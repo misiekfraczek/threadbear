@@ -229,13 +229,28 @@ export function gitAsync(cwd: string, args: string[], opts: GitOptions = {}): Pr
   return runGit(cwd, args, opts).then((out) => out.toString('utf8').trim());
 }
 
+// A bare repository (the check's own fetch folder) is named with
+// --git-dir: with safe.bareRepository=explicit (in someone's git config,
+// or GIT_CONFIG_PARAMETERS, as Claude's desktop terminal sets) git won't
+// use one it only finds through -C.
+function isBareRepo(dir: string): boolean {
+  try {
+    return fs.statSync(path.join(dir, 'objects')).isDirectory()
+      && fs.statSync(path.join(dir, 'refs')).isDirectory()
+      && fs.statSync(path.join(dir, 'HEAD')).isFile()
+      && !fs.existsSync(path.join(dir, '.git'));
+  } catch {
+    return false;
+  }
+}
+
 // git in its own process group, so a deadline stops what it started too
 // (git-remote-https, ssh, upload-pack), with a cap on what it may print.
 // GIT_TERMINAL_PROMPT=0: a fetch that wants a password fails rather than
 // hanging the runner on a prompt nobody sees.
 function runGit(cwd: string, args: string[], opts: GitOptions): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-C', cwd, ...args], {
+    const child = spawn('git', ['-C', cwd, ...(isBareRepo(cwd) ? ['--git-dir=.'] : []), ...args], {
       stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       detached: true,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...opts.env },
