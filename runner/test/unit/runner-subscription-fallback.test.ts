@@ -79,3 +79,12 @@ test('a user message replaces recovery still waiting for the old process to exit
  assert.equal(h.adapters.codex.last.sent.length,1);assert.match(h.adapters.codex.last.sent[0].text,/User priority$/);
  assert.ok(!h.adapters.codex.last.sent[0].text.endsWith('instruction first.'));
 });
+
+test('after all limits reset, recovery starts at the first provider in pool order',async()=>{
+ const h=setup();const {thread}=h.runner.create({text:'x',poolId:'all'});
+ for(const p of order){limit(h.adapters[p]);await tick();}
+ assert.ok(h.runner.get(thread.id).waitingForRoom);
+ h.clock.advance(31*60_000);await tick();
+ assert.equal(h.runner.get(thread.id).provider,'claude');
+ assert.equal(h.adapters.claude.sessions.length,2);
+});

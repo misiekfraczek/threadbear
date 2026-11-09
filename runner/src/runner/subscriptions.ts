@@ -8,7 +8,7 @@ import type {Account} from '../protocol.ts';
 import type {StartSessionOptions,TurnResult} from '../adapters/types.ts';
 import {experimentOn} from '../experiments.ts';
 import {chooseSubscriptionFallback,type Eligibility} from '../subscription-fallback.ts';
-import {backAt,loginOk,UNKNOWN_WAIT_MS} from '../pools.ts';
+import {backAt,loginOk,poolProviders,UNKNOWN_WAIT_MS} from '../pools.ts';
 
 const CONTINUE='Continue the unfinished task from the handoff. Before repeating an interrupted operation, verify its effects in the relevant system; the previous operation may already have succeeded. Keep the user’s latest instruction first.';
 export const subscriptionsPart={
@@ -16,6 +16,10 @@ export const subscriptionsPart={
   subscriptionOptions(this:Runner,st:ThreadState,account:Account):StartSessionOptions {
     const rec=st.rec;
     return {threadId:rec.id,cwd:rec.cwd,account,model:account.provider===rec.provider?rec.model:this.defaultModelFor(account.provider),effort:account.provider===rec.provider?rec.effort:this.defaultEffortFor(account.provider),permissionMode:rec.permissionMode,confined:rec.confined,sessionId:rec.nativeSessionId??'',resume:false,mediaDir:this.store.mediaDir(rec.id),blobsDir:this.store.blobsDir(rec.id),tmpDir:path.join(this.cfg.home,'run','tmp')};
+  },
+  subscriptionCandidates(this:Runner):Account[] {
+    const usable=this.usableAccounts();
+    return this.safeAccounts().map(a=>usable.find(u=>u.id===a.id)??a);
   },
   subscriptionEligible(this:Runner,st:ThreadState,account:Account):Eligibility {
     const adapter=this.adapters[account.provider];
@@ -53,21 +57,38 @@ export const subscriptionsPart={
     // Persist the block even when the thread was archived during the turn.
     this.store.save(rec);
     if(this.bucket(rec)!=='inbox')return;
-    const accounts=this.usableAccounts();
+    const accounts=this.subscriptionCandidates();
     const next=chooseSubscriptionFallback(pool,accounts,rec,cycle,a=>this.subscriptionEligible(st,a),now);
     if(next.kind==='wait') {this.startWait(st,{waitUntil:next.until},`Every compatible login in ${pool.title} has been tried or is out of room.`);this.store.save(rec);return;}
     if(next.kind==='blocked') {this.emit(st,{type:'system.note',text:`No compatible subscription can continue: ${next.reasons.join(' ')}`});this.store.save(rec);return;}
     const to=accounts.find(a=>a.id===next.accountId)!;
     this.moveLogin(st,to,'the previous login reached its subscription limit');
+    this.queueSubscriptionRecovery(st);
+  },
+  queueSubscriptionRecovery(this:Runner,st:ThreadState):void {
+    const {rec}=st;const cycle=rec.fallbackCycle!;
     if(!rec.queue.length) {
       const id=crypto.randomUUID();
-      cycle.pending={accountId:to.id,turnId:id,phase:'queued'};rec.autoCarryOn=id;
+      cycle.pending={accountId:rec.accountId,turnId:id,phase:'queued'};rec.autoCarryOn=id;
       rec.queue.push({turnId:id,text:CONTINUE,images:[],origin:'runner'});
     }
     // Queue and selected account must be on disk before afterTurn kicks it.
     try {this.store.save(rec);}catch(e){
       rec.queue=rec.queue.filter(q=>q.turnId!==cycle.pending?.turnId);delete cycle.pending;throw e;
     }
+  },
+  resumeSubscriptions(this:Runner,st:ThreadState):void {
+    const {rec}=st;const pool=this.poolById(rec.poolId);if(!pool)return;
+    const accounts=this.subscriptionCandidates();
+    const cycle={id:crypto.randomUUID(),sourceTurnId:crypto.randomUUID(),attemptedAccountIds:[]};
+    rec.fallbackCycle=cycle;
+    const provider=poolProviders(pool,accounts)[0]??rec.provider;
+    const next=chooseSubscriptionFallback(pool,accounts,{accountId:'',provider},cycle,a=>this.subscriptionEligible(st,a),this.clock.now());
+    if(next.kind==='wait'){this.startWait(st,{waitUntil:next.until},`Still no room in ${pool.title}.`);this.store.save(rec);return;}
+    if(next.kind==='blocked'){this.emit(st,{type:'system.note',text:`No compatible subscription can continue: ${next.reasons.join(' ')}`});this.store.save(rec);return;}
+    const to=accounts.find(a=>a.id===next.accountId)!;
+    if(to.id!==rec.accountId)this.moveLogin(st,to,'subscription room is available again');
+    this.queueSubscriptionRecovery(st);
   },
   clearSubscriptionRecovery(this:Runner,st:ThreadState):void {
     const pending=st.rec.fallbackCycle?.pending;

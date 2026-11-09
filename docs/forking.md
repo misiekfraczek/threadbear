@@ -204,3 +204,8 @@ What a first list of the cuts missed and the trial found: the `-ThreadbearPocket
 launch argument, the positional parameter shifting the tools test, and the
 App Store review notes. Expect a few like that in any feature: after the
 listed cuts, `git grep -i <feature>` across the repo finds the rest.
+
+Subscription fallback is an optional experiment. Its implementation and
+removal points are listed in [Experiments](experiments.md). It uses official
+CLI binaries supplied in the runner's configuration; no account, path or
+subscription belonging to the author is embedded in the feature.

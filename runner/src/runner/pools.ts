@@ -257,8 +257,13 @@ export const poolsPart = {
   // own, if it's back) carries on by itself; with none, wait again.
   endWait(this: Runner, st: ThreadState): void {
     const { rec, rt } = st;
+    if (this.subscriptionFallbackOn() && rec.fallbackCycle) {
+      delete rec.waitingForRoom;
+      if (rt.deleted || rt.turn || rec.queue.length || this.bucket(rec) !== 'inbox') return;
+      try {this.resumeSubscriptions(st);this.kickQueue(st);} catch(e) {this.log.error('could not resume subscription recovery',{threadId:rec.id,error:String(e)});}
+      return;
+    }
     delete rec.waitingForRoom;
-    if (this.subscriptionFallbackOn()) delete rec.fallbackCycle;
     this.markDirty(st);
     if (rt.deleted || rt.turn || rec.queue.length || this.bucket(rec) !== 'inbox') return;
     const pool = this.poolById(rec.poolId);

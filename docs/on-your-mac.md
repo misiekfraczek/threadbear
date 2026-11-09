@@ -311,3 +311,20 @@ priority, it passes a sample of tool output and pictures to Apple's on-device
 model, and Apple's on-device text recognition for a picture. Nothing leaves the
 Mac and it changes nothing that uploads. It keeps counts, and the thread and
 sequence number of what it flagged, in `<data>/secret-check.json`. Never the text.
+
+### Optional subscription CLIs
+
+With the `subscriptionFallback` experiment enabled and `grokPath` or
+`antigravityPath` configured, the runner starts that official CLI to check its
+subscription and model list, and starts a separate process for each live
+thread. The CLI uses its own saved login, files and network connections.
+Threadbear does not read or copy OAuth tokens. It removes API authentication
+variables from the child environment and disables Antigravity's extra-credit
+fallback. These CLIs are not installed or updated by Threadbear.
+
+A session uses a temporary loopback HTTP listener with an unpredictable path
+and a stdio MCP child to reach the same Threadbear tool handlers as other
+providers. It binds only to 127.0.0.1 and closes with that session. Model probes
+use a temporary working directory; official CLIs may keep their own session
+metadata. No model prompt is sent by a model-list probe. Recovery state stays
+in the existing thread.json and usage files.
