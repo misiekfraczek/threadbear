@@ -1,6 +1,6 @@
 # Kontynuacja rozmowy po limicie abonamentu
 
-Data: 2026-11-09. Status: specyfikacja do akceptacji, bez zmian w kodzie produktu.
+Data: 2026-11-09. Status: specyfikacja zaakceptowana przez Michała 09.11.2026, bez zmian w kodzie produktu.
 Repo bazowe: `5bbf9f64`. Wątek: `08c2784c-f107-48da-a4c7-463081907a9b`.
 
 ## Cel i decyzje Michała
