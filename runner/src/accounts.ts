@@ -242,7 +242,7 @@ export class AccountRegistry {
     const id = this.usage.identityFor(account);
     if (id.email) out.email = id.email;
     if (id.plan) out.plan = id.plan;
-    out.title = out.provider === 'codex' ? codexTitle(out.email, out.id) : (out.email ?? out.id);
+    out.title = out.provider === 'codex' ? codexTitle(out.email, out.id) : out.provider === 'claude' ? (out.email ?? out.id) : account.title;
     const usage = this.usage.usageFor(out);
     if (usage) out.usage = usage;
     return out;

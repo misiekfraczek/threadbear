@@ -19,12 +19,12 @@ export class AcpTransport {
   private notify:(method:string,params:any)=>void;
   private request:(method:string,params:any)=>Promise<unknown>;
   private exit:(error?:Error)=>void;
-  private registry?:Pick<ProcessRegistry,'add'|'remove'>;
+  private registry?:Pick<ProcessRegistry,'add'|'remove'> & Partial<Pick<ProcessRegistry,'toolGroups'>>;
   constructor(command:string,args:string[],cwd:string,env:NodeJS.ProcessEnv,
     notify:(method:string,params:any)=>void,
     request:(method:string,params:any)=>Promise<unknown>,
     exit:(error?:Error)=>void,
-    registry?:Pick<ProcessRegistry,'add'|'remove'>) {
+    registry?:Pick<ProcessRegistry,'add'|'remove'> & Partial<Pick<ProcessRegistry,'toolGroups'>>) {
     this.notify=notify;this.request=request;this.exit=exit;this.registry=registry;
     this.child=spawn(command,args,{cwd,env,stdio:['pipe','pipe','pipe'],detached:true});
     if(this.child.pid) registry?.add(this.child.pid,command);
@@ -33,7 +33,11 @@ export class AcpTransport {
     this.child.stderr.resume();
     this.child.on('error',e=>this.fail(e));
     this.stopped=new Promise(resolve=>this.child.on('close',()=>{
-      if(this.child.pid) registry?.remove(this.child.pid);
+      if(this.child.pid) {
+        for(const group of registry?.toolGroups?.(this.child.pid)??[])killGroup(group,'SIGKILL');
+        killGroup(this.child.pid,'SIGKILL');
+        registry?.remove(this.child.pid);
+      }
       this.fail(this.closing?undefined:new Error('CLI exited before the ACP session closed.'));
       resolve();
     }));

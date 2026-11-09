@@ -129,6 +129,7 @@ import { cutSafely, firstLineSafely, isSafeSlice } from './safe-cut.ts';
 import { FolderCache } from './folder-cache.ts';
 import { worktreesPart, type WorktreesPart } from './runner/worktrees.ts';
 import { networkPart, type NetworkPart } from './runner/network.ts';
+import { subscriptionsPart, type SubscriptionsPart } from './runner/subscriptions.ts';
 import { poolsPart, type PoolsPart } from './runner/pools.ts';
 import { handoversPart, type HandoversPart } from './runner/handovers.ts';
 import { stoppedWorkPart, type StoppedWorkPart } from './runner/stopped-work.ts';
@@ -596,7 +597,7 @@ export const UNTIL_RESTART = '9999-12-31T00:00:00.000Z';
 export const NO_WAKE_TIME = UNTIL_RESTART;
 
 // Parts of the Runner that live in runner/ (see each file's top).
-export interface Runner extends LooseEndsPart, LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ButtonsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart {}
+export interface Runner extends SubscriptionsPart, LooseEndsPart, LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ButtonsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart {}
 export class Runner {
   // While main.ts is still starting up: waking a thread for its waits
   // (reconcileWaits) would start a CLI whose tools aren't ready, so they
@@ -770,7 +771,7 @@ export class Runner {
     this.seedPatchTrust(records.map((r) => r.cwd));
     this.flush();
     void this.settleLostCleanups();
-    for (const st of this.threads.values()) if (st.rec.queue.some(q => q.reviewId) && this.bucket(st.rec) === 'inbox') this.kickQueue(st);
+    for (const st of this.threads.values()) if (st.rec.queue.some(q => q.reviewId || (this.subscriptionFallbackOn() && st.rec.fallbackCycle?.pending?.phase === 'queued')) && this.bucket(st.rec) === 'inbox') this.kickQueue(st);
     this.armSnoozeTimer();
     // Waits for room are in thread.json, so they outlive a restart.
     this.armRoomTimer();
@@ -946,6 +947,12 @@ export class Runner {
     this.stopSubagents(st);
     // Waiting with no turn is only a subagent's card, and that subagent is
     // gone: there's no turn to pick up again.
+    if (rec.fallbackCycle?.pending?.phase === 'started') {
+      const pending = rec.fallbackCycle.pending;
+      rec.queue = rec.queue.filter(q => q.turnId !== pending.turnId);
+      if (!rec.fallbackCycle.attemptedAccountIds.includes(pending.accountId)) rec.fallbackCycle.attemptedAccountIds.push(pending.accountId);
+      delete rec.fallbackCycle.pending;
+    }
     const onlyCards = rec.status === 'waiting' && !rec.turnId;
     if (onlyCards) rec.status = 'idle';
     const midTurn = rec.status === 'starting' || rec.status === 'running' || rec.status === 'waiting';
@@ -995,8 +1002,9 @@ export class Runner {
       this.markDirty(st);
       return false;
     }
-    const reviewQueue = rec.queue.filter(q => q.reviewId);
-    rec.queue = rec.queue.filter(q => !q.reviewId);
+    const keep = (q: QueuedSend) => q.reviewId || (this.subscriptionFallbackOn() && rec.fallbackCycle?.pending?.phase === 'queued');
+    const reviewQueue = rec.queue.filter(keep);
+    rec.queue = rec.queue.filter(q => !keep(q));
     if (rec.queue.length) {
       const texts = rec.queue.map((q) => q.text).filter(Boolean);
       this.emit(st, {
@@ -1380,6 +1388,7 @@ export class Runner {
   sendTo(st: ThreadState, text: string, images: ImageRef[], opts: SendOptions = {}): string {
     const { rec, rt } = st;
     if (opts.origin !== 'runner') {
+      if(this.subscriptionFallbackOn() && rec.fallbackCycle)this.clearSubscriptionRecovery(st);
       rt.hookTurns = undefined;
       delete rec.stoppedWorkWakes;
       // A new ask from Mike: its change can be reviewed afresh.
@@ -1690,6 +1699,10 @@ export class Runner {
         this.emit(st, { type: 'system.note', text: 'Resumed session' }, msg.turnId);
       }
       this.makeRoomForCli(st);
+      if (rec.fallbackCycle?.pending?.turnId === msg.turnId) {
+        rec.fallbackCycle.pending.phase = 'started';
+        this.store.save(rec);
+      }
       this.startSession(st, account);
     }
     // Projects the session hasn't been told about: one it was put in while
@@ -1770,13 +1783,15 @@ export class Runner {
   startSession(st: ThreadState, account: Account): void {
     const { rec, rt } = st;
     const adapter = this.adapters[rec.provider];
+    if ((rec.provider === 'grok' || rec.provider === 'antigravity') && !this.subscriptionFallbackOn()) throw new Error('Subscription fallback is disabled.');
     if (!adapter) throw new Error(`This runner can't run ${providerName(rec.provider)} threads.`);
     if (!rec.nativeSessionId) rec.nativeSessionId = crypto.randomUUID();
     const gen = ++rt.generation;
     const resume = Boolean(rec.sessionUsed);
+    let exited = false;
     const sink: SessionSink = {
       output: (o) => {
-        if (rt.generation !== gen) return;
+        if (exited || rt.generation !== gen || (rt.releasedGen === gen && o.kind === 'result')) return;
         rt.lastOutputAt = this.clock.now();
         try {
           this.onOutput(st, o);
@@ -1789,7 +1804,7 @@ export class Runner {
       },
       requestApproval: (req) => this.requestApproval(st, gen, req),
       requestQuestion: (req) => this.requestQuestion(st, gen, req),
-      exited: (err) => this.onExited(st, gen, err),
+      exited: (err) => { exited = true; this.onExited(st, gen, err); },
     };
     rt.resumed = resume;
     rt.cliVersion = undefined;
@@ -2228,6 +2243,7 @@ export class Runner {
     // Any completed turn replaces the last one's card; one that said
     // neither leaves no card, and counts as before.
     if (outcome === 'completed') {
+      if(this.subscriptionFallbackOn()) delete rec.fallbackCycle;
       if (said) rec.needs = { seq: ev.seq, needs: said.needs, ...(said.asks ? { asks: said.asks } : {}) };
       else delete rec.needs;
       // How it came out replaces why it was started, on the row of a thread
@@ -2263,7 +2279,7 @@ export class Runner {
       !rec.subagents?.some((a) => a.status === 'running') && !rt.tasks.length && !rt.approvals.size &&
       // A job that ended mid-turn: the CLI's turn reading its result is next.
       !rt.taskEndedInTurn && !rt.finished.length;
-    this.endTurn(st, ev.seq, outcome === 'failed' ? 'error' : 'idle', outcome, limitHit, netLost);
+    this.endTurn(st, ev.seq, outcome === 'failed' ? 'error' : 'idle', outcome, limitHit, netLost, r.limit);
     // The done card's loose ends (experiment looseEnds), unless it's going
     // away now; and the card of the thread that started this one, which
     // lists this one while it's working.
@@ -2351,7 +2367,7 @@ export class Runner {
     this.update({ threadId: rec.id, snoozedUntil: until });
   }
 
-  endTurn(st: ThreadState, completedSeq: number, status: ThreadStatus, outcome?: TurnOutcome, limitHit?: string, netLost?: string): void {
+  endTurn(st: ThreadState, completedSeq: number, status: ThreadStatus, outcome?: TurnOutcome, limitHit?: string, netLost?: string, limit?: TurnResult['limit']): void {
     const { rec, rt } = st;
     const finished = rt.turn;
     rt.turn?.interruptTimer?.cancel();
@@ -2383,7 +2399,7 @@ export class Runner {
     const waiters = rt.turnEndWaiters ?? [];
     rt.turnEndWaiters = undefined;
     for (const w of waiters) w();
-    this.afterTurn(st, limitHit, netLost);
+    this.afterTurn(st, limitHit, netLost, limit);
   }
 
   // A turn that ended without a result from the CLI (spawn failure, crash).
@@ -2411,11 +2427,11 @@ export class Runner {
     this.endTurn(st, ev.seq, interrupted ? 'idle' : 'error');
   }
 
-  afterTurn(st: ThreadState, limitHit?: string, netLost?: string): void {
+  afterTurn(st: ThreadState, limitHit?: string, netLost?: string, limit?: TurnResult['limit']): void {
     if (this.stopping) return;
     if (limitHit) {
       try {
-        this.onUsageLimit(st, limitHit);
+        this.onUsageLimit(st, limitHit, limit);
       } catch (e) {
         this.log.error('could not move a thread off a login at its limit', { threadId: st.rec.id, error: String(e) });
       }
@@ -2436,7 +2452,7 @@ export class Runner {
     const { rec } = st;
     const pool = this.poolById(rec.poolId);
     if (!pool) return;
-    const accounts = this.usableAccounts();
+    const accounts = this.usableAccounts().filter(a => !this.subscriptionFallbackOn() || this.subscriptionEligible(st,a).ok);
     const current = accounts.find((a) => a.id === rec.accountId);
     const inPool = pool.accountIds.includes(rec.accountId);
     if (current && inPool && loginOk(current)) return;
@@ -2555,6 +2571,7 @@ export class Runner {
   interrupt(threadId: string, opts: { byMike?: boolean } = {}): Record<string, never> {
     const st = this.mustGet(threadId);
     const { rt } = st;
+    if(this.subscriptionFallbackOn())this.clearSubscriptionRecovery(st);
     const turn = rt.turn;
     const closing = { stopped: opts.byMike === true };
     // Stop with only a subagent's card open: that card is what's waiting.
@@ -3495,7 +3512,7 @@ export class Runner {
 
 // The Runner's other methods live in parts under runner/, one area each;
 // they go onto its prototype here, as the class's own methods would be.
-for (const part of [looseEndsPart, labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, patchesPart, editingPart, clisPart, reviewsPart, buttonsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart]) {
+for (const part of [subscriptionsPart, looseEndsPart, labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, patchesPart, editingPart, clisPart, reviewsPart, buttonsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart]) {
   for (const [key, d] of Object.entries(Object.getOwnPropertyDescriptors(part))) {
     Object.defineProperty(Runner.prototype, key, { ...d, enumerable: false });
   }
@@ -3681,11 +3698,11 @@ export function oneLine(text: string, max: number): string {
 
 // A provider's name in notes.
 export function providerName(p: Provider): string {
-  return p === 'codex' ? 'Codex' : 'Claude';
+  return {claude:'Claude',codex:'Codex',grok:'Grok',antigravity:'Google (Antigravity)'}[p] ?? p;
 }
 
 function cliName(p: Provider): string {
-  return p === 'codex' ? 'Codex' : 'Claude Code';
+  return p === 'claude' ? 'Claude Code' : providerName(p);
 }
 
 // Claude's own ids: its aliases, and anything starting claude- (with or

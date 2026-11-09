@@ -25,6 +25,8 @@ export type ThreadRecord = {
   // The id of the runner's own carry-on turn after a login ran dry, so a
   // carry-on that runs dry straight away waits rather than move again.
   autoCarryOn?: string;
+  fallbackCycle?: import('./subscription-fallback.ts').FallbackCycle;
+  subscriptionModelBlocks?: {accountId:string;model:string;until:string}[];
   // A turn failed because the API couldn't be reached (errorKind network):
   // the thread carries on by itself once a probe reaches it again
   // (Runner.onNetworkLost). `since` is when the line first went, `tries`

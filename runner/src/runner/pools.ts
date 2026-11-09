@@ -2,6 +2,7 @@
 // Part of the Runner (runner.ts), split out on 4 Nov 2026 as a plain move so a
 // fork's change to one area doesn't clash with another's. Each method's `this`
 // is the Runner; runner.ts puts them on its prototype.
+import type { TurnResult } from '../adapters/types.ts';
 import type { Runner } from '../runner.ts';
 import type { RunnerPart } from './part.ts';
 import type { Account, Pool, Provider } from '../protocol.ts';
@@ -85,7 +86,7 @@ export const poolsPart = {
   usable(this: Runner, all: Account[]): Account[] {
     const now = this.clock.now();
     return all
-      .filter((a) => this.adapters[a.provider])
+      .filter((a) => this.adapters[a.provider] && ((a.provider !== 'grok' && a.provider !== 'antigravity') || (this.subscriptionFallbackOn() && a.subscription?.state === 'ready')))
       .map((a) => {
         const until = this.ranDry.get(a.id);
         if (until === undefined || until <= now || a.usage?.blocked) return a;
@@ -116,6 +117,8 @@ export const poolsPart = {
   // The provider a model id belongs to, when that can be told.
   modelProvider(this: Runner, model: string): Provider | undefined {
     if (isClaudeModel(model)) return 'claude';
+    if (model.startsWith('grok-')) return 'grok';
+    if (model.startsWith('gemini-')) return 'antigravity';
     const accounts = this.safeAccounts();
     if (model.startsWith('gpt-') || accounts.some((a) => a.provider === 'codex' && modelRow(a, model))) return 'codex';
     if (accounts.some((a) => a.provider === 'claude' && modelRow(a, model))) return 'claude';
@@ -163,7 +166,8 @@ export const poolsPart = {
   // login blocked, move to the next login with room and carry on by
   // itself, once. A carry-on that runs dry too waits instead of moving
   // again, as does a pool with nothing left.
-  onUsageLimit(this: Runner, st: ThreadState, turnId: string): void {
+  onUsageLimit(this: Runner, st: ThreadState, turnId: string, limit?: TurnResult['limit']): void {
+    if(this.subscriptionFallbackOn()) {this.subscriptionLimit(st,turnId,limit);return;}
     const { rec } = st;
     const pool = this.poolById(rec.poolId);
     if (!pool) return;
@@ -254,6 +258,7 @@ export const poolsPart = {
   endWait(this: Runner, st: ThreadState): void {
     const { rec, rt } = st;
     delete rec.waitingForRoom;
+    if (this.subscriptionFallbackOn()) delete rec.fallbackCycle;
     this.markDirty(st);
     if (rt.deleted || rt.turn || rec.queue.length || this.bucket(rec) !== 'inbox') return;
     const pool = this.poolById(rec.poolId);
@@ -391,6 +396,7 @@ export const poolsPart = {
           : `from the ${fromAccount} login to ${account.title}`;
     return (
       `[Threadbear handoff] This conversation moved ${moved}, so this is a fresh session. ` +
+      (rec.fallbackCycle ? `Before repeating the interrupted step, verify the effects of the last operation in the relevant system. Its result may be unknown. ` : '') +
       `The thread so far:\n\n${lines.join('\n\n') || '(none)'}\n\n[End of handoff. The new message follows.]\n\n`
     );
   },
