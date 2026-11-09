@@ -31,3 +31,9 @@ test('another eligible account on the same provider precedes other providers',()
   const next=chooseSubscriptionFallback({...pool,accountIds:[...pool.accountIds,extra.id]},all,{accountId:'codex',provider:'codex'},{...cycle,attemptedAccountIds:['codex']},()=>({ok:true}),now);
   assert.deepEqual(next,{kind:'move',accountId:'codex2'});
 });
+
+test('shared pools retain four-provider order after a round trip',async()=>{
+ const {toShared,fromShared,readShared}=await import('../../src/pools.ts');
+ const shared=readShared(toShared([pool],[],accounts,'test-runner'));
+ assert.deepEqual(fromShared(shared,accounts,'test-runner')[0].accountIds,pool.accountIds);
+});

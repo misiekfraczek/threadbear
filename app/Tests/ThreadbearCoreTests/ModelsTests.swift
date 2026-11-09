@@ -344,3 +344,17 @@ final class ModelsTests: XCTestCase {
         XCTAssertFalse(none.isWorkingInBackground)
     }
 }
+
+extension ModelsTests {
+    func testSubscriptionProvidersKeepNamesAndUnknownValues() throws {
+        for provider in ["grok", "antigravity", "future-provider"] {
+            let json = "{\"id\":\"test\",\"provider\":\"\(provider)\",\"title\":\"Test\"}"
+            let account = try JSONDecoder().decode(Account.self, from: Data(json.utf8))
+            XCTAssertEqual(account.provider, provider)
+            XCTAssertTrue(ModelPicker.rows(choices: [], defaultId: nil, selected: nil, provider: provider).isEmpty)
+        }
+        XCTAssertEqual(ModelPicker.providerTitle("grok"), "Grok")
+        XCTAssertEqual(ModelPicker.providerTitle("antigravity"), "Google (Antigravity)")
+        XCTAssertEqual(ModelPicker.providerTitle("future-provider"), "Future-provider")
+    }
+}

@@ -3,7 +3,8 @@
 // "claude-opus-5-5" → "Claude Opus 5.5", "opus" → "Claude Opus",
 // "gpt-6-astra" → "GPT-6 Astra". With no model, the CLI's name.
 export function modelLabel(provider?: string, model?: string): string {
-  const cli = provider === 'codex' ? 'Codex' : 'Claude';
+  const names: Record<string, string> = {claude: 'Claude', codex: 'Codex', grok: 'Grok', antigravity: 'Google (Antigravity)'};
+  const cli = names[provider || 'claude'] ?? provider!;
   if (!model) return cli;
   const id = model.replace(/\[.*\]$/, '');
   const claude = id.match(/^(?:claude-)?(opus|sonnet|haiku|fable)(?:-(\d+)(?:-(\d+))?)?/i);
