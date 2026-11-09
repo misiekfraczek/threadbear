@@ -131,7 +131,10 @@ test('a page full of long rows and links has a bounded cost', () => {
     for (let m = 41; m <= 80; m++) for (let l = 0; l < 700; l++) if (findStep(`z q${m}-${l}`, m, page) !== undefined) found++;
   });
   assert.equal(found, 0);
-  assert.ok(ms < 100, `took ${ms.toFixed(0)} ms`);
+  // 25 to 40 ms on an M-series Mac; tb land runs the check at background
+  // priority, on the efficiency cores, where it takes about 120. A search
+  // that went quadratic would take seconds either way.
+  assert.ok(ms < 300, `took ${ms.toFixed(0)} ms`);
   // Links that do find their step still do, on a fresh page.
   assert.equal(findStep('Run the tests', 9, [...rows]), 5);
 });
