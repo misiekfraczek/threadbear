@@ -44,7 +44,7 @@ Spec: [zaakceptowana specyfikacja](../specs/2026-11-09-subscription-fallback-des
 
 Nowe pliki mają pojedynczą odpowiedzialność. Nie przenosić istniejących integracji Claude/Codex do nowej abstrakcji. Dokładne formaty CLI ustala zadanie 1; nie zgadywać ich z podobieństwa do Claude.
 
-## Zadanie 1: potwierdzić kontrakt obu oficjalnych CLI
+### Task 1: potwierdzić kontrakt obu oficjalnych CLI
 
 Files: utworzyć `docs/superpowers/evidence/2026-11-09-subscription-cli-contracts.md`; syntetyczne przykłady w `runner/test/fixtures/subscriptions/`. Prywatne odpowiedzi i metadane kont zostają poza Git.
 Interfaces: wynik to udokumentowany kontrakt dla każdego CLI: wersja, tryb abonamentowy, start/wznowienie, wejście i wyjście, MCP, zgody, przerwanie, błędy limitu. Ten wynik zasila zadania 2-4.
@@ -55,7 +55,7 @@ Interfaces: wynik to udokumentowany kontrakt dla każdego CLI: wersja, tryb abon
 - [ ] Oznaczyć osobno `PASS`, `FAIL` lub `UNVERIFIED` dla każdej możliwości. Brak potwierdzonego abonamentu, MCP albo bezpiecznego wznowienia blokuje aktywowanie danej integracji. Inne zadania niewymagające tego wyniku mogą trwać; nie zastępować brakującej możliwości API.
 - [ ] Zacommitować dokument i wyłącznie syntetyczne przykłady: `docs: record subscription CLI contracts`. Jeżeli wynik przeczy specyfikacji, opisać konkretną różnicę przed zmianą projektu.
 
-## Zadanie 2: kontrakt usług, kont i możliwości
+### Task 2: kontrakt usług, kont i możliwości
 
 Files: kontrakt protokołu i możliwości z mapy; nowe pliki `subscription-accounts.ts`, `subscription-env.ts`; `runner/test/unit/subscription-accounts.test.ts`, `runner/test/unit/subscription-env.test.ts`, `runner/test/unit/runner-providers.test.ts`.
 Interfaces: `SubscriptionProvider = 'grok' | 'antigravity'`; `SubscriptionStatus = { state: 'ready' | 'loginRequired' | 'unknown' | 'unavailable'; identity?: string; plan?: string; reason?: string }`. `SubscriptionAccountProbe.status(account: Account): Promise<SubscriptionStatus>`. Opcjonalne `AgentAdapter.supports(opts: StartSessionOptions): { ok: boolean; reason?: string }`. Opcjonalne `TurnResult.limit?: { scope: 'account' | 'model'; model?: string; resetsAt?: string }` przenosi wyłącznie potwierdzony zakres limitu z CLI; brak metadanych zachowuje dotychczasową klasyfikację istniejących integracji. `subscriptionEnv(provider: SubscriptionProvider, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv` zwraca kopię środowiska bez dróg uwierzytelniania API wykazanych w zadaniu 1.
@@ -65,7 +65,7 @@ Interfaces: `SubscriptionProvider = 'grok' | 'antigravity'`; `SubscriptionStatus
 - [ ] Dodać nowe wartości `Provider`, opcjonalne ścieżki `grokPath` i `antigravityPath` w konfiguracji oraz sondy metadanych kont. Zachować synchroniczne `discoverAccounts`; wynik asynchronicznej sondy trzymać w pamięci i publikować przez istniejący mechanizm aktualizacji kont. Tylko `ready` kwalifikuje nowe konta do automatycznej puli; katalog modeli nie zmienia stanu na `ready`.
 - [ ] Powtórzyć komendę: wszystkie testy PASS. Sprawdzić, że brak opcjonalnej metody `supports` nie zmienia zachowania starych integracji. Commit `feat: describe subscription providers and account readiness`.
 
-## Zadanie 3: integracja Grok Build
+### Task 3: integracja Grok Build
 
 Files: trzy nowe pliki `adapters/grok/` z mapy, `runner/test/unit/grok-adapter.test.ts`, `runner/test/helpers/fake-grok.ts`. Rejestracja w `main.ts` pozostaje wyłączona do zadania 8.
 Interfaces: `GrokAdapter implements AgentAdapter`, `provider = 'grok'`; `start(opts: StartSessionOptions, sink: SessionSink): AgentSession`, `models(account: Account): Promise<ModelChoice[]>`. `GrokNormalizer.push(chunk: string): AdapterOutput[]` i `finish(): AdapterOutput[]` oddzielają transport od normalizacji; `surface.ts` buduje argumenty i konfigurację MCP według zadania 1.
@@ -75,7 +75,7 @@ Interfaces: `GrokAdapter implements AgentAdapter`, `provider = 'grok'`; `start(o
 - [ ] Zaimplementować interfejs oraz cykl życia procesu według kontraktu. Użyć istniejącego rejestru procesów. Wynik końcowy wydawać tylko po zdarzeniu końcowym CLI; EOF bez niego jest błędem. Zmiany modelu/trybu, których nie można stosować w locie, zaczynają kolejną turę. Nie przekazywać reguł uprawnień Claude do Groka. Nieobsługiwane ograniczenia odrzuca `supports`.
 - [ ] Powtórzyć testy: PASS, także brak niejawnego API i brak wykonania narzędzia po odmowie. Commit `feat: add Grok Build subscription adapter`.
 
-## Zadanie 4: integracja Google Antigravity
+### Task 4: integracja Google Antigravity
 
 Files: trzy nowe pliki `adapters/antigravity/` z mapy, `runner/test/unit/antigravity-adapter.test.ts`, `runner/test/helpers/fake-antigravity.ts`.
 Interfaces: `AntigravityAdapter implements AgentAdapter`, `provider = 'antigravity'`; sygnatury `start` i `models` jak w zadaniu 3. `AntigravityNormalizer.push(chunk: string): AdapterOutput[]`, `finish(): AdapterOutput[]`; `surface.ts` według własnego kontraktu CLI.
@@ -85,7 +85,7 @@ Interfaces: `AntigravityAdapter implements AgentAdapter`, `provider = 'antigravi
 - [ ] Zaimplementować oficjalny proces `agy`, konfigurację MCP i sesje zgodnie z zadaniem 1. Nie używać wycofanej ścieżki konsumenckiej Gemini CLI. Obsłużyć `settingsApplyNextTurn` i brak możliwości zmiany ograniczeń w locie przez zamknięcie sesji przed następną turą.
 - [ ] Powtórzyć testy: PASS, także zabezpieczenie przed API. Commit `feat: add Google Antigravity subscription adapter`.
 
-## Zadanie 5: deterministyczny wybór kolejnego konta
+### Task 5: deterministyczny wybór kolejnego konta
 
 Files: nowy `runner/src/subscription-fallback.ts`, `runner/test/unit/subscription-fallback.test.ts`; `runner/src/pools.ts`.
 Interfaces: `FallbackCycle = { id: string; sourceTurnId: string; attemptedAccountIds: string[]; pending?: { accountId: string; turnId: string; phase: 'queued' | 'started' } }`. `FallbackChoice = { kind: 'move'; accountId: string } | { kind: 'wait'; until: string } | { kind: 'blocked'; reasons: string[] }`. `chooseSubscriptionFallback(pool: Pool, accounts: Account[], current: { accountId: string; provider: Provider }, cycle: FallbackCycle, eligible: (account: Account) => { ok: boolean; reason?: string; retryAt?: string }, now: number): FallbackChoice`. Funkcja `eligible` zamyka w swoim kontekście planowany model i uprawnienia dla danej usługi; sama funkcja wyboru nie wybiera innego modelu.
@@ -95,7 +95,7 @@ Interfaces: `FallbackCycle = { id: string; sourceTurnId: string; attemptedAccoun
 - [ ] Zaimplementować funkcję przez istniejące `pickInPool` i reguły dostępności. Kolejność pochodzi z puli, nie z globalnego porządku typów. Filtrować odwiedzone konta i wymagane możliwości przed wyborem. Rozróżnić limit całego konta od modelowego: blokada modelowa wyłącza tę parę konto/model, bez oznaczania całego konta jako wyczerpane.
 - [ ] Powtórzyć testy oraz `node --test test/unit/pools.test.ts`: PASS. Commit `feat: select subscription fallback without revisiting accounts`.
 
-## Zadanie 6: trwała kontynuacja i przekazanie kontekstu
+### Task 6: trwała kontynuacja i przekazanie kontekstu
 
 Files: `runner/src/store.ts`, `runner/src/runner/pools.ts`, `runner/src/runner.ts`, `runner/src/handoff-history.ts`; `runner/test/unit/runner-pools.test.ts`, `runner/test/unit/provider-switch.test.ts`, `runner/test/unit/store.test.ts`, `runner/test/helpers/fakes.ts`.
 Interfaces: opcjonalne `ThreadRecord.fallbackCycle?: FallbackCycle` oraz `ThreadRecord.subscriptionModelBlocks?: { accountId: string; model: string; until: string }[]`; wybór z zadania 5. Blokady modeli wygasają według `TurnResult.limit.resetsAt`, a bez niego po 30 minutach; stan ten filtruje `eligible`, które przekazuje termin przez `retryAt`, i wyznacza oczekiwanie dla dotkniętej rozmowy. Istniejące `onUsageLimit`, `moveLogin`, `carryOn`, `startWait`, `endWait` pozostają punktami wejścia. Nowa ścieżka działa wyłącznie pod eksperymentem; stara pozostaje poza nim.
@@ -106,7 +106,7 @@ Interfaces: opcjonalne `ThreadRecord.fallbackCycle?: FallbackCycle` oraz `Thread
 - [ ] Uzupełnić notatkę przekazania o przerwany krok i sprawdzenie skutków ostatniej operacji. Test sprawdza obecność celu oraz ostrzeżenia o nieznanym wyniku, a licznik fałszywego narzędzia z poprzedniej tury pozostaje równy 1. Brak kopiowania pełnych sekretów, narzędzi ani pierwotnej wiadomości jako nowego zadania.
 - [ ] Powtórzyć testy: PASS. Dodać przypadki wyczerpania wszystkich kont, restartu oczekiwania, resetu i przypiętego konta. Commit `feat: persist subscription recovery and resume once`.
 
-## Zadanie 7: nazwy usług i zgodność klientów
+### Task 7: nazwy usług i zgodność klientów
 
 Files: pliki klientów i synchronizacji z mapy, `app/Sources/ThreadbearCore/Protocol/Models.swift`; testy `app/Tests/ThreadbearCoreTests/ModelsTests.swift`, nowe `ios/ThreadbearKit/Tests/ThreadbearKitTests/SubscriptionProvidersTests.swift`, `web/src/format.test.ts`, `runner/test/unit/sync.test.ts`, `runner/test/unit/shared-pools.test.ts`.
 Interfaces: zachować `provider` jako string w klientach/Convex. Istniejące `modelLabel(provider?: string, model?: string): string` ma zwracać Grok i Google (Antigravity) przy braku nazwy modelu; dla nieznanej usługi jej ID. Nie dodawać nowego ekranu.
@@ -116,7 +116,7 @@ Interfaces: zachować `provider` jako string w klientach/Convex. Istniejące `mo
 - [ ] Uzupełnić nazwy w istniejących menu i usunąć założenia „wszystko poza Codex to Claude”. Zachować tolerancję protokołu i dotychczasowe dane. Testy regresji istniejących usług muszą przejść. Jeżeli wymagane są zmiany interakcji, zachować istniejące spinnery i tooltipy.
 - [ ] Powtórzyć testy: PASS. W debug app załadować syntetyczne konta i wątki, sprawdzić `dump` oraz screenshot okna bez podnoszenia go na pierwszy plan. Wyłączyć własną instancję. Commit `feat: display subscription providers across clients`.
 
-## Zadanie 8: rejestracja, odbiór i uruchomienie u Michała
+### Task 8: rejestracja, odbiór i uruchomienie u Michała
 
 Files: `runner/src/main.ts`, `runner/src/config.ts`, `runner/src/runner.ts`, `runner/src/net-probe.ts`, eksperyment i dokumentacja z mapy; nowe `runner/test/unit/subscription-registration.test.ts`, `runner/test/e2e/subscription-handoff.test.ts`.
 Interfaces: `experimentOn(home, 'subscriptionFallback')` steruje rejestracją i wyborem nowych usług. Konta spoza aktywnej konfiguracji pozostają czytelne w historii. Oficjalne hosty do sprawdzania sieci wynikają z kontraktu zadania 1, bez zgadywania endpointów.
@@ -132,4 +132,4 @@ Interfaces: `experimentOn(home, 'subscriptionFallback')` steruje rejestracją i 
 
 Gotowe oznacza sprawdzone rzeczywiste sesje abonamentowe obu nowych usług, test przejścia przez cztery konta z zachowaniem kontekstu oraz wdrożenie potwierdzone odczytem wersji i ustawień. Nie ma obowiązku wywoływania rzeczywistego limitu. Jeżeli jednej usługi nie można uruchomić, pozostała część może być zapisana i sprawdzona, ale cały zakres pozostaje częściowy.
 
-Plan przygotowany 09.11.2026 na bazie `6c6c3943`; do akceptacji sposobu wykonania. Testów produktu w tym etapie nie uruchamiano. Przy rozpoczęciu wykonania utworzyć lub odnaleźć zadanie Linear w SCL z etykietą scalex po potwierdzeniu workspace i konta; nie traktować projektu Threadbear jako zamiennika backlogu.
+Plan przygotowany 09.11.2026 na bazie `6c6c3943`; zaakceptowany do wykonania w tym wątku. Testów produktu w tym etapie nie uruchamiano. Przy rozpoczęciu wykonania utworzyć lub odnaleźć zadanie Linear w SCL z etykietą scalex po potwierdzeniu workspace i konta; nie traktować projektu Threadbear jako zamiennika backlogu.
