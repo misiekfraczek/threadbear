@@ -77,6 +77,8 @@ export type Config = {
   // Threadbear's own copy (<home>/tools/codex/current), or until there is
   // one the codex next to the runner's Node; never ~/.local/bin/codex.
   codexPath?: string;
+  grokPath?: string;
+  antigravityPath?: string;
   codexArgs: string[]; // extra `codex app-server` arguments
   codexMainDir: string; // codex-main's CODEX_HOME
   tokenStatsLimitsFile: string; // Token Stats' limits.json, read only
@@ -150,6 +152,8 @@ export type RunnerJson = {
   idleMinutes?: number;
   maxLiveCLIs?: number;
   codexPath?: string;
+  grokPath?: string;
+  antigravityPath?: string;
   codexArgs?: string[];
   cliUpdates?: Partial<CliUpdatesConfig>;
   accountNotes?: Record<string, string>;
@@ -281,6 +285,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tokenStatsLimitsFile: expandHome(
       env.THREADBEAR_TOKEN_STATS_LIMITS || '~/Library/Application Support/Token Stats/limits.json',
     ),
+    ...(json.grokPath ? { grokPath: expandHome(json.grokPath) } : {}),
+    ...(json.antigravityPath ? { antigravityPath: expandHome(json.antigravityPath) } : {}),
     cliUpdates: cliUpdatesConfig(json.cliUpdates, env.THREADBEAR_CLI_UPDATES),
     tokenTally: env.THREADBEAR_TOKEN_TALLY !== 'off',
     accountNotes: stringMap(json.accountNotes) ?? { ...DEFAULT_ACCOUNT_NOTES },

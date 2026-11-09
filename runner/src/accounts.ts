@@ -37,7 +37,7 @@ export function stripModelSuffix(model: string): string {
 
 // What the runner has learned about an account since it started: the
 // CLI's model list (asked once), and the model a thread with none ran on.
-export type LearnedAccountInfo = { models?: ModelChoice[]; defaultModel?: string };
+export type LearnedAccountInfo = { subscription?: Account['subscription']; models?: ModelChoice[]; defaultModel?: string };
 
 // The full id a thread with no model runs on. A turn that showed it wins;
 // otherwise the account's settings.json, turned into a full id through the
@@ -84,7 +84,7 @@ export function isCodexLogin(dir: string): boolean {
 }
 
 export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 'tokenStatsAccountsDir'> &
-  Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'accountsDir'>>;
+  Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'accountsDir' | 'grokPath' | 'antigravityPath'>>;
 
 // claude-main is ~/.claude (its .claude.json sits at ~/.claude.json);
 // codex-main is ~/.codex. Token Stats' Accounts folder holds claude-N and
@@ -121,6 +121,9 @@ export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
   for (const { id, dir } of [...codex, ...numbered('codex')]) {
     if (isCodexLogin(dir)) out.push(codexAccount(id, dir));
   }
+  for (const [provider, binary] of [['grok', cfg.grokPath], ['antigravity', cfg.antigravityPath]] as const) {
+    if (binary && fs.existsSync(binary)) out.push({id: `${provider}-main`, provider, title: provider === 'grok' ? 'Grok' : 'Google (Antigravity)', configDir: '', subscription: {state: 'unknown'}});
+  }
   for (const a of out) {
     const note = cfg.accountNotes?.[a.id];
     if (note) a.note = note;
@@ -154,6 +157,7 @@ function codexTitle(email: string | undefined, id: string): string {
 // settings.json, Codex's config.toml.
 function settingsModel(account: Account): string | undefined {
   if (account.provider === 'codex') return readCodexConfig(path.join(account.configDir, 'config.toml')).model;
+  if (account.provider !== 'claude') return undefined;
   return readSettingsModel(path.join(account.configDir, 'settings.json'));
 }
 
@@ -205,6 +209,7 @@ export class AccountRegistry {
   learn(id: string, info: LearnedAccountInfo): boolean {
     const have = this.learned.get(id) ?? {};
     const next: LearnedAccountInfo = { ...have };
+    if (info.subscription) next.subscription = info.subscription;
     if (info.models && JSON.stringify(info.models) !== JSON.stringify(have.models)) next.models = info.models;
     if (info.defaultModel && info.defaultModel !== have.defaultModel) next.defaultModel = info.defaultModel;
     if (JSON.stringify(next) === JSON.stringify(have)) return false;
@@ -217,6 +222,11 @@ export class AccountRegistry {
     const learned = this.learned.get(account.id);
     if (!learned) return account;
     const out: Account = { ...account };
+    if (learned.subscription) {
+      out.subscription = learned.subscription;
+      if (learned.subscription.identity) out.email = learned.subscription.identity;
+      if (learned.subscription.plan) out.plan = learned.subscription.plan;
+    }
     const model = resolveDefaultModel(settingsModel(account), learned);
     if (model) out.defaultModel = model;
     else delete out.defaultModel;

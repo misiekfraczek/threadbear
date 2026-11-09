@@ -4,8 +4,8 @@
 
 export const PROTOCOL_VERSION = 1;
 
-export type Provider = 'claude' | 'codex';
-export const PROVIDERS: readonly Provider[] = ['claude', 'codex'];
+export type Provider = 'claude' | 'codex' | 'grok' | 'antigravity';
+export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'grok', 'antigravity'];
 
 export function isProvider(v: unknown): v is Provider {
   return typeof v === 'string' && (PROVIDERS as readonly string[]).includes(v);
@@ -103,6 +103,7 @@ export type Account = {
   plan?: string;
   note?: string; // from runner.json's accountNotes ("Convex work only")
   usage?: AccountUsage;
+  subscription?: import('./subscription-accounts.ts').SubscriptionStatus;
 };
 
 export type CliPolicy = 'auto' | 'notify' | 'off';

@@ -98,6 +98,7 @@ export type TurnResult = {
   usage?: Record<string, unknown>;
   error?: string;
   errorKind?: TurnErrorKind;
+  limit?: { scope: 'account' | 'model'; model?: string; resetsAt?: string };
 };
 
 export type AdapterOutput =
@@ -282,6 +283,7 @@ export class RewindRefusedError extends Error {
 
 export interface AgentAdapter {
   readonly provider: Provider;
+  supports?(opts: StartSessionOptions): { ok: boolean; reason?: string };
   start(opts: StartSessionOptions, sink: SessionSink): AgentSession;
   // What the account's CLI offers as models, without starting a turn.
   // Optional: a provider without a picker leaves it out.

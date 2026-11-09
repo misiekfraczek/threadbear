@@ -5865,3 +5865,30 @@ Either side may be upgraded first, so each tolerates the other:
 - An app older than Devices never asks for them. A newer app talking to a
   runner older than Devices gets `-32601` from `devices.*` and says the
   Phone & browser tab needs a newer runner.
+
+### Subscription fallback (experiment)
+
+The `subscriptionFallback` experiment adds provider IDs `grok` (Grok Build)
+and `antigravity` (Google Antigravity, Gemini models only). Clients preserve
+provider strings they do not recognize. Accounts may carry `subscription`
+metadata: `state` (`ready`, `loginRequired`, `unknown`, `unavailable`),
+`identity`, `plan` and `reason`. Only a confirmed `ready` subscription can
+enter an automatic fallback. CLI model discovery alone proves no entitlement.
+
+Adapters may refuse unsupported session constraints through `supports`; an
+absent method preserves the existing adapter contract. A usage-limit result
+may carry `limit: {scope: "account" | "model", model?, resetsAt?}`. A model
+limit blocks only that account/model pair. No quota is inferred from an
+unclassified HTTP 429 or an authentication error.
+
+A pool retains its configured provider order, trying other eligible logins
+of the current provider first. Each login is attempted once per recovery
+cycle. A pinned thread never moves. Known resets have a one-minute buffer;
+unknown resets wait thirty minutes. User messages take precedence over
+automatic continuation. The cycle and continuation identity are stored
+with the thread before a replacement CLI starts. An uncertain dispatch after
+a crash must be reconciled rather than replayed blindly.
+
+New providers use their official CLI login. API-key authentication and paid
+credit fallback are disabled. Unsupported permission or sandbox constraints
+exclude an account; a switch never grants broader permissions.

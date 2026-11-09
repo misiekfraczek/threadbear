@@ -15,7 +15,7 @@ import type { Config } from '../config.ts';
 import type { Logger } from '../log.ts';
 import { paths } from '../config.ts';
 import type { CliPolicy, CliStatus, Provider } from '../protocol.ts';
-import { PROVIDERS } from '../protocol.ts';
+const PROVIDERS = ['claude', 'codex'] as const;
 import { claudeChannel, claudeInstalledVersion, claudeLatestVersion, runClaudeUpdate } from './claude.ts';
 import { CodexCopies, NPM_LATEST, codexPackageVersion, type CodexResolver, type SurfaceCheck } from './codex.ts';
 import { VERSION_RE, compareVersions, defaultExec, defaultFetchText, type Exec, type FetchText } from './exec.ts';
@@ -141,16 +141,19 @@ export class CliUpdates {
   }
 
   check(p?: Provider): CliStatus[] {
+    if (p && p !== 'claude' && p !== 'codex') throw new Error('This CLI is updated outside Threadbear.');
     for (const prov of p ? [p] : PROVIDERS) this.track(prov, this.runCheck(prov, true));
     return this.list();
   }
 
   update(p: Provider, o: { version?: string; force?: boolean } = {}): CliStatus[] {
+    if (p !== 'claude' && p !== 'codex') throw new Error('This CLI is updated outside Threadbear.');
     this.startUpdate(p, o);
     return this.list();
   }
 
   setPolicy(p: Provider, policy: CliPolicy): CliStatus[] {
+    if (p !== 'claude' && p !== 'codex') throw new Error('This CLI is updated outside Threadbear.');
     this.ps(p).policy = policy;
     this.save();
     this.changed();
@@ -167,7 +170,7 @@ export class CliUpdates {
   // CLI's init (Claude) or initialize (Codex). Two failures in a row on a
   // version it just moved to send a warning, once.
   sessionStarted(p: Provider, version: string | undefined, ok: boolean): void {
-    if (!version) return;
+    if (!version || (p !== 'claude' && p !== 'codex')) return;
     const s = this.ps(p);
     if (ok) {
       if (s.startFailures?.version === version) {
@@ -227,12 +230,14 @@ export class CliUpdates {
   // "off" can't be turned on from the app; a Codex binary set by hand is
   // never updated.
   private policy(p: Provider): CliPolicy {
+    if (p !== 'claude' && p !== 'codex') return 'off';
     if (this.configOff(p)) return 'off';
     if (p === 'codex' && this.cfg.codexPath) return 'off';
     return this.st[p]?.policy ?? this.cfg.cliUpdates[p];
   }
 
   private configOff(p: Provider): boolean {
+    if (p !== 'claude' && p !== 'codex') return true;
     return this.env.THREADBEAR_CLI_UPDATES === 'off' || this.cfg.cliUpdates[p] === 'off';
   }
 
