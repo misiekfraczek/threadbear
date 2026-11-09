@@ -326,5 +326,6 @@ A session uses a temporary loopback HTTP listener with an unpredictable path
 and a stdio MCP child to reach the same Threadbear tool handlers as other
 providers. It binds only to 127.0.0.1 and closes with that session. Model probes
 use a temporary working directory; official CLIs may keep their own session
-metadata. No model prompt is sent by a model-list probe. Recovery state stays
+metadata. No model prompt is sent by a model-list probe. An unconfirmed subscription
+is checked again at most once a minute while the experiment is enabled. Recovery state stays
 in the existing thread.json and usage files.

@@ -660,6 +660,8 @@ export class Runner {
   startupNotices: { level: 'info' | 'warning' | 'error'; message: string }[] = [];
   // Accounts whose CLI has been asked for its models (or is being asked).
   probed = new Set<string>();
+  probingModels = new Set<string>();
+  lastModelProbe = new Map<string, number>();
   rescanTimer?: TimerHandle;
   liveTimer?: TimerHandle;
   accountsTimer?: TimerHandle;
@@ -794,18 +796,18 @@ export class Runner {
   // some accounts: a login that has just appeared, or every Codex account
   // after a Codex update (a new version can change the list).
   async probeModels(only?: (a: Account) => boolean): Promise<void> {
-    const targets = this.safeAccounts().filter((a) => !only || only(a));
-    for (const a of targets) this.probed.add(a.id);
+    const targets = this.safeAccounts().filter((a) => (!only || only(a)) && !this.probingModels.has(a.id));
+    for (const a of targets) {this.probed.add(a.id);this.probingModels.add(a.id);this.lastModelProbe.set(a.id,this.clock.now());}
     for (const account of targets) {
-      if (this.stopping) return;
+      if (this.stopping) {for(const a of targets)this.probingModels.delete(a.id);return;}
       const adapter = this.adapters[account.provider];
-      if (!adapter?.models) continue;
+      if (!adapter?.models) {this.probingModels.delete(account.id);continue;}
       try {
         const models = await adapter.models(account);
         this.learnAccount(account.id, { models });
       } catch (e) {
         this.log.warn('could not read the model list', { accountId: account.id, error: String(e) });
-      }
+      } finally {this.probingModels.delete(account.id);}
     }
   }
 
@@ -838,7 +840,7 @@ export class Runner {
 
   rescanAccounts(): void {
     const list = this.safeAccounts();
-    const fresh = new Set(list.filter((a) => !this.probed.has(a.id)).map((a) => a.id));
+    const fresh = new Set(list.filter((a) => !this.probed.has(a.id) || (this.subscriptionFallbackOn() && (a.provider === 'grok' || a.provider === 'antigravity') && a.subscription?.state !== 'ready' && this.clock.now() - (this.lastModelProbe.get(a.id) ?? 0) >= 60_000)).map((a) => a.id));
     if (fresh.size) void this.probeModels((a) => fresh.has(a.id));
     if (accountsKey(list) !== this.accountsShown) this.accountsChanged();
   }
@@ -1504,6 +1506,7 @@ export class Runner {
   // there's no CLI turn to join.
   canSteer(st: ThreadState): boolean {
     const { rec, rt } = st;
+    if (this.adapters[rec.provider]?.supportsSteering === false) return false;
     const turn = rt.turn;
     if (!turn || !rt.session || rt.closing || this.stopping || rt.editing) return false;
     if (rec.queue.length || rec.handoff || rec.moved || rt.releaseWhenIdle || turn.interruptRequested) return false;
@@ -1643,6 +1646,10 @@ export class Runner {
     // a CLI started there meanwhile would have the folder taken from under it.
     while (rt.cleaning) await rt.cleaning;
     if (rt.turn?.turnId !== msg.turnId) return; // interrupted while waiting
+    if (rec.fallbackCycle?.pending?.turnId === msg.turnId) {
+      rec.fallbackCycle.pending.phase = 'started';
+      this.store.save(rec);
+    }
     const local = this.runLocalCommand(st, msg);
     if (local === true || (local !== false && (await local))) return;
     // A slash command reaches the CLI as typed: anything put in front of it
@@ -1699,10 +1706,6 @@ export class Runner {
         this.emit(st, { type: 'system.note', text: 'Resumed session' }, msg.turnId);
       }
       this.makeRoomForCli(st);
-      if (rec.fallbackCycle?.pending?.turnId === msg.turnId) {
-        rec.fallbackCycle.pending.phase = 'started';
-        this.store.save(rec);
-      }
       this.startSession(st, account);
     }
     // Projects the session hasn't been told about: one it was put in while
@@ -1791,7 +1794,7 @@ export class Runner {
     let exited = false;
     const sink: SessionSink = {
       output: (o) => {
-        if (exited || rt.generation !== gen || (rt.releasedGen === gen && o.kind === 'result')) return;
+        if (rt.generation !== gen || (this.subscriptionFallbackOn() && (exited || (rt.releasedGen === gen && o.kind === 'result')))) return;
         rt.lastOutputAt = this.clock.now();
         try {
           this.onOutput(st, o);
@@ -2252,7 +2255,8 @@ export class Runner {
       if (byline && rec.startedBy) rec.startedBy.why = byline;
     }
     // A pool thread whose login ran dry moves and carries on (afterTurn).
-    const limitHit = outcome === 'failed' && r.errorKind === 'usageLimit' ? turn.turnId : undefined;
+    const admissionFailed = r.admissionFailure === true && !!rec.fallbackCycle && this.subscriptionFallbackOn();
+    const limitHit = outcome === 'failed' && (r.errorKind === 'usageLimit' || admissionFailed) ? turn.turnId : undefined;
     // One that couldn't reach the API carries on once it's back (afterTurn).
     const netLost = outcome === 'failed' && r.errorKind === 'network' ? turn.turnId : undefined;
     // A turn the CLI opened by itself during a wait (a background job
@@ -2279,7 +2283,7 @@ export class Runner {
       !rec.subagents?.some((a) => a.status === 'running') && !rt.tasks.length && !rt.approvals.size &&
       // A job that ended mid-turn: the CLI's turn reading its result is next.
       !rt.taskEndedInTurn && !rt.finished.length;
-    this.endTurn(st, ev.seq, outcome === 'failed' ? 'error' : 'idle', outcome, limitHit, netLost, r.limit);
+    this.endTurn(st, ev.seq, outcome === 'failed' ? 'error' : 'idle', outcome, limitHit, netLost, r.limit, admissionFailed);
     // The done card's loose ends (experiment looseEnds), unless it's going
     // away now; and the card of the thread that started this one, which
     // lists this one while it's working.
@@ -2367,7 +2371,7 @@ export class Runner {
     this.update({ threadId: rec.id, snoozedUntil: until });
   }
 
-  endTurn(st: ThreadState, completedSeq: number, status: ThreadStatus, outcome?: TurnOutcome, limitHit?: string, netLost?: string, limit?: TurnResult['limit']): void {
+  endTurn(st: ThreadState, completedSeq: number, status: ThreadStatus, outcome?: TurnOutcome, limitHit?: string, netLost?: string, limit?: TurnResult['limit'], admissionFailed = false): void {
     const { rec, rt } = st;
     const finished = rt.turn;
     rt.turn?.interruptTimer?.cancel();
@@ -2399,7 +2403,7 @@ export class Runner {
     const waiters = rt.turnEndWaiters ?? [];
     rt.turnEndWaiters = undefined;
     for (const w of waiters) w();
-    this.afterTurn(st, limitHit, netLost, limit);
+    this.afterTurn(st, limitHit, netLost, limit, admissionFailed);
   }
 
   // A turn that ended without a result from the CLI (spawn failure, crash).
@@ -2427,11 +2431,11 @@ export class Runner {
     this.endTurn(st, ev.seq, interrupted ? 'idle' : 'error');
   }
 
-  afterTurn(st: ThreadState, limitHit?: string, netLost?: string, limit?: TurnResult['limit']): void {
+  afterTurn(st: ThreadState, limitHit?: string, netLost?: string, limit?: TurnResult['limit'], admissionFailed = false): void {
     if (this.stopping) return;
     if (limitHit) {
       try {
-        this.onUsageLimit(st, limitHit, limit);
+        this.onUsageLimit(st, limitHit, limit, admissionFailed);
       } catch (e) {
         this.log.error('could not move a thread off a login at its limit', { threadId: st.rec.id, error: String(e) });
       }

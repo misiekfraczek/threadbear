@@ -7,6 +7,11 @@ export const PROTOCOL_VERSION = 1;
 export type Provider = 'claude' | 'codex' | 'grok' | 'antigravity';
 export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'grok', 'antigravity'];
 
+export function providerTitle(provider: string): string {
+  const titles: Record<string, string> = {claude: 'Claude', codex: 'Codex', grok: 'Grok', antigravity: 'Google (Antigravity)'};
+  return titles[provider] ?? provider;
+}
+
 export function isProvider(v: unknown): v is Provider {
   return typeof v === 'string' && (PROVIDERS as readonly string[]).includes(v);
 }

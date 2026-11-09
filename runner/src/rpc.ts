@@ -796,7 +796,7 @@ export class RpcServer {
 }
 
 function reqProvider(p: Record<string, unknown>): Provider {
-  if (!isProvider(p.provider)) throw bad(`provider must be one of ${PROVIDERS.join(', ')}`);
+  if (p.provider !== 'claude' && p.provider !== 'codex') throw bad('CLI updates support claude and codex only');
   return p.provider;
 }
 

@@ -1,3 +1,4 @@
+import { providerTitle } from './protocol.ts';
 // tb: a small command line client for testing and scripting the runner.
 import { parseArgs } from 'node:util';
 import { startedByFlags } from './started-by-flags.ts';
@@ -563,7 +564,7 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
         const note = a.note ? `  (${a.note})` : '';
         // The provider has its own column, so not "Codex · " again.
         const who = a.email ?? a.title.replace(/^Codex · /, '');
-        console.log(`${a.id === r.defaults.accountId ? '*' : ' '} ${a.id.padEnd(12)} ${(a.provider === 'codex' ? 'Codex' : 'Claude').padEnd(7)}${who}${note}`);
+        console.log(`${a.id === r.defaults.accountId ? '*' : ' '} ${a.id.padEnd(12)} ${providerTitle(a.provider).padEnd(7)}${who}${note}`);
       }
       return 0;
     }

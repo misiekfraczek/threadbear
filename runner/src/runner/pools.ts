@@ -166,8 +166,8 @@ export const poolsPart = {
   // login blocked, move to the next login with room and carry on by
   // itself, once. A carry-on that runs dry too waits instead of moving
   // again, as does a pool with nothing left.
-  onUsageLimit(this: Runner, st: ThreadState, turnId: string, limit?: TurnResult['limit']): void {
-    if(this.subscriptionFallbackOn()) {this.subscriptionLimit(st,turnId,limit);return;}
+  onUsageLimit(this: Runner, st: ThreadState, turnId: string, limit?: TurnResult['limit'], admissionFailed = false): void {
+    if(this.subscriptionFallbackOn()) {this.subscriptionLimit(st,turnId,limit,admissionFailed);return;}
     const { rec } = st;
     const pool = this.poolById(rec.poolId);
     if (!pool) return;

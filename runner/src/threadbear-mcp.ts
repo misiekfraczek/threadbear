@@ -1,3 +1,4 @@
+import { providerTitle } from './protocol.ts';
 // Tools that let an agent drive Threadbear itself: list and read threads,
 // start new ones, message them, rename, snooze, archive, move and delete
 // them. The runner hands each Claude session its own in-process MCP server
@@ -138,7 +139,7 @@ type Result = { content: { type: 'text'; text: string }[]; isError?: boolean };
 // model doesn't offer, with a note.
 const effortEnum = z.enum(EFFORT_LEVELS as unknown as [EffortLevel, ...EffortLevel[]]);
 
-const providerName = (a: Pick<Account, 'provider'>): string => (a.provider === 'codex' ? 'Codex' : 'Claude');
+const providerName = (a: Pick<Account, 'provider'>): string => providerTitle(a.provider);
 
 const ok = (text: string): Result => ({ content: [{ type: 'text', text }] });
 const fail = (text: string): Result => ({ content: [{ type: 'text', text }], isError: true });
@@ -505,7 +506,7 @@ export function buildThreadbearTools(
       `runner: ${runner} (read through Convex: messages and one line per tool call; tool output stays on that runner)`,
       `status: ${t.status}${t.needsYou ? ' (needs the user)' : ''}`,
       `folder: ${t.cwd} (on ${runner})`,
-      `account: ${t.accountId} (${t.provider === 'codex' ? 'Codex' : 'Claude'})`,
+      `account: ${t.accountId} (${providerTitle(t.provider)})`,
       `model: ${t.model ?? 'default'}`,
       t.snoozedUntil ? `snoozed until: ${t.snoozedUntil}` : '',
       t.archivedAt ? `archived: ${t.archivedAt}` : '',

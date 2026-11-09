@@ -2,10 +2,12 @@
 import readline from 'node:readline';
 const scenario = process.argv[2] ?? 'ok';
 let prompt;
+let prompts=0;
 const send = m => process.stdout.write(JSON.stringify(m)+'\n');
 for await (const line of readline.createInterface({input:process.stdin})) {
   const m = JSON.parse(line);
   const reply = result => send({jsonrpc:'2.0',id:m.id,result});
+  if (scenario==='auth-fail' && (m.method==='authenticate'||m.method==='session/new'||m.method==='session/load')) {send({jsonrpc:'2.0',id:m.id,error:{code:-32000,message:'Authentication required'}});continue;}
   if (m.method==='initialize') reply({protocolVersion:1,agentCapabilities:{loadSession:true},agentInfo:{version:'test'}});
   else if(m.method==='authenticate') reply({_meta:{auth_mode:'Oidc',subscription_tier:'SuperGrok Plus',backend_billed:false}});
   else if(m.method==='session/new'||m.method==='session/load') {
@@ -13,7 +15,8 @@ for await (const line of readline.createInterface({input:process.stdin})) {
     reply({sessionId:m.params.sessionId??'native-test',_meta:{antigravity:{tier:{id:'g1-pro-tier',name:'Google AI Pro'}}},models:{availableModels:[{modelId:'grok-test',name:'Grok'},{modelId:'gemini-test',name:'Gemini'},{modelId:'claude-test',name:'Claude'}]}});
   } else if(m.method==='session/set_model'||m.method==='session/set_config_option') reply({});
   else if(m.method==='session/prompt') {
-    prompt=m.id;
+    prompt=m.id;prompts++;
+    if(scenario==='queued-after-cancel'&&prompts===1)continue;
     if(scenario==='eof') process.exit(0);
     if(scenario==='bad-json') {process.stdout.write('{bad}\n');continue;}
     if(scenario==='wait') continue;

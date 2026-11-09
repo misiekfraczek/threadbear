@@ -99,6 +99,9 @@ export type TurnResult = {
   error?: string;
   errorKind?: TurnErrorKind;
   limit?: { scope: 'account' | 'model'; model?: string; resetsAt?: string };
+  // Initialization failed before a prompt was dispatched. Only an existing
+  // subscription recovery may skip this candidate; it is not a quota limit.
+  admissionFailure?: true;
 };
 
 export type AdapterOutput =
@@ -283,6 +286,8 @@ export class RewindRefusedError extends Error {
 
 export interface AgentAdapter {
   readonly provider: Provider;
+  // false: later messages stay in the runner queue until the active turn ends.
+  readonly supportsSteering?: boolean;
   supports?(opts: StartSessionOptions): { ok: boolean; reason?: string };
   start(opts: StartSessionOptions, sink: SessionSink): AgentSession;
   // What the account's CLI offers as models, without starting a turn.

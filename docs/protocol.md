@@ -5892,3 +5892,7 @@ a crash must be reconciled rather than replayed blindly.
 New providers use their official CLI login. API-key authentication and paid
 credit fallback are disabled. Unsupported permission or sandbox constraints
 exclude an account; a switch never grants broader permissions.
+
+An adapter may set `supportsSteering: false`. Messages arriving during its
+turn remain in the runner's queue instead of entering a second private CLI
+queue. ACP adapters use this mode so Stop owns all pending continuation.

@@ -222,6 +222,7 @@ export class FakeAccounts {
       const out = { ...a };
       if (info.defaultModel) out.defaultModel = info.defaultModel;
       if (info.models) out.models = info.models;
+      if (info.subscription) out.subscription = info.subscription;
       return out;
     });
   }
