@@ -27,6 +27,8 @@ Zadanie: [SCL-412](https://linear.app/sclaex/issue/SCL-412).
 | Testy obszarów objętych zmianą po poprawkach przeglądu | PASS: 183 |
 | Niezależny przegląd | Brak otwartych ustaleń; 34 testy ponowione przez recenzenta |
 | Runner, web i Convex typecheck | PASS |
+| Pełny check --quick i tb land --dry-run | PASS na 5cb53618; po dodatkowej korekcie Stop wymagane ponowienie |
+| Adaptery i kontynuacja po korekcie Stop | PASS: 38 testów |
 | Kompilacja Mac przez `./check.sh --app` | PASS |
 | `swift build --target ThreadbearCore` | PASS |
 | XCTest Mac i Testing iOS | UNVERIFIED: brak pełnego Xcode, dostępne CommandLineTools |
@@ -56,7 +58,12 @@ powoduje pominięcie konta, nigdy podniesienie uprawnień. Szczegóły zawiera
 Przegląd wykrył cztery problemy, wszystkie poprawione i objęte testami regresji:
 kolejkę po Stop, zapis rozpoczęcia kolejnej tury w istniejącym CLI, ponawianie
 sondy po zalogowaniu oraz pomijanie konta, którego logowanie wygasło w trakcie
-cyklu. Końcowy commit kodu: `2319ce89`.
+cyklu. Pierwszy commit poprawek przeglądu: `2319ce89`. Dodatkowo odtworzono
+Stop podczas inicjalizacji oraz Stop nowej tury zaraz po zakończeniu poprzedniej.
+Kolejka przyjmuje pierwszą wiadomość przed zakończeniem inicjalizacji, a po
+anulowaniu przed promptem pozostawia zdrową sesję do następnej wiadomości.
+Testy przed poprawką wykazały brak wyniku i przerwanie następnej wiadomości;
+po poprawce oba scenariusze przechodzą dla obu usług.
 
 ## Wdrożenie
 

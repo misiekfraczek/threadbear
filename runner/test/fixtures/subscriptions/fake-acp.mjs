@@ -8,7 +8,10 @@ for await (const line of readline.createInterface({input:process.stdin})) {
   const m = JSON.parse(line);
   const reply = result => send({jsonrpc:'2.0',id:m.id,result});
   if (scenario==='auth-fail' && (m.method==='authenticate'||m.method==='session/new'||m.method==='session/load')) {send({jsonrpc:'2.0',id:m.id,error:{code:-32000,message:'Authentication required'}});continue;}
-  if (m.method==='initialize') reply({protocolVersion:1,agentCapabilities:{loadSession:true},agentInfo:{version:'test'}});
+  if (m.method==='initialize') {
+    if(scenario==='slow-start') await new Promise(r=>setTimeout(r,200));
+    reply({protocolVersion:1,agentCapabilities:{loadSession:true},agentInfo:{version:'test'}});
+  }
   else if(m.method==='authenticate') reply({_meta:{auth_mode:'Oidc',subscription_tier:'SuperGrok Plus',backend_billed:false}});
   else if(m.method==='session/new'||m.method==='session/load') {
     send({jsonrpc:'2.0',method:'session/update',params:{update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'OLD HISTORY'}}}});

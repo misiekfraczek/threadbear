@@ -90,7 +90,7 @@ class AcpSession implements AgentSession {
   private abort = new AbortController();
   private normalizer: AcpNormalizer;
   private ready: Promise<void>;
-  private tail: Promise<void>;
+  private tail?: Promise<void>;
   private active = false;
   private epoch = 0;
   private ended = false;
@@ -114,7 +114,6 @@ class AcpSession implements AgentSession {
       this.deps.onStatus?.(this.opts.account, subscriptionStatus(this.provider, { error: { message: e instanceof Error ? e.message : String(e) } }), []);
       throw e;
     });
-    this.tail = this.ready.catch(() => {});
     // A failed start is reported by the queued send, with its turn ID.
     void this.ready.catch(() => {});
   }
@@ -198,12 +197,20 @@ class AcpSession implements AgentSession {
   }
   send(input: UserInput): void {
     const epoch = this.epoch;
-    this.tail = this.tail.then(async () => {
+    const run = async () => {
       if (epoch !== this.epoch) return;
       const start = Date.now();
       try {
         await this.ready;
-        if (this.ended || this.cancelRequested) throw new Error('Session interrupted.');
+        if (this.ended) throw new Error('Session interrupted.');
+        if (this.cancelRequested) {
+          // Nothing reached the model yet. Complete this turn without
+          // poisoning or killing the initialized session for the next one.
+          this.cancelRequested = false;
+          clear();
+          this.sink.output({ kind: 'result', result: { outcome: 'interrupted', answers: input.id, durationMs: Date.now() - start } });
+          return;
+        }
         this.active = true;
         const guidance = this.told ? '' : `${toolGuidance(this.tools)}\n${this.opts.instructions ?? ''}\n\n`;
         this.told = true;
@@ -214,6 +221,7 @@ class AcpSession implements AgentSession {
         this.active = false;
         const interrupted = this.cancelRequested || r.stopReason === 'cancelled';
         const completed = r.stopReason === 'end_turn';
+        clear();
         this.sink.output({
           kind: 'result',
           result: {
@@ -228,6 +236,7 @@ class AcpSession implements AgentSession {
       } catch (e) {
         this.normalizer.flush();
         this.active = false;
+        clear();
         this.sink.output({
           kind: 'result',
           result: {
@@ -240,7 +249,15 @@ class AcpSession implements AgentSession {
         });
         this.kill();
       }
-    });
+    };
+    // Admit the first send immediately, before initialization finishes. Stop
+    // must complete that turn, while discarding any later queued sends.
+    const pending = this.tail ? this.tail.then(run) : run();
+    this.tail = pending;
+    const clear = () => {
+      if (this.tail === pending) this.tail = undefined;
+    };
+    void pending.then(clear, clear);
   }
   async interrupt(): Promise<void> {
     this.cancelRequested = true;

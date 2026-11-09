@@ -30,17 +30,21 @@ for (const [name, Adapter] of [
     const finished = new Promise<void>((r) => (done = r));
     let started!: () => void;
     const promptStarted = new Promise<void>((r) => (started = r));
+    const resultWaiters: (() => void)[] = [];
     const session = adapter.start(opts, {
       output: (o) => {
         outputs.push(o);
-        if (o.kind === 'result') done();
+        if (o.kind === 'result') {
+          done();
+          resultWaiters.shift()?.();
+        }
         if (o.kind === 'delta' && o.delta.type === 'assistant.text.delta' && o.delta.text === 'PROMPT_STARTED') started();
       },
       exited: () => {},
       requestApproval: async () => ({ decision: 'deny' }),
       requestQuestion: async () => ({ answers: null }),
     });
-    return { outputs, session, finished, promptStarted, adapter, opts, statuses };
+    return { outputs, session, finished, promptStarted, nextResult: () => new Promise<void>((r) => resultWaiters.push(r)), adapter, opts, statuses };
   }
   test(`${name}: split JSON, unknown events and resume without replay`, async () => {
     const h = setup('ok', true);
@@ -100,6 +104,40 @@ for (const [name, Adapter] of [
     await h.finished;
     await h.session.end();
     assert.equal(h.outputs.find((o) => o.kind === 'result')?.result.outcome, 'interrupted');
+  });
+  test(`${name}: Stop during initialization ends the admitted turn without a prompt`, { timeout: 3000 }, async (t) => {
+    const h = setup('slow-start');
+    t.after(() => h.session.kill());
+    h.session.send({ id: 'early-stop', text: 'must not run', images: [] });
+    await h.session.interrupt();
+    await h.finished;
+    const results = h.outputs.filter((o) => o.kind === 'result');
+    assert.equal(results.length, 1);
+    assert.equal(results[0].result.answers, 'early-stop');
+    assert.equal(results[0].result.outcome, 'interrupted');
+    assert.ok(!h.outputs.some((o) => o.kind === 'delta'));
+    const next = h.nextResult();
+    h.session.send({ id: 'after-stop', text: 'hi', images: [] });
+    await next;
+    assert.equal(h.outputs.filter((o) => o.kind === 'result').find((o) => o.result.answers === 'after-stop')?.result.outcome, 'completed');
+    await h.session.end();
+  });
+  test(`${name}: Stop immediately after a completed turn also ends the next admitted turn`, { timeout: 3000 }, async (t) => {
+    const h = setup();
+    t.after(() => h.session.kill());
+    h.session.send({ id: 'first', text: 'hi', images: [] });
+    await h.finished;
+    const finished = h.nextResult();
+    h.session.send({ id: 'second', text: 'must not run', images: [] });
+    await h.session.interrupt();
+    await finished;
+    await h.session.end();
+    const results = h.outputs.filter((o) => o.kind === 'result');
+    assert.deepEqual(
+      results.map((o) => o.result.outcome),
+      ['completed', 'interrupted'],
+    );
+    assert.equal(h.outputs.filter((o) => o.kind === 'delta').length, 1);
   });
 }
 
