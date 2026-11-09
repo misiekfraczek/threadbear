@@ -16,6 +16,7 @@ for await (const line of readline.createInterface({input:process.stdin})) {
   } else if(m.method==='session/set_model'||m.method==='session/set_config_option') reply({});
   else if(m.method==='session/prompt') {
     prompt=m.id;prompts++;
+    if(scenario==='wait'||scenario==='queued-after-cancel') send({jsonrpc:'2.0',method:'session/update',params:{update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PROMPT_STARTED'}}}});
     if(scenario==='queued-after-cancel'&&prompts===1)continue;
     if(scenario==='eof') process.exit(0);
     if(scenario==='bad-json') {process.stdout.write('{bad}\n');continue;}

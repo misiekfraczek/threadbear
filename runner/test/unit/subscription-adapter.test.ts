@@ -28,16 +28,19 @@ for (const [name, Adapter] of [
     };
     let done!: () => void;
     const finished = new Promise<void>((r) => (done = r));
+    let started!: () => void;
+    const promptStarted = new Promise<void>((r) => (started = r));
     const session = adapter.start(opts, {
       output: (o) => {
         outputs.push(o);
         if (o.kind === 'result') done();
+        if (o.kind === 'delta' && o.delta.type === 'assistant.text.delta' && o.delta.text === 'PROMPT_STARTED') started();
       },
       exited: () => {},
       requestApproval: async () => ({ decision: 'deny' }),
       requestQuestion: async () => ({ answers: null }),
     });
-    return { outputs, session, finished, adapter, opts, statuses };
+    return { outputs, session, finished, promptStarted, adapter, opts, statuses };
   }
   test(`${name}: split JSON, unknown events and resume without replay`, async () => {
     const h = setup('ok', true);
@@ -80,7 +83,7 @@ for (const [name, Adapter] of [
     const h = setup('queued-after-cancel');
     h.session.send({ id: 'one', text: 'first', images: [] });
     h.session.send({ id: 'two', text: 'second', images: [] });
-    await new Promise((r) => setTimeout(r, 150));
+    await h.promptStarted;
     await h.session.interrupt();
     await h.finished;
     await new Promise((r) => setTimeout(r, 100));
@@ -92,7 +95,7 @@ for (const [name, Adapter] of [
   test(`${name}: cancellation does not report completion`, async () => {
     const h = setup('wait');
     h.session.send({ id: 'turn', text: 'hi', images: [] });
-    await new Promise((r) => setTimeout(r, 150));
+    await h.promptStarted;
     await h.session.interrupt();
     await h.finished;
     await h.session.end();
