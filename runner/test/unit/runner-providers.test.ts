@@ -573,6 +573,40 @@ function fakeClis(start: CliStatus[]) {
 
 const codexStatus = (v: string): CliStatus => ({ provider: 'codex', path: `/t/codex/${v}`, managedBy: 'threadbear', installedVersion: v, status: 'current', policy: 'auto', inUse: [] });
 
+test('a Claude update refreshes every Claude account and publishes the new model list', async () => {
+  const h = codexHarness();
+  await tick();
+  const asked: string[] = [];
+  const models = [{ id: 'fable', model: 'claude-fable-5-2', title: 'Fable 5.2' }];
+  h.adapter.models = async (a) => (asked.push(a.id), models);
+  h.codex.models = async (a) => { throw new Error(`unexpected probe: ${a.id}`); };
+  const status = (v: string): CliStatus => ({ ...codexStatus(v), provider: 'claude' });
+  const unknown = { ...status(''), installedVersion: undefined, status: 'unknown' as const };
+  const f = fakeClis([unknown, codexStatus('1')]);
+  h.runner.attachClis(f.clis);
+  f.emit([status('2.1.321'), codexStatus('1')]);
+  await tick();
+  assert.deepEqual(asked, [], 'initial version discovery is not an update');
+  f.emit([status('2.1.322'), codexStatus('1')]);
+  await tick();
+  const ids = h.fake.base.filter((a) => a.provider === 'claude').map((a) => a.id);
+  assert.deepEqual(asked, ids);
+  for (const a of h.runner.hello().accounts.filter((a) => a.provider === 'claude')) {
+    assert.deepEqual(a.models, models);
+  }
+  h.clock.advance(5 * SEC);
+  const published = h.notes.filter((n) => n.method === 'accounts.updated').at(-1) as any;
+  assert.deepEqual(published.params.accounts.find((a: Account) => a.id === ids[0]).models, models);
+  asked.length = 0;
+  f.emit([status('2.1.322'), codexStatus('1')]);
+  await tick();
+  assert.deepEqual(asked, [], 'unchanged installed version does not probe');
+  f.emit([{ ...unknown, status: 'missing' }, codexStatus('1')]);
+  f.emit([status('2.1.323'), codexStatus('1')]);
+  await tick();
+  assert.deepEqual(asked, ids, 'a newly available CLI refreshes the list');
+});
+
 test('CLI statuses reach hello and clis.updated, and a Codex update asks for the models again', async () => {
   const h = codexHarness();
   const asked: string[] = [];

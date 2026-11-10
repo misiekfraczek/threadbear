@@ -670,8 +670,8 @@ export class Runner {
   // E's last Codex status, to notice an update activating (or a first
   // copy arriving where there was none) as against E working out what's
   // installed when it starts.
-  codexVersion?: string;
-  codexMissing = false;
+  modelCliVersions: Partial<Record<Provider, string>> = {};
+  modelCliMissing: Partial<Record<Provider, boolean>> = {};
   // The version E last asked sessions to move to, per provider.
   wantedVersion: Partial<Record<Provider, string>> = {};
   unsubs: (() => void)[] = [];
@@ -793,8 +793,8 @@ export class Runner {
   // Asks each account's CLI for its model list, one account at a time so
   // startup doesn't spawn three CLIs at once. Clients hear through
   // accounts.updated; a failure just leaves the list unknown. `only` picks
-  // some accounts: a login that has just appeared, or every Codex account
-  // after a Codex update (a new version can change the list).
+  // some accounts: a login that has just appeared, or a provider's accounts
+  // after a CLI update (a new version can change the list).
   async probeModels(only?: (a: Account) => boolean): Promise<void> {
     const targets = this.safeAccounts().filter((a) => (!only || only(a)) && !this.probingModels.has(a.id));
     for (const a of targets) {this.probed.add(a.id);this.probingModels.add(a.id);this.lastModelProbe.set(a.id,this.clock.now());}

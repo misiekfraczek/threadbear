@@ -136,13 +136,14 @@ export const clisPart = {
     }
   },
 
-  // E's CliUpdates: hello and clis.updated carry its statuses, and a Codex
-  // update that activates asks every Codex account for its models again.
+  // E's CliUpdates: hello and clis.updated carry its statuses. An installed
+  // CLI update asks every account of that provider for its models again.
   attachClis(this: Runner, clis: CliControl): void {
     this.clis = clis;
-    const codex = this.cliList()?.find((c) => c.provider === 'codex');
-    this.codexVersion = codex?.installedVersion;
-    this.codexMissing = codex?.status === 'missing';
+    for (const cli of this.cliList() ?? []) {
+      this.modelCliVersions[cli.provider] = cli.installedVersion;
+      this.modelCliMissing[cli.provider] = cli.status === 'missing';
+    }
     this.unsubs.push(clis.onChange((list) => this.clisChanged(list)));
   },
 
@@ -166,14 +167,15 @@ export const clisPart = {
 
   clisChanged(this: Runner, list: CliStatus[]): void {
     this.notify({ method: 'clis.updated', params: { clis: list } });
-    const codex = list.find((c) => c.provider === 'codex');
-    const version = codex?.installedVersion;
-    if (version && version !== this.codexVersion) {
-      const changed = this.codexVersion !== undefined || this.codexMissing;
-      this.codexVersion = version;
-      if (changed && !this.stopping) void this.probeModels((a) => a.provider === 'codex');
+    for (const cli of list) {
+      const { provider, installedVersion: version } = cli;
+      if (version && version !== this.modelCliVersions[provider]) {
+        const changed = this.modelCliVersions[provider] !== undefined || this.modelCliMissing[provider];
+        this.modelCliVersions[provider] = version;
+        if (changed && !this.stopping) void this.probeModels((a) => a.provider === provider);
+      }
+      this.modelCliMissing[provider] = cli.status === 'missing';
     }
-    this.codexMissing = codex?.status === 'missing';
   },
 };
 

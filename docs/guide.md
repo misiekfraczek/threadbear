@@ -1410,6 +1410,10 @@ the runner and the Claude Code and Codex tools. A grey dot means something
 is in progress and will sort itself out, and a coloured dot means it needs
 you. Right-click it for a quick Restart to Update.
 
+When an installed Claude Code or Codex version changes, Threadbear refreshes
+that tool's model list automatically, so new models appear in the picker
+without restarting Threadbear.
+
 ### Mike's updates
 
 Your copy is a fork of Mike's, and it doesn't change unless you say so.
