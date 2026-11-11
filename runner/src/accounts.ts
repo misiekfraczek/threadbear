@@ -1,4 +1,7 @@
 import fs from 'node:fs';
+import { acpAccounts } from './adapters/acp/agents.ts';
+import { experimentOn } from './experiments.ts';
+import { providerName } from './providers.ts';
 import path from 'node:path';
 import { isEffortLevel, type Account, type EffortLevel, type ModelChoice } from './protocol.ts';
 import type { UsageStore } from './usage.ts';
@@ -84,7 +87,7 @@ export function isCodexLogin(dir: string): boolean {
 }
 
 export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 'tokenStatsAccountsDir'> &
-  Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'accountsDir' | 'grokPath' | 'antigravityPath'>>;
+  Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'accountsDir' | 'home' | 'cursorPath' | 'opencodePath' | 'grokPath' | 'antigravityPath'>>;
 
 // claude-main is ~/.claude (its .claude.json sits at ~/.claude.json);
 // codex-main is ~/.codex. Token Stats' Accounts folder holds claude-N and
@@ -122,7 +125,10 @@ export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
     if (isCodexLogin(dir)) out.push(codexAccount(id, dir));
   }
   for (const [provider, binary] of [['grok', cfg.grokPath], ['antigravity', cfg.antigravityPath]] as const) {
-    if (binary && fs.existsSync(binary)) out.push({id: `${provider}-main`, provider, title: provider === 'grok' ? 'Grok' : 'Google (Antigravity)', configDir: '', subscription: {state: 'unknown'}});
+    if (binary && fs.existsSync(binary)) out.push({id: `${provider}-main`, provider, title: providerName(provider), configDir: '', subscription: {state: 'unknown'}});
+  }
+  if (cfg.home && experimentOn(cfg.home, 'acpAgents')) {
+    out.push(...acpAccounts({ paths: { cursor: cfg.cursorPath, opencode: cfg.opencodePath } }));
   }
   for (const a of out) {
     const note = cfg.accountNotes?.[a.id];

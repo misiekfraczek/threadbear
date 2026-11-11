@@ -23,7 +23,7 @@ test('Google requires a confirmed consumer subscription, never just a model list
 });
 
 test('account tooling names new and unknown providers accurately', async () => {
-  const { providerTitle } = await import('../../src/protocol.ts');
+  const { providerName: providerTitle } = await import('../../src/providers.ts');
   assert.equal(providerTitle('grok'), 'Grok');
   assert.equal(providerTitle('antigravity'), 'Google (Antigravity)');
   assert.equal(providerTitle('future'), 'future');

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import type { Config } from './config.ts';
 import type { AgentAdapter } from './adapters/types.ts';
-import type { AcpDeps } from './adapters/acp/adapter.ts';
+import type { AcpDeps } from './adapters/subscription-acp/adapter.ts';
 import { GrokAdapter } from './adapters/grok/adapter.ts';
 import { AntigravityAdapter } from './adapters/antigravity/adapter.ts';
 import { experimentOn } from './experiments.ts';

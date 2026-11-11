@@ -31,8 +31,9 @@ external operation already succeeded before repeating it.
 
 ## Lives in
 
-`runner/src/subscription-*.ts`, `runner/src/adapters/acp/`, provider wrappers
-in `adapters/grok/` and `adapters/antigravity/`, `runner/subscriptions.ts`,
+`runner/src/subscription-*.ts`, `runner/src/adapters/subscription-acp/` (apart
+from the ACP agents' `adapters/acp/`), provider wrappers in `adapters/grok/`
+and `adapters/antigravity/`, their rows in `runner/src/providers.ts`, `runner/subscriptions.ts`,
 `runner/pools.ts`, the recovery hooks in `runner.ts` and `store.ts`.
 `main.ts` registers adapters only while enabled. Clients preserve provider
 strings; the Mac model picker and web formatters display their names.

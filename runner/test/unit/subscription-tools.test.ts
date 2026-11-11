@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
-import { acpTools } from '../../src/adapters/acp/tools.ts';
-import { AcpTransport } from '../../src/adapters/acp/transport.ts';
+import { acpTools } from '../../src/adapters/subscription-acp/tools.ts';
+import { AcpTransport } from '../../src/adapters/subscription-acp/transport.ts';
 import { tmpDir } from '../helpers/fakes.ts';
 import type { AdapterOutput } from '../../src/adapters/types.ts';
 
