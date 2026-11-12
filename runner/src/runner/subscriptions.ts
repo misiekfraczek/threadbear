@@ -107,7 +107,6 @@ export const subscriptionsPart = {
     if (!rec.queue.length) {
       const id = crypto.randomUUID();
       cycle.pending = { accountId: rec.accountId, turnId: id, phase: 'queued' };
-      rec.autoCarryOn = id;
       rec.queue.push({ turnId: id, text: CONTINUE, images: [], origin: 'runner' });
     }
     // Queue and selected account must be on disk before afterTurn kicks it.

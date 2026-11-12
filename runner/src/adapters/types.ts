@@ -168,6 +168,7 @@ export type SubagentUpdate = {
   parentId?: string;
   description?: string;
   agentType?: string;
+  model?: string; // the model its messages say it ran on
   status?: SubagentStatus;
   background?: boolean;
   activity?: string;
