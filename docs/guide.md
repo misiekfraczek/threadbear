@@ -2252,7 +2252,7 @@ Help > Finish Setting Up brings it back. The phone and website items only
 show when your Threadbear has a Convex deployment for them to use.
 
 Subscription fallback, including the optional Grok Build and Google
-Antigravity integrations, is described in [Experiments](experiments.md).
+Antigravity integrations, is described in `docs/experiments.md`.
 Its pool order is configurable; an account pinned to a thread stays pinned.
 The new integrations currently require Full access and cannot take over a
 thread that requires approval or a sandbox.
