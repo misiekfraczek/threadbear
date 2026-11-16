@@ -232,3 +232,69 @@ test('a previously ready login rejected at admission is skipped only in an exist
   await tick();
   assert.equal(other.adapters.codex.sessions.length, 0);
 });
+
+// 10 Nov 2026: Claude out of room in its 5-hour window moved a thread before
+// its turn, and the note said "claude-main isn't on this Mac".
+test('a move before the turn for low room says the limit, not that the login is missing', async () => {
+  const h = setup();
+  const { thread } = h.runner.create({ text: 'x', poolId: 'all' });
+  h.adapters.claude.last.init();
+  h.adapters.claude.last.result();
+  await tick();
+  const accounts = (h.runner as any).accounts as FakeAccounts;
+  accounts.base = accounts.base.map((a) =>
+    a.id === 'claude'
+      ? { ...a, usage: { windows: [{ kind: 'five_hour', title: '5-hour', remainingPercent: 0 }], readAt: new Date(h.clock.now()).toISOString(), source: 'live' } }
+      : a,
+  );
+  h.runner.send(thread.id, 'next', []);
+  await tick();
+  assert.equal(h.runner.get(thread.id).provider, 'codex');
+  const note = h.events(thread.id).filter((e: any) => e.type === 'system.note' && /^Moved to /.test(e.text)).at(-1)!.text;
+  assert.match(note, /claude hit its 5-hour limit/);
+  assert.doesNotMatch(note, /isn't on this Mac/);
+});
+
+// 11 Nov 2026: a scheduled turn in a thread that had moved to Grok (then on
+// this feature's own adapter) failed in 1.5 s with "The CLI has not confirmed
+// a supported subscription", with room on Claude. No cycle was open, so
+// nothing moved it on. Only Google starts sessions that way now.
+async function onGoogle() {
+  const h = setup();
+  const { thread } = h.runner.create({ text: 'x', poolId: 'all' });
+  for (const p of order.slice(0, 3)) {
+    limit(h.adapters[p]);
+    await tick();
+  }
+  h.adapters.antigravity.last.init();
+  h.adapters.antigravity.last.result();
+  await tick();
+  h.runner.flush();
+  assert.equal(h.store.load(thread.id)?.fallbackCycle, undefined);
+  // The other logins have their room back.
+  h.runner.ranDry.clear();
+  return { h, thread };
+}
+const lastMove = (h: { events(id: string): any[] }, id: string): string =>
+  h.events(id).filter((e: any) => e.type === 'system.note' && /^Moved to /.test(e.text)).at(-1)!.text;
+
+test('a Google login that cannot start a session moves the thread on with no cycle open', async () => {
+  const { h, thread } = await onGoogle();
+  h.runner.send(thread.id, 'Check the listing', []);
+  await tick();
+  h.adapters.antigravity.last.result('failed', undefined, 'The CLI has not confirmed a supported subscription.', { admissionFailure: true });
+  await tick();
+  assert.equal(h.runner.get(thread.id).provider, 'claude');
+  assert.match(h.adapters.claude.last.sent[0].text, /Check the listing/);
+  assert.equal(h.runner.ranDry.has('antigravity'), false, 'a failed start is not a usage limit');
+  assert.match(lastMove(h, thread.id), /could not start a session/);
+});
+
+test('a move off a login whose subscription is no longer confirmed says so', async () => {
+  const { h, thread } = await onGoogle();
+  h.runner.learnAccount('antigravity', { subscription: { state: 'unknown' } });
+  h.runner.send(thread.id, 'next', []);
+  await tick();
+  assert.equal(h.runner.get(thread.id).provider, 'claude');
+  assert.match(lastMove(h, thread.id), /^Moved to claude: antigravity can't take this turn, subscription is not confirmed\. /);
+});

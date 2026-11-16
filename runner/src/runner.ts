@@ -2689,7 +2689,13 @@ export class Runner {
       if (byline && rec.startedBy) rec.startedBy.why = byline;
     }
     // A pool thread whose login ran dry moves and carries on (afterTurn).
-    const admissionFailed = r.admissionFailure === true && !!rec.fallbackCycle && this.subscriptionFallbackOn();
+    // Google confirms its subscription as a session starts, so a thread
+    // sitting on it can fail there with no cycle open (11 Nov 2026: a
+    // scheduled turn died that way on Grok's old adapter, with room on
+    // Claude). Other logins' own sign-in errors still stop the thread where
+    // it is.
+    const startsCycle = !!rec.fallbackCycle || rec.provider === 'antigravity';
+    const admissionFailed = r.admissionFailure === true && startsCycle && this.subscriptionFallbackOn();
     const limitHit = outcome === 'failed' && (r.errorKind === 'usageLimit' || admissionFailed) ? turn.turnId : undefined;
     // One that couldn't reach the API carries on once it's back (afterTurn).
     const netLost = outcome === 'failed' && r.errorKind === 'network' ? turn.turnId : undefined;
@@ -2913,14 +2919,26 @@ export class Runner {
     const { rec } = st;
     const pool = this.poolById(rec.poolId);
     if (!pool) return;
-    const accounts = this.usableAccounts().filter(a => !this.subscriptionFallbackOn() || this.subscriptionEligible(st,a).ok);
+    const usable = this.usableAccounts();
+    const accounts = usable.filter(a => !this.subscriptionFallbackOn() || this.subscriptionEligible(st,a).ok);
     const current = accounts.find((a) => a.id === rec.accountId);
     const inPool = pool.accountIds.includes(rec.accountId);
     if (current && inPool && loginOk(current)) return;
     const now = this.clock.now();
     const next = nextLogin(pool, accounts, rec, now);
     if ('waitUntil' in next) return;
-    const why = !current ? `${rec.accountId} isn't on this Mac` : inPool ? `${current.title} ${limitWhy(current, now)}` : `${current.title} isn't in ${pool.title}`;
+    // A login the fallback's own check left out is still on this Mac: say
+    // what's wrong with it (10 Nov 2026: "claude-main isn't on this Mac"
+    // for a login short of room in its 5-hour window).
+    const known = current ?? this.safeAccounts().find((a) => a.id === rec.accountId);
+    const cant = current || !known ? undefined : this.subscriptionEligible(st, known).reason?.replace(/^[^:]*: /, '').replace(/\.$/, '');
+    const why = !known
+      ? `${rec.accountId} isn't on this Mac`
+      : !inPool
+        ? `${known.title} isn't in ${pool.title}`
+        : current || !loginOk(known)
+          ? `${known.title} ${limitWhy(known, now)}`
+          : `${known.title} can't take this turn${cant ? `, ${cant}` : ''}`;
     this.moveLogin(st, accounts.find((a) => a.id === next.accountId)!, why);
   }
 

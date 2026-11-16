@@ -19,7 +19,10 @@ The official Google Antigravity CLI can be added through `antigravityPath`
 in runner.json. It confirms its own subscription before a turn; API keys and
 Google's extra credit fallback are excluded, and it offers Gemini models
 only. This adapter currently supports Full access without a sandbox. A thread
-requiring approvals or confinement skips it, retaining its permissions. Sign
+requiring approvals or confinement skips it, retaining its permissions. A
+thread already on it moves on through the pool when the login cannot start a
+session, such as an expired sign-in; other logins' sign-in errors stay where
+they are. Sign
 in using `agy acp --login`; Threadbear never reads the login's tokens.
 Restart the runner after enabling the experiment or configuring the path.
 
