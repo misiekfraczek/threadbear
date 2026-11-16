@@ -44,6 +44,9 @@ strings; the Mac model picker and web formatters display their names.
 Since Mike's release of 16 Nov 2026 Grok is one of the ACP agents
 (`runner/src/adapters/acp/agents.ts`), and this feature's own Grok adapter
 is gone: only Antigravity runs through `adapters/subscription-acp/`.
+The ACP adapter (`adapters/acp/adapter.ts`) borrows `acpFailure` from here to
+say when a Grok turn failed at its subscription limit, so a thread on Grok
+moves on (`test/unit/subscription-grok-limit.test.ts`).
 
 ## Taking it out
 

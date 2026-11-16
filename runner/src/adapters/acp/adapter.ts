@@ -5,6 +5,7 @@
 // hook its args load: grok-guard.ts), and each request is answered from the
 // thread's permission mode at that moment. So Ask, Auto and Plan never run a
 // tool unguarded, and leaving Full takes effect at once, with no new process.
+import { acpFailure } from '../subscription-acp/normalize.ts';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -698,7 +699,10 @@ export class AcpSession implements AgentSession {
       if (e instanceof AcpExitedError) return; // the exit handler reports it
       this.emit(this.normalizer.closeOpen('Failed'));
       const auth = e instanceof AcpRpcError && e.code === AUTH_REQUIRED;
-      result = { outcome: turn.interrupted ? 'interrupted' : 'failed', durationMs: Math.max(0, this.now() - turn.startedAt), ...(turn.interrupted ? {} : { error: (e as Error).message }), ...(auth ? { errorKind: 'auth' as const } : {}) };
+      // This fork's subscription fallback: a turn refused at the login's
+      // subscription limit moves a pooled thread on (runner/subscriptions.ts).
+      const limit = !auth && !turn.interrupted && acpFailure(e).errorKind === 'usageLimit';
+      result = { outcome: turn.interrupted ? 'interrupted' : 'failed', durationMs: Math.max(0, this.now() - turn.startedAt), ...(turn.interrupted ? {} : { error: (e as Error).message }), ...(auth ? { errorKind: 'auth' as const } : limit ? { errorKind: 'usageLimit' as const } : {}) };
     }
     if (this.turn !== turn) return;
     this.turn = undefined;

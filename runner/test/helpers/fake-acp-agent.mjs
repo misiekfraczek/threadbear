@@ -286,6 +286,10 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   if (m.method === 'session/prompt') {
+    // "fail <message>": the prompt is refused with that message (this fork's
+    // subscription fallback: a login at its limit).
+    const last = m.params.prompt.findLast((b) => b.type === 'text')?.text.trim().split('\n').at(-1) ?? '';
+    if (last.startsWith('fail ')) return send({ id: m.id, error: { code: -32603, message: last.slice(5) } });
     void prompt(m.id, m.params);
     if (m.params.prompt.some((b) => b.type === 'text' && b.text.trim().split('\n').at(-1) === 'hang')) hanging.push(m.id);
     return;
