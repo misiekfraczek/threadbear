@@ -981,7 +981,7 @@ export class Runner {
 
   rescanAccounts(): void {
     const list = this.safeAccounts();
-    const fresh = new Set(list.filter((a) => !this.probed.has(a.id) || (this.subscriptionFallbackOn() && (a.provider === 'grok' || a.provider === 'antigravity') && a.subscription?.state !== 'ready' && this.clock.now() - (this.lastModelProbe.get(a.id) ?? 0) >= 60_000)).map((a) => a.id));
+    const fresh = new Set(list.filter((a) => !this.probed.has(a.id) || (this.subscriptionFallbackOn() && a.provider === 'antigravity' && a.subscription?.state !== 'ready' && this.clock.now() - (this.lastModelProbe.get(a.id) ?? 0) >= 60_000)).map((a) => a.id));
     if (fresh.size) void this.probeModels((a) => fresh.has(a.id));
     if (accountsKey(list) !== this.accountsShown) this.accountsChanged();
   }

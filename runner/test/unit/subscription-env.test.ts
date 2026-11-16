@@ -17,7 +17,7 @@ test('subscription environment excludes alternate billing without changing the c
     PATH: '/bin',
     THREADBEAR_THREAD_ID: 'thread',
   };
-  for (const provider of ['grok', 'antigravity'] as const) {
+  for (const provider of ['antigravity'] as const) {
     const cleaned = subscriptionEnv(provider, input);
     for (const key of Object.keys(input).filter((k) => !['HOME', 'PATH', 'THREADBEAR_THREAD_ID'].includes(k))) assert.equal(cleaned[key], undefined, key);
     assert.equal(cleaned.HOME, input.HOME);

@@ -2,12 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { tmpDir } from '../helpers/fakes.ts';
-import { GrokAdapter } from '../../src/adapters/grok/adapter.ts';
 import { AntigravityAdapter } from '../../src/adapters/antigravity/adapter.ts';
 import type { AdapterOutput, StartSessionOptions } from '../../src/adapters/types.ts';
 const fixture = path.resolve('test/fixtures/subscriptions/fake-acp.mjs');
 for (const [name, Adapter] of [
-  ['grok', GrokAdapter],
   ['antigravity', AntigravityAdapter],
 ] as const) {
   function setup(scenario = 'ok', resume = false) {

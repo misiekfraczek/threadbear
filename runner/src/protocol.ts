@@ -7,7 +7,7 @@ export const PROTOCOL_VERSION = 1;
 // cursor, opencode and grok run over ACP (adapters/acp/); each turns up as a
 // login only where its CLI is installed and logged in (adapters/acp/agents.ts).
 // antigravity is this fork's subscription login (adapters/subscription-acp/),
-// behind the subscriptionFallback experiment, which also runs grok its own way.
+// behind the subscriptionFallback experiment.
 export type Provider = 'claude' | 'codex' | 'cursor' | 'opencode' | 'grok' | 'antigravity';
 export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'cursor', 'opencode', 'grok', 'antigravity'];
 

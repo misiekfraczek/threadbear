@@ -40,7 +40,7 @@ export const subscriptionsPart = {
   subscriptionEligible(this: Runner, st: ThreadState, account: Account): Eligibility {
     const adapter = this.adapters[account.provider];
     if (!adapter) return { ok: false, reason: `${account.title}: CLI unavailable.` };
-    if ((account.provider === 'grok' || account.provider === 'antigravity') && account.subscription?.state !== 'ready')
+    if (account.provider === 'antigravity' && account.subscription?.state !== 'ready')
       return { ok: false, reason: `${account.title}: subscription is not confirmed.` };
     if (st.rec.confined && account.provider !== 'claude') return { ok: false, reason: `${account.title}: cannot preserve the sandbox.` };
     const options = this.subscriptionOptions(st, account);

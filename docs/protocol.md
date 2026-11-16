@@ -7304,8 +7304,9 @@ Either side may be upgraded first, so each tolerates the other:
 
 ### Subscription fallback (experiment)
 
-The `subscriptionFallback` experiment adds provider IDs `grok` (Grok Build)
-and `antigravity` (Google Antigravity, Gemini models only). Clients preserve
+The `subscriptionFallback` experiment adds the provider ID `antigravity`
+(Google Antigravity, Gemini models only); `grok` is an ACP agent with or
+without it. Clients preserve
 provider strings they do not recognize. Accounts may carry `subscription`
 metadata: `state` (`ready`, `loginRequired`, `unknown`, `unavailable`),
 `identity`, `plan` and `reason`. Only a confirmed `ready` subscription can

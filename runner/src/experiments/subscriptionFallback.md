@@ -15,14 +15,17 @@ pool's provider order. A cycle tries each account once. Known resets have a
 one-minute buffer; an unknown reset waits thirty minutes. Stop cancels the
 recovery and a new user message takes precedence. Pinned threads stay pinned.
 
-Official Grok Build and Google Antigravity CLIs can be added through
-`grokPath` and `antigravityPath` in runner.json. Each confirms its own
-subscription before a turn; API keys and Google's extra credit fallback are
-excluded. Google offers Gemini models only. These adapters currently support
-Full access without a sandbox. A thread requiring approvals or confinement
-skips them, retaining its permissions. Sign in using `grok login` or
-`agy acp --login`; Threadbear never reads the login's tokens. Restart the
-runner after enabling the experiment or configuring binary paths.
+The official Google Antigravity CLI can be added through `antigravityPath`
+in runner.json. It confirms its own subscription before a turn; API keys and
+Google's extra credit fallback are excluded, and it offers Gemini models
+only. This adapter currently supports Full access without a sandbox. A thread
+requiring approvals or confinement skips it, retaining its permissions. Sign
+in using `agy acp --login`; Threadbear never reads the login's tokens.
+Restart the runner after enabling the experiment or configuring the path.
+
+A Grok login joins the order like any other login in the pool. It runs as
+one of the ACP agents (see Accounts in the guide), which ask before every
+tool and don't confirm which plan the login is on.
 
 The recovery record is saved before dispatch. An uncertain turn after a crash
 uses the runner's existing interrupted-turn recovery, without blindly sending
@@ -32,16 +35,15 @@ external operation already succeeded before repeating it.
 ## Lives in
 
 `runner/src/subscription-*.ts`, `runner/src/adapters/subscription-acp/` (apart
-from the ACP agents' `adapters/acp/`), provider wrappers in `adapters/grok/`
-and `adapters/antigravity/`, their rows in `runner/src/providers.ts`, `runner/subscriptions.ts`,
+from the ACP agents' `adapters/acp/`), the provider wrapper in `adapters/antigravity/`,
+its row in `runner/src/providers.ts`, `runner/subscriptions.ts`,
 `runner/pools.ts`, the recovery hooks in `runner.ts` and `store.ts`.
 `main.ts` registers adapters only while enabled. Clients preserve provider
 strings; the Mac model picker and web formatters display their names.
 
-Since Mike's release of 16 Nov 2026 Grok is also one of the ACP agents
-(`runner/src/adapters/acp/agents.ts`). With this experiment on, this
-feature's own Grok adapter runs `grok-main` (it confirms the subscription and
-allows Full access only); with it off, the ACP agents' Grok does.
+Since Mike's release of 16 Nov 2026 Grok is one of the ACP agents
+(`runner/src/adapters/acp/agents.ts`), and this feature's own Grok adapter
+is gone: only Antigravity runs through `adapters/subscription-acp/`.
 
 ## Taking it out
 

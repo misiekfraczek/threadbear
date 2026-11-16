@@ -367,7 +367,7 @@ export const newThreadsPart = {
   // lists it.
   modelFits(this: Runner, account: Account, model: string): boolean {
     if (modelRow(account, model)) return true;
-    if (account.provider === 'grok' || account.provider === 'antigravity') return false;
+    if (account.provider === 'antigravity') return false;
     if (account.provider === 'codex') return !account.models?.length && model.startsWith('gpt-');
     // An ACP agent runs what it lists, and nothing can be told from the name.
     if (account.provider !== 'claude') return false;

@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import { acpAccounts } from './adapters/acp/agents.ts';
-import { experimentOn } from './experiments.ts';
 import { providerName } from './providers.ts';
 import path from 'node:path';
 import { isEffortLevel, type Account, type EffortLevel, type ModelChoice } from './protocol.ts';
@@ -125,18 +124,10 @@ export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
     if (isCodexLogin(dir)) out.push(codexAccount(id, dir));
   }
   out.push(...acpAccounts({ home: cfg.userHome, pathEnv: cfg.pathEnv, paths: { cursor: cfg.cursorPath, opencode: cfg.opencodePath, grok: cfg.grokPath } }));
-  // The subscription fallback's logins (adapters/subscription-acp/). With the
-  // experiment on its own Grok adapter runs grok-main, so its row replaces
-  // the ACP agents' one; with it off Grok is the ACP agents' alone.
-  const subscriptions = Boolean(cfg.home && experimentOn(cfg.home, 'subscriptionFallback'));
-  for (const [provider, binary] of [['grok', cfg.grokPath], ['antigravity', cfg.antigravityPath]] as const) {
-    if (provider === 'grok' && !subscriptions) continue;
-    if (!binary || !fs.existsSync(binary)) continue;
-    const id = `${provider}-main`;
-    const at = out.findIndex((a) => a.id === id);
-    const row: Account = { id, provider, title: providerName(provider), configDir: '', subscription: { state: 'unknown' } };
-    if (at >= 0) out[at] = row;
-    else out.push(row);
+  // The subscription fallback's own login (adapters/subscription-acp/).
+  // Grok is the ACP agents' above, since Mike's release of 16 Nov 2026.
+  if (cfg.antigravityPath && fs.existsSync(cfg.antigravityPath)) {
+    out.push({ id: 'antigravity-main', provider: 'antigravity', title: providerName('antigravity'), configDir: '', subscription: { state: 'unknown' } });
   }
   for (const a of out) {
     const note = cfg.accountNotes?.[a.id];

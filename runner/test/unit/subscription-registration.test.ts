@@ -3,19 +3,18 @@ import assert from 'node:assert/strict';
 import { tmpDir } from '../helpers/fakes.ts';
 import { writeRunnerJson } from '../../src/config.ts';
 import { subscriptionAdapters } from '../../src/subscription-registration.ts';
-test('experiment off never registers subscription CLIs; on registers only executable paths', () => {
+test('experiment off never registers the subscription CLI; on registers only an executable path', () => {
   const home = tmpDir();
-  const cfg = { home, grokPath: process.execPath, antigravityPath: '/missing/agy' };
-  assert.deepEqual(subscriptionAdapters(cfg, { toolsFor: () => [] }), {});
+  assert.deepEqual(subscriptionAdapters({ home, antigravityPath: process.execPath }, { toolsFor: () => [] }), {});
   writeRunnerJson(home, { experiments: { subscriptionFallback: true } });
-  const adapters = subscriptionAdapters(cfg, { toolsFor: () => [] });
-  assert.equal(adapters.grok?.provider, 'grok');
-  assert.equal(adapters.antigravity, undefined);
+  assert.equal(subscriptionAdapters({ home, antigravityPath: process.execPath }, { toolsFor: () => [] }).antigravity?.provider, 'antigravity');
+  assert.deepEqual(subscriptionAdapters({ home, antigravityPath: '/missing/agy' }, { toolsFor: () => [] }), {});
 });
 
-// Mike's release of 16 Nov runs Grok as an ACP agent of its own. The
-// subscription fallback's Grok takes grok-main only while its experiment is on.
-test('grok-main is the ACP agents\' with the experiment off and the subscription fallback\'s with it on', async () => {
+// Mike's release of 16 Nov runs Grok as an ACP agent of its own, and since
+// then the subscription fallback has no Grok adapter: grok-main is always
+// the ACP agents' row, whatever the experiment says.
+test('grok-main is the ACP agents\' with the experiment off and on', async () => {
   const fs = await import('node:fs');
   const path = await import('node:path');
   const { discoverAccounts } = await import('../../src/accounts.ts');
@@ -27,15 +26,12 @@ test('grok-main is the ACP agents\' with the experiment off and the subscription
   const grok = path.join(userHome, 'grok');
   fs.writeFileSync(grok, '#!/bin/sh\n', { mode: 0o755 });
   const cfg = { home, userHome, pathEnv: '', claudeMainDir: '/missing', claudeMainJson: '/missing', tokenStatsAccountsDir: '/missing', grokPath: grok, antigravityPath: grok };
-  const off = discoverAccounts(cfg);
-  const offGrok = off.filter((a) => a.provider === 'grok');
-  assert.equal(offGrok.length, 1);
-  assert.equal(offGrok[0].subscription, undefined, 'the ACP agents\' row');
-  assert.equal(offGrok[0].configDir, path.join(userHome, '.grok'));
-  writeRunnerJson(home, { experiments: { subscriptionFallback: true } });
-  const on = discoverAccounts(cfg);
-  const onGrok = on.filter((a) => a.id === 'grok-main');
-  assert.equal(onGrok.length, 1, 'never two rows for one login');
-  assert.deepEqual(onGrok[0].subscription, { state: 'unknown' });
-  assert.ok(on.some((a) => a.id === 'antigravity-main'));
+  for (const on of [false, true]) {
+    if (on) writeRunnerJson(home, { experiments: { subscriptionFallback: true } });
+    const rows = discoverAccounts(cfg).filter((a) => a.provider === 'grok');
+    assert.equal(rows.length, 1, 'never two rows for one login');
+    assert.equal(rows[0].subscription, undefined, 'the ACP agents\' row');
+    assert.equal(rows[0].configDir, path.join(userHome, '.grok'));
+  }
+  assert.ok(discoverAccounts(cfg).some((a) => a.id === 'antigravity-main'));
 });

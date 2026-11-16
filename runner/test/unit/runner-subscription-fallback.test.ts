@@ -11,7 +11,7 @@ function setup() {
     provider: p,
     title: p,
     configDir: '',
-    subscription: p === 'grok' || p === 'antigravity' ? { state: 'ready' } : undefined,
+    subscription: p === 'antigravity' ? { state: 'ready' } : undefined,
   }));
   const h = makeHarness(undefined, { pools: [{ id: 'all', title: 'All', accountIds: order }] }, { adapters, accounts: new FakeAccounts(accounts) });
   writeRunnerJson(h.home, { experiments: { subscriptionFallback: true } });
@@ -194,14 +194,14 @@ test('recovery reusing a live CLI persists dispatch before sending', async () =>
 
 test('an unready subscription is re-probed after login without restarting, with a bounded interval', async () => {
   const h = setup();
-  h.runner.learnAccount('grok', { subscription: { state: 'loginRequired' } });
+  h.runner.learnAccount('antigravity', { subscription: { state: 'loginRequired' } });
   let probes = 0;
-  h.adapters.grok.models = async () => {
+  h.adapters.antigravity.models = async () => {
     probes++;
-    if (probes === 2) h.runner.learnAccount('grok', { subscription: { state: 'ready' } });
+    if (probes === 2) h.runner.learnAccount('antigravity', { subscription: { state: 'ready' } });
     return [];
   };
-  await h.runner.probeModels((a) => a.id === 'grok');
+  await h.runner.probeModels((a) => a.id === 'antigravity');
   h.clock.advance(59_000);
   await tick();
   assert.equal(probes, 1);

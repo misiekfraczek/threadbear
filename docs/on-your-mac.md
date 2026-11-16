@@ -704,13 +704,14 @@ sequence number of what it flagged, in `<data>/secret-check.json`. Never the tex
 
 ### Optional subscription CLIs
 
-With the `subscriptionFallback` experiment enabled and `grokPath` or
-`antigravityPath` configured, the runner starts that official CLI to check its
+With the `subscriptionFallback` experiment enabled and `antigravityPath`
+configured, the runner starts that official CLI to check its
 subscription and model list, and starts a separate process for each live
 thread. The CLI uses its own saved login, files and network connections.
 Threadbear does not read or copy OAuth tokens. It removes API authentication
 variables from the child environment and disables Antigravity's extra-credit
-fallback. These CLIs are not installed or updated by Threadbear.
+fallback. This CLI is not installed or updated by Threadbear. Grok is one
+of the ACP agents above, with or without the experiment.
 
 A session uses a temporary loopback HTTP listener with an unpredictable path
 and a stdio MCP child to reach the same Threadbear tool handlers as other

@@ -18,14 +18,14 @@ export type AcpDeps = {
   toolsFor: (threadId: string) => ToolDefinition[];
   onStatus?: (account: Account, status: SubscriptionStatus, models: ModelChoice[]) => void;
 };
-export function acpArgs(provider: SubscriptionProvider): string[] {
-  return provider === 'grok' ? ['agent', '--no-leader', 'stdio'] : ['--settings', JSON.stringify({ useG1Credits: false, modelProvider: '', gcp: {} }), 'acp'];
+export function acpArgs(_provider: SubscriptionProvider): string[] {
+  return ['--settings', JSON.stringify({ useG1Credits: false, modelProvider: '', gcp: {} }), 'acp'];
 }
-export function acpModels(provider: SubscriptionProvider, response: any): ModelChoice[] {
+export function acpModels(_provider: SubscriptionProvider, response: any): ModelChoice[] {
   const available = response?.models?.availableModels;
   if (!Array.isArray(available)) return [];
   return available
-    .filter((m) => typeof m.modelId === 'string' && m.modelId.startsWith(provider === 'grok' ? 'grok-' : 'gemini-'))
+    .filter((m) => typeof m.modelId === 'string' && m.modelId.startsWith('gemini-'))
     .map((m) => ({ id: m.modelId, model: m.modelId, title: String(m.name ?? m.modelId) }));
 }
 export class AcpAdapter implements AgentAdapter {
@@ -66,10 +66,8 @@ export class AcpAdapter implements AgentAdapter {
     );
     try {
       await rpc.call('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'threadbear', version: '1' } });
-      let status: SubscriptionStatus | undefined;
-      if (this.provider === 'grok') status = subscriptionStatus(this.provider, await rpc.call('authenticate', { methodId: 'cached_token' }));
       const r = await rpc.call('session/new', { cwd, mcpServers: [] });
-      status ??= subscriptionStatus(this.provider, r);
+      const status = subscriptionStatus(this.provider, r);
       const models = acpModels(this.provider, r);
       this.deps.onStatus?.(account, status, models);
       return status.state === 'ready' ? models : [];
@@ -168,14 +166,12 @@ class AcpSession implements AgentSession {
     const init = await this.rpc.call('initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'threadbear', version: '1' } });
     if (this.opts.resume && init.agentCapabilities?.loadSession !== true) throw new Error('CLI does not support session load.');
     if (init.agentInfo?.version) this.sink.output({ kind: 'cliVersion', version: init.agentInfo.version });
-    let status: SubscriptionStatus | undefined;
-    if (this.provider === 'grok') status = subscriptionStatus(this.provider, await this.rpc.call('authenticate', { methodId: 'cached_token' }));
     const r = await this.rpc.call(this.opts.resume ? 'session/load' : 'session/new', {
       ...(this.opts.resume ? { sessionId: this.opts.sessionId } : {}),
       cwd: this.opts.cwd,
       mcpServers: [this.bridge.config],
     });
-    status ??= subscriptionStatus(this.provider, r);
+    const status = subscriptionStatus(this.provider, r);
     const models = acpModels(this.provider, r);
     this.deps.onStatus?.(this.opts.account, status, models);
     if (status.state !== 'ready') throw new Error(status.reason ?? 'The CLI did not confirm a subscription.');
@@ -271,8 +267,8 @@ class AcpSession implements AgentSession {
   private async effort(effort: EffortLevel): Promise<void> {
     await this.rpc.call('session/set_config_option', {
       sessionId: this.id,
-      configId: this.provider === 'grok' ? 'reasoning_effort' : 'thought_level',
-      value: this.provider === 'grok' ? { value: effort } : effort,
+      configId: 'thought_level',
+      value: effort,
     });
   }
   async setEffort(effort: EffortLevel | undefined): Promise<void> {

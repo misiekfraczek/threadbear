@@ -91,7 +91,7 @@ export const poolsPart = {
   usable(this: Runner, all: Account[]): Account[] {
     const now = this.clock.now();
     return all
-      .filter((a) => this.adapters[a.provider] && (this.subscriptionFallbackOn() ? (a.provider !== 'grok' && a.provider !== 'antigravity') || a.subscription?.state === 'ready' : a.provider !== 'antigravity'))
+      .filter((a) => this.adapters[a.provider] && (a.provider !== 'antigravity' || (this.subscriptionFallbackOn() && a.subscription?.state === 'ready')))
       .map((a) => {
         const until = this.ranDry.get(a.id);
         if (until === undefined || until <= now || a.usage?.blocked) return a;
