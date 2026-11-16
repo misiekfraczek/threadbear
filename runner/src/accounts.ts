@@ -86,7 +86,7 @@ export function isCodexLogin(dir: string): boolean {
   return store === 'keyring' || store === 'auto';
 }
 
-export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 'tokenStatsAccountsDir'> &
+export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 'tokenStatsAccountsDir' | 'userHome' | 'pathEnv'> &
   Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'accountsDir' | 'home' | 'cursorPath' | 'opencodePath' | 'grokPath' | 'antigravityPath'>>;
 
 // claude-main is ~/.claude (its .claude.json sits at ~/.claude.json);
@@ -124,11 +124,19 @@ export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
   for (const { id, dir } of [...codex, ...numbered('codex')]) {
     if (isCodexLogin(dir)) out.push(codexAccount(id, dir));
   }
+  out.push(...acpAccounts({ home: cfg.userHome, pathEnv: cfg.pathEnv, paths: { cursor: cfg.cursorPath, opencode: cfg.opencodePath, grok: cfg.grokPath } }));
+  // The subscription fallback's logins (adapters/subscription-acp/). With the
+  // experiment on its own Grok adapter runs grok-main, so its row replaces
+  // the ACP agents' one; with it off Grok is the ACP agents' alone.
+  const subscriptions = Boolean(cfg.home && experimentOn(cfg.home, 'subscriptionFallback'));
   for (const [provider, binary] of [['grok', cfg.grokPath], ['antigravity', cfg.antigravityPath]] as const) {
-    if (binary && fs.existsSync(binary)) out.push({id: `${provider}-main`, provider, title: providerName(provider), configDir: '', subscription: {state: 'unknown'}});
-  }
-  if (cfg.home && experimentOn(cfg.home, 'acpAgents')) {
-    out.push(...acpAccounts({ paths: { cursor: cfg.cursorPath, opencode: cfg.opencodePath } }));
+    if (provider === 'grok' && !subscriptions) continue;
+    if (!binary || !fs.existsSync(binary)) continue;
+    const id = `${provider}-main`;
+    const at = out.findIndex((a) => a.id === id);
+    const row: Account = { id, provider, title: providerName(provider), configDir: '', subscription: { state: 'unknown' } };
+    if (at >= 0) out[at] = row;
+    else out.push(row);
   }
   for (const a of out) {
     const note = cfg.accountNotes?.[a.id];

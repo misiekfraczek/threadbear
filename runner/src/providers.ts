@@ -5,7 +5,6 @@
 //
 // What's left comparing names is really about one CLI's own files or
 // behaviour (copying Claude's transcripts, Codex's model list).
-import { experimentOn } from './experiments.ts';
 import { PROVIDERS, type Provider, type ProviderInfo } from './protocol.ts';
 
 export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
@@ -61,21 +60,25 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     smallJobs: true,
     usageReadings: false,
   },
-  // This fork's subscription logins (adapters/subscription-acp/): Full
-  // access only, effort levels as Codex's, and no sandbox, rewind, small
-  // jobs or usage readings.
   grok: {
     id: 'grok',
     name: 'Grok',
     cliName: 'Grok',
     loginCommand: 'grok login',
+    // Its models list their own levels (low to xhigh), which narrow this
+    // (AcpSession sets them as the session's thought_level option).
     effort: 'codex',
     autoMode: 'asks',
     sandbox: false,
     rewind: false,
-    smallJobs: false,
+    // Threadbear's hook denies every tool for a small job, reads included
+    // (adapters/acp/grok-guard.ts).
+    smallJobs: true,
     usageReadings: false,
   },
+  // This fork's subscription login (adapters/subscription-acp/): Full access
+  // only, effort levels as Codex's, and no sandbox, rewind, small jobs or
+  // usage readings. Runs only with the subscriptionFallback experiment on.
   antigravity: {
     id: 'antigravity',
     name: 'Google (Antigravity)',
@@ -89,17 +92,6 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     usageReadings: false,
   },
 };
-
-const ACP: readonly Provider[] = ['cursor', 'opencode'];
-const SUBSCRIPTION: readonly Provider[] = ['grok', 'antigravity'];
-
-// The providers this runner offers: the ACP agents only with the experiment
-// on, so with it off nothing of theirs turns up anywhere.
-export function activeProviders(home: string): Provider[] {
-  const acp = experimentOn(home, 'acpAgents');
-  const subscriptions = experimentOn(home, 'subscriptionFallback');
-  return PROVIDERS.filter((p) => (acp || !ACP.includes(p)) && (subscriptions || !SUBSCRIPTION.includes(p)));
-}
 
 // One this build has no row for (a record or another runner's hello from a
 // build that has more): it can do nothing, so no check takes it for Claude

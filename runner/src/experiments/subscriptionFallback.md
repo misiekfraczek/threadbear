@@ -38,6 +38,11 @@ and `adapters/antigravity/`, their rows in `runner/src/providers.ts`, `runner/su
 `main.ts` registers adapters only while enabled. Clients preserve provider
 strings; the Mac model picker and web formatters display their names.
 
+Since Mike's release of 16 Nov 2026 Grok is also one of the ACP agents
+(`runner/src/adapters/acp/agents.ts`). With this experiment on, this
+feature's own Grok adapter runs `grok-main` (it confirms the subscription and
+allows Full access only); with it off, the ACP agents' Grok does.
+
 ## Taking it out
 
 Disable the experiment and remove the extra logins from pools first. Remove
