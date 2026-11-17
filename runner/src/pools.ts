@@ -340,7 +340,14 @@ function localLogin(m: PoolMember, accounts: Account[], runnerId: string): Accou
   }
   if (!m.email) return undefined;
   const email = m.email.toLowerCase();
-  return accounts.find((a) => a.provider === m.provider && emailOf(a) === email);
+  const byEmail = accounts.find((a) => a.provider === m.provider && emailOf(a) === email);
+  if (byEmail || m.runnerId) return byEmail;
+  // This fork: the provider's only login here, when it doesn't say whose it
+  // is. Grok's account had an email while the subscription fallback's own
+  // adapter ran it and has none on the ACP agents', which never read the
+  // login, so pools saved before named it by email (16 Nov 2026).
+  const ofProvider = accounts.filter((a) => a.provider === m.provider);
+  return ofProvider.length === 1 && !emailOf(ofProvider[0]!) ? ofProvider[0] : undefined;
 }
 
 // The shared list as this runner's pools: each with the logins it has, in

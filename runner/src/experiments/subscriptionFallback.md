@@ -50,6 +50,9 @@ is gone: only Antigravity runs through `adapters/subscription-acp/`.
 The ACP adapter (`adapters/acp/adapter.ts`) borrows `acpFailure` from here to
 say when a Grok turn failed at its subscription limit, so a thread on Grok
 moves on (`test/unit/subscription-grok-limit.test.ts`).
+A shared pool saved before then names Grok by the email the old adapter
+learned; `localLogin` in `runner/src/pools.ts` lets such a member stand for
+the provider's only login when that login has no email.
 
 ## Taking it out
 

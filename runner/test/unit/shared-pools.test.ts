@@ -162,3 +162,22 @@ test("a reorder on another runner moves the Mac's pinned member too", () => {
   const after = toShared([{ id: 'mix', title: 'Mix', accountIds: ['codex-main', 'claude-main'] }], shared, HZ, 'hz');
   assert.deepEqual(after[0]!.members, [{ provider: 'codex', email: 'alex@example.net' }, { provider: 'claude', email: 'alex@example.net', runnerId: 'laptop', accountId: 'claude-2' }]);
 });
+
+// This fork: until Mike's release of 16 Nov 2026 the subscription fallback's
+// own Grok adapter learned the login's email, so shared pools name Grok by
+// email. The ACP agents' Grok never reads the login, so its account has no
+// email, and it fell out of both of Michał's pools (16 Nov).
+test("a member named by email stands for a provider's only login when that login doesn't say whose it is", () => {
+  const grok: Account = { id: 'grok-main', provider: 'grok', title: 'Grok', configDir: '/g' };
+  const shared: SharedPool[] = [{ id: 'all', title: 'All', members: [{ provider: 'claude', email: 'alex@example.net' }, { provider: 'grok', email: 'alex@example.net' }] }];
+  const here = [login('claude-main', 'alex@example.net'), grok];
+  assert.deepEqual(fromShared(shared, here, 'laptop')[0]!.accountIds, ['claude-main', 'grok-main']);
+  // A save keeps the member as it was, in its place.
+  assert.deepEqual(toShared([{ id: 'all', title: 'All', accountIds: ['claude-main', 'grok-main'] }], shared, here, 'laptop')[0]!.members.map((m) => m.provider), ['claude', 'grok']);
+  // Two logins of the provider, or one with another email, can't be told to be it.
+  assert.deepEqual(fromShared(shared, [...here, { ...grok, id: 'grok-2' }], 'laptop')[0]!.accountIds, ['claude-main']);
+  assert.deepEqual(fromShared(shared, [here[0]!, { ...grok, email: 'someone@else.example' }], 'laptop')[0]!.accountIds, ['claude-main']);
+  // One another runner pinned by id is that runner's, not this one's.
+  const pinned: SharedPool[] = [{ id: 'all', title: 'All', members: [{ provider: 'grok', email: 'alex@example.net', runnerId: 'hz', accountId: 'grok-main' }] }];
+  assert.deepEqual(fromShared(pinned, [grok], 'laptop'), []);
+});
