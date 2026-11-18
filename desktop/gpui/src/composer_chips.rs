@@ -869,7 +869,7 @@ impl Render for ModelPickerView {
             .children(rail_columns.into_iter().map(|(id, title, _, _)| {
                 let active = if pools { id == provider } else { id == column };
                 let this = this.clone();
-                h_flex().id(SharedString::from(format!("picker-provider-{id}"))).role(Role::Button).aria_label(title.clone())
+                h_flex().id(SharedString::from(format!("picker-provider-{id}"))).test_support().role(Role::Button).aria_label(format!("Browse {title} models"))
                     .h(px(36.)).px(px(7.)).gap(px(6.)).rounded(px(7.)).cursor_pointer()
                     .when(active, |s| s.bg(active_fill)).when(!active, |s| s.hover(move |s| s.bg(hover_fill)))
                     .text_color(if active { fg } else { secondary })
@@ -889,7 +889,7 @@ impl Render for ModelPickerView {
             .children(pool_columns.into_iter().map(|(id, title, _, _)| {
                 let active = id == column;
                 let this = this.clone();
-                div().id(SharedString::from(format!("picker-pool-{id}"))).role(Role::Button)
+                div().id(SharedString::from(format!("picker-pool-{id}"))).test_support().role(Role::Button).aria_label(format!("Browse models in {title}"))
                     .px(px(8.)).py(px(5.)).rounded(px(5.)).text_size(px(12.)).cursor_pointer()
                     .when(active, |s| s.bg(active_fill)).hover(move |s| s.bg(hover_fill))
                     .child(title.clone()).tip(format!("Browse models in {title}"))
@@ -915,7 +915,7 @@ impl Render for ModelPickerView {
         list = list.children(main.into_iter().map(|r| row_view(r, cx)));
         if !older.is_empty() && provider != "claude" {
             let this = this.clone();
-            list = list.child(div().id("picker-all-models").role(Role::Button).px(px(10.)).py(px(8.)).text_size(px(12.)).cursor_pointer()
+            list = list.child(div().id("picker-all-models").test_support().role(Role::Button).aria_label("Show or hide other model versions; search always includes them").px(px(10.)).py(px(8.)).text_size(px(12.)).cursor_pointer()
                 .child(if self.show_all { "Show fewer models" } else { "Show all versions and models" })
                 .tip("Show or hide other model versions; search always includes them")
                 .on_click(move |_, _, cx| { if let Some(this) = this.upgrade() { this.update(cx, |this, cx| { this.show_all = !this.show_all; cx.notify(); }); } }));
@@ -1192,7 +1192,7 @@ fn model_row(row: PickerRow, provider: &str, cx: &App, action: impl Fn(&mut Wind
     let (fg, secondary) = (cx.theme().foreground, cx.theme().muted_foreground);
     let (selected_fill, hover_fill) = (style::primary_opacity(cx, 0.1), style::primary_opacity(cx, 0.06));
     h_flex()
-        .id(SharedString::from(format!("model-{}", row.id))).role(Role::Button).tip(format!("{}{}", row.id, row.subtitle.as_ref().map_or(String::new(), |s| format!(" · {s}"))))
+        .id(SharedString::from(format!("model-{}", row.id))).test_support().role(Role::Button).aria_label(row.id.clone()).tip(format!("{}{}", row.id, row.subtitle.as_ref().map_or(String::new(), |s| format!(" · {s}"))))
         .gap(px(10.))
         .pl(px(6.))
         .pr(px(10.))

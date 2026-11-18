@@ -203,7 +203,7 @@ Then('the model picker uses the {string} login', async function (this: Threadbea
   let lines: string[] = [];
   for (let n = 0; n < 40; n++) {
     lines = await menuLines(this, 'model');
-    if (lines.some(l => l.startsWith('--- Login: Auto') && l.includes(provider))) return;
+    if (lines.some(l => l.startsWith('--- Login: Auto') && l.toLowerCase().includes(`(${provider.toLowerCase()} for now)`))) return;
     await sleep(150);
   }
   assert.fail(`login did not change to ${provider}: ${lines.join('\n')}`);
