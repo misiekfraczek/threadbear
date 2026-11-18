@@ -884,7 +884,7 @@ impl Render for ModelPickerView {
                         }); }
                     })
             }));
-        let pool_header = pools.then(|| h_flex().px(px(10.)).py(px(6.)).gap(px(4.))
+        let pool_header = pools.then(|| h_flex().flex_wrap().px(px(10.)).py(px(6.)).gap(px(4.))
             .child(div().text_size(px(11.)).text_color(secondary).child("Pool:"))
             .children(pool_columns.into_iter().map(|(id, title, _, _)| {
                 let active = id == column;
@@ -921,7 +921,7 @@ impl Render for ModelPickerView {
                 .on_click(move |_, _, cx| { if let Some(this) = this.upgrade() { this.update(cx, |this, cx| { this.show_all = !this.show_all; cx.notify(); }); } }));
         }
         if !older.is_empty() && (provider == "claude" || self.show_all) {
-            list = list.child(div().px(px(10.)).pt(px(8.)).pb(px(2.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(style::faint_text(cx)).child("Older")).children(older.into_iter().map(|r| row_view(r, cx)));
+            list = list.child(div().px(px(10.)).pt(px(8.)).pb(px(2.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(style::faint_text(cx)).child(if provider == "claude" { "Older" } else { "More versions and options" })).children(older.into_iter().map(|r| row_view(r, cx)));
         }
         let composer_for_effort = self.composer.clone();
         let effort = (!levels.is_empty()).then(|| {
