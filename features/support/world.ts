@@ -144,6 +144,10 @@ Before(async function (this: ThreadbearWorld, { pickle }) {
   else delete process.env.TB_MOCK_NESTED;
   if (nestedOff) process.env.TB_MOCK_NESTED_OFF = '1';
   else delete process.env.TB_MOCK_NESTED_OFF;
+  // The subscription providers' logins (Grok, Google's Antigravity), which
+  // the mock leaves out otherwise.
+  if (pickle.tags.some((t) => t.name === '@subscription-logins')) process.env.TB_MOCK_SUBSCRIPTIONS = '1';
+  else delete process.env.TB_MOCK_SUBSCRIPTIONS;
   // Parts of a project: Photo sync as a part of Threadbear.
   if (pickle.tags.some((t) => t.name === '@project-parts')) process.env.TB_MOCK_PARTS = '1';
   else delete process.env.TB_MOCK_PARTS;

@@ -16,6 +16,12 @@ Feature: The Usage panel and its honey pot
     Then the Usage chart is "Tokens by day"
     And the Usage chart's key names "alex, work, alex+3, alex+4, Codex"
 
+  @usage.spend @subscription-logins
+  Scenario: A login that isn't Claude's goes by its provider's name
+    When I click the honey pot in the activity bar
+    And I show the last 7 days on the Usage chart
+    Then the Usage chart's key names "alex, work, alex+3, alex+4, Codex, Grok, Google (Antigravity)"
+
   @usage.pools
   Scenario: A card for each pool, with what each login has left
     When I click the honey pot in the activity bar

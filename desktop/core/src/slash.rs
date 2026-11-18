@@ -104,6 +104,8 @@ pub fn cli_name(provider: &str) -> String {
     match provider {
         "claude" | "" => "Claude Code".to_owned(),
         "codex" => "Codex".to_owned(),
+        "grok" => "Grok".to_owned(),
+        "antigravity" => "Google (Antigravity)".to_owned(),
         other => {
             let mut chars = other.chars();
             chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()

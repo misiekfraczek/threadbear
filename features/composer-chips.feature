@@ -91,6 +91,16 @@ Feature: The chips under the message box
     And the window is 560 points wide
     Then the chips under the box fit inside it
 
+  # Only Claude logins go by their email. Any other provider's goes by the
+  # provider's name, as Codex's always did (the Swift app's 80bc92c2).
+  @composer.modelpicker @swift-pending
+  Scenario: A Grok login in the pool goes by its provider's name
+    When the runner gets a "grok" login "sam@example.com" in the pool "claude"
+    Then the "model" menu has a row "[ ] Grok"
+    When I pick "Login: Grok" from the "model" menu
+    Then the "model" menu has a row "--- Login: Grok"
+    And the "model" menu has a row "# Pinned to Grok"
+
   # Without pools there's a login chip: another Mac's thread, as mac-mini has none.
   @composer.account @remote-threads
   Scenario: The login picker groups the logins by provider, with the room each has left

@@ -270,6 +270,8 @@ pub fn provider_title(id: &str) -> String {
     match id {
         "claude" | "" => "Claude".to_owned(),
         "codex" => "Codex".to_owned(),
+        "grok" => "Grok".to_owned(),
+        "antigravity" => "Google (Antigravity)".to_owned(),
         other => {
             let mut chars = other.chars();
             chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
@@ -584,8 +586,9 @@ pub fn twin_label(account: &Account, accounts: &[Account]) -> Option<String> {
 }
 
 /// AccountName.short: the part of a Claude email before the @, unless
-/// another Claude account shares it; "Codex", or "Codex sam.lee" if there
-/// are several. A login whose whole email another shares goes by its note
+/// another Claude account shares it. Any other provider's login goes by
+/// its provider: "Codex" or "Grok", or "Codex sam.lee" if there are
+/// several. A login whose whole email another shares goes by its note
 /// or id (twin_label).
 pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
     let Some(account) = accounts.iter().find(|a| a.id == id) else { return id.to_owned() };
@@ -595,8 +598,9 @@ pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
     let full = account.name();
     let local = |s: &str| s.split('@').next().unwrap_or(s).to_owned();
     let siblings: Vec<&Account> = accounts.iter().filter(|a| a.id != id && a.provider_id() == account.provider_id()).collect();
-    if account.provider_id() == "codex" {
-        return if siblings.is_empty() { "Codex".to_owned() } else { format!("Codex {}", local(&full)) };
+    if account.provider_id() != "claude" {
+        let provider = provider_title(account.provider_id());
+        return if siblings.is_empty() { provider } else { format!("{provider} {}", local(&full)) };
     }
     if !full.contains('@') {
         return full;
@@ -642,6 +646,28 @@ mod tests {
             permission_mode: "full".into(),
             cwd: "/x".into(),
             is_new: false,
+        }
+    }
+
+    #[test]
+    fn subscription_logins_go_by_their_provider() {
+        let l = RunnerLogins::from_hello(&json!({ "accounts": [
+            { "id": "claude-main", "provider": "claude", "email": "alex@example.com" },
+            { "id": "grok-main", "provider": "grok", "title": "alex@example.com" },
+            { "id": "antigravity-main", "provider": "antigravity", "title": "alex@example.com" },
+            { "id": "future-1", "provider": "future-provider", "title": "sam@example.com" },
+            { "id": "future-2", "provider": "future-provider", "title": "lee@example.com" }
+        ]}));
+        assert_eq!(provider_title("grok"), "Grok");
+        assert_eq!(provider_title("antigravity"), "Google (Antigravity)");
+        assert_eq!(provider_title("future-provider"), "Future-provider");
+        assert_eq!(short_account_name("claude-main", &l.accounts), "alex");
+        assert_eq!(short_account_name("grok-main", &l.accounts), "Grok");
+        assert_eq!(short_account_name("antigravity-main", &l.accounts), "Google (Antigravity)");
+        assert_eq!(short_account_name("future-1", &l.accounts), "Future-provider sam");
+        // No Claude aliases for a provider with no list of its own.
+        for provider in ["grok", "antigravity", "future-provider"] {
+            assert!(picker_rows(&[], None, None, "", provider).is_empty());
         }
     }
 

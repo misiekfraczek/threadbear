@@ -47,6 +47,8 @@ pub fn login_command(provider: &str) -> &'static str {
         "codex" => "codex login",
         "cursor" => "agent login",
         "opencode" => "opencode auth login",
+        "grok" => "grok login",
+        "antigravity" => "agy acp --login",
         "claude" | "" => "claude auth login",
         _ => "",
     }
@@ -132,6 +134,15 @@ mod tests {
         let s = script(&account("codex-1", "codex", "c", "/tmp/it's here"), "/opt/codex");
         assert!(s.contains("CODEX_HOME='/tmp/it'\\''s here' '/opt/codex' login"), "{s}");
         assert!(s.starts_with("#!/bin/zsh -l\n"));
+    }
+
+    #[test]
+    fn subscription_logins_sign_in_with_their_own_cli() {
+        let grok = script(&account("grok-main", "grok", "g", ""), "");
+        assert!(grok.contains("\ngrok login\n"), "{grok}");
+        let agy = script(&account("antigravity-main", "antigravity", "a", ""), "/opt/agy");
+        assert!(agy.contains("\n'/opt/agy' acp --login\n"), "{agy}");
+        assert!(agy.contains("Signing in to Google (Antigravity) for Threadbear"), "{agy}");
     }
 
     #[test]

@@ -1163,6 +1163,11 @@ reads their passwords or tokens. The account and model a thread runs on are
 small menus on the composer. Whatever you picked last is what the next
 thread starts on.
 
+Logins outside Claude use their provider's name, such as Grok or
+Google (Antigravity), in the thread's account menu and the Usage chart.
+If you have several logins for one provider, a short login name or a note
+tells them apart.
+
 Once a thread has run a turn, a small ring beside the send button shows
 how full its context is: how much of the model's window the conversation
 takes up. It turns orange when it's nearly full, as Claude and Codex

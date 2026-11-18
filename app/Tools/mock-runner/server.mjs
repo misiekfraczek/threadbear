@@ -153,12 +153,24 @@ let accounts = [
     }),
   },
 ];
+// TB_MOCK_SUBSCRIPTIONS: the subscription providers' logins too (Grok and
+// Google's Antigravity), titled as the runner titles them, with the email a
+// reading gave. Last, so the other logins' made-up usage stays as it was.
+const subscriptionLogins = process.env.TB_MOCK_SUBSCRIPTIONS ? [
+  {
+    id: 'grok-main', provider: 'grok', title: 'Grok', configDir: '~/.grok', defaultModel: 'grok-4.7',
+    models: [{ id: 'grok-4.7', model: 'grok-4.7', title: 'Grok 4.7', effortLevels: ['low', 'medium', 'high', 'xhigh'] }],
+    email: 'alex@example.com',
+  },
+  { id: 'antigravity-main', provider: 'antigravity', title: 'Google (Antigravity)', configDir: '', email: 'alex@example.com' },
+] : [];
+accounts.push(...subscriptionLogins);
 // usage.stats (docs/protocol.md, "Usage history"), made up but steady: the
 // same seed every time, so screenshots only change when the code does.
 // Each login works the hours of a day (busier in the afternoon, quiet at
 // night), at its own pace; its weekly and 5-hour readings go down with its
 // tokens and come back at its resets, ending on what `accounts` says now.
-const tokenPace = { 'claude-main': 1.0, 'claude-2': 0.08, 'claude-3': 0.45, 'claude-4': 0.7, 'codex-main': 0.25 };
+const tokenPace = { 'claude-main': 1.0, 'claude-2': 0.08, 'claude-3': 0.45, 'claude-4': 0.7, 'codex-main': 0.25, 'grok-main': 0.3, 'antigravity-main': 0.15 };
 function seeded(seed) {
   let x = seed >>> 0;
   return () => ((x = (x * 1664525 + 1013904223) >>> 0) / 2 ** 32);
@@ -248,6 +260,12 @@ let pools = [
   { id: 'personal', title: 'Personal', accountIds: ['codex-main', 'claude-3'], icon: 'hammer' },
   { id: 'weekends', title: 'Weekends', accountIds: ['claude-4'], icon: 'moon' },
 ];
+if (subscriptionLogins.length) {
+  pools.push(
+    { id: 'grok', title: 'Grok', accountIds: ['grok-main'], builtIn: true },
+    { id: 'antigravity', title: 'Google (Antigravity)', accountIds: ['antigravity-main'], builtIn: true },
+  );
+}
 const poolOf = (id) => pools.find((pool) => pool.id === id);
 // The room a login has: the tighter of its 5-hour and weekly windows; none
 // when it's blocked. Unknown usage counts as room.
@@ -1864,9 +1882,15 @@ async function dispatch(client, method, p) {
       return { thread: t.summary };
     }
     case 'mock.accounts': {
-      // Replaces the account list ({accounts}), or plays a runner from
+      // Replaces the account list ({accounts}), adds a login, or plays a runner from
       // before step 4 ({old: true}: no usage, no clis.*) until {old: false}.
       if (Array.isArray(p.accounts)) accounts = p.accounts;
+      // {add, pool}: one more login, put in that pool (a Grok one, say).
+      if (p.add?.id) {
+        accounts = [...accounts.filter((a) => a.id !== p.add.id), p.add];
+        const pool = poolOf(p.pool);
+        if (pool && !pool.accountIds.includes(p.add.id)) pool.accountIds.push(p.add.id);
+      }
       if (typeof p.old === 'boolean') oldRunner = p.old;
       broadcast('accounts.updated', { accounts: publicAccounts() });
       if (!oldRunner) broadcast('pools.updated', { pools });
