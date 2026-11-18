@@ -182,10 +182,11 @@ fn domain_part(address: &str) -> Option<String> {
 
 /// `AccountName.login`: the first part of its email's domain ("acme" for
 /// sam@acme.io), or the part before the @ when another login shares that
-/// domain, else the whole address. Codex reads as `short` has it.
+/// domain, else the whole address. Another provider's (Codex, Grok) reads as `short`
+/// has it.
 pub fn login_name(id: &str, accounts: &[Account]) -> String {
     let Some(account) = accounts.iter().find(|a| a.id == id) else { return id.to_owned() };
-    if account.provider_id() == "codex" {
+    if account.provider_id() != "claude" {
         return short_account_name(id, accounts);
     }
     let full = account.name();
@@ -205,7 +206,7 @@ pub fn login_name(id: &str, accounts: &[Account]) -> String {
 /// `AccountName.label`: a name for a card, where a whole address doesn't fit.
 pub fn account_label(id: &str, accounts: &[Account]) -> String {
     let Some(account) = accounts.iter().find(|a| a.id == id) else { return id.to_owned() };
-    if account.provider_id() == "codex" {
+    if account.provider_id() != "claude" {
         return short_account_name(id, accounts);
     }
     let full = account.name();

@@ -1864,9 +1864,15 @@ async function dispatch(client, method, p) {
       return { thread: t.summary };
     }
     case 'mock.accounts': {
-      // Replaces the account list ({accounts}), or plays a runner from
+      // Replaces the account list ({accounts}), adds a login, or plays a runner from
       // before step 4 ({old: true}: no usage, no clis.*) until {old: false}.
       if (Array.isArray(p.accounts)) accounts = p.accounts;
+      // {add, pool}: one more login, put in that pool (a Grok one, say).
+      if (p.add?.id) {
+        accounts = [...accounts.filter((a) => a.id !== p.add.id), p.add];
+        const pool = poolOf(p.pool);
+        if (pool && !pool.accountIds.includes(p.add.id)) pool.accountIds.push(p.add.id);
+      }
       if (typeof p.old === 'boolean') oldRunner = p.old;
       broadcast('accounts.updated', { accounts: publicAccounts() });
       if (!oldRunner) broadcast('pools.updated', { pools });

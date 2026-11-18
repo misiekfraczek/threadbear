@@ -36,6 +36,11 @@ Then('the {string} menu has no row {string}', async function (this: ThreadbearWo
   assert.fail(`the ${menu} menu still has "${row}":\n${lines.join('\n')}`);
 });
 
+// One more login on the runner, in a pool (mock.accounts {add, pool}).
+When('the runner gets a {string} login {string} in the pool {string}', async function (this: ThreadbearWorld, provider: string, email: string, pool: string) {
+  await this.app.do({ cmd: 'mock', method: 'accounts', params: { add: { id: `${provider}-main`, provider, title: email, email }, pool } });
+});
+
 // The model chip clicked, as a person does, which opens its popover.
 When('I open the model picker', async function (this: ThreadbearWorld) {
   await this.app.do({ cmd: 'composer-menu', menu: 'model', show: true });

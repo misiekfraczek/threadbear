@@ -270,6 +270,8 @@ pub fn provider_title(id: &str) -> String {
     match id {
         "claude" | "" => "Claude".to_owned(),
         "codex" => "Codex".to_owned(),
+        "grok" => "Grok".to_owned(),
+        "antigravity" => "Google (Antigravity)".to_owned(),
         other => {
             let mut chars = other.chars();
             chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
@@ -584,8 +586,9 @@ pub fn twin_label(account: &Account, accounts: &[Account]) -> Option<String> {
 }
 
 /// AccountName.short: the part of a Claude email before the @, unless
-/// another Claude account shares it; "Codex", or "Codex sam.lee" if there
-/// are several. A login whose whole email another shares goes by its note
+/// another Claude account shares it. Any other provider's login goes by
+/// the provider's name: "Codex", "Grok", "Google (Antigravity)", or
+/// "Codex sam.lee" if there are several. A login whose whole email another shares goes by its note
 /// or id (twin_label).
 pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
     let Some(account) = accounts.iter().find(|a| a.id == id) else { return id.to_owned() };
@@ -595,8 +598,9 @@ pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
     let full = account.name();
     let local = |s: &str| s.split('@').next().unwrap_or(s).to_owned();
     let siblings: Vec<&Account> = accounts.iter().filter(|a| a.id != id && a.provider_id() == account.provider_id()).collect();
-    if account.provider_id() == "codex" {
-        return if siblings.is_empty() { "Codex".to_owned() } else { format!("Codex {}", local(&full)) };
+    if account.provider_id() != "claude" {
+        let provider = provider_title(account.provider_id());
+        return if siblings.is_empty() { provider } else { format!("{provider} {}", local(&full)) };
     }
     if !full.contains('@') {
         return full;
@@ -698,6 +702,23 @@ mod tests {
         assert_eq!(short_account_name("codex-main", &l.accounts), "Codex");
         assert_eq!(l.account("claude-main").unwrap().name(), "alex@example.com");
         assert_eq!(l.account("codex-main").unwrap().name(), "sam@example.com");
+    }
+
+    /// Ports the Swift app's 80bc92c2: only Codex went by its provider's
+    /// name, so a Grok login read as the start of its email, like Claude's.
+    #[test]
+    fn other_providers_logins_go_by_the_providers_name() {
+        let a = |id: &str, provider: &str, email: &str| Account { id: id.into(), provider: provider.into(), email: Some(email.into()), ..Default::default() };
+        let mut accounts = vec![a("claude-main", "claude", "alex@example.com"), a("grok-main", "grok", "sam@example.com"), a("antigravity-main", "antigravity", "sam@example.com")];
+        assert_eq!(short_account_name("grok-main", &accounts), "Grok");
+        assert_eq!(short_account_name("antigravity-main", &accounts), "Google (Antigravity)");
+        assert_eq!(crate::new_thread::login_name("grok-main", &accounts), "Grok");
+        assert_eq!(crate::new_thread::account_label("antigravity-main", &accounts), "Google (Antigravity)");
+        assert_eq!(short_account_name("claude-main", &accounts), "alex");
+        accounts.push(a("grok-2", "grok", "lee@example.com"));
+        assert_eq!(short_account_name("grok-main", &accounts), "Grok sam");
+        assert_eq!(crate::new_thread::login_name("grok-2", &accounts), "Grok lee");
+        assert_eq!(provider_title("future-provider"), "Future-provider");
     }
 
     #[test]
