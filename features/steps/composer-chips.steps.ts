@@ -172,3 +172,39 @@ When('the window is {int} points wide', async function (this: ThreadbearWorld, w
 Then('the chips under the box fit inside it', async function (this: ThreadbearWorld) {
   await this.until('the chips inside the box', (d) => (d.composer as { chipsFit?: boolean }).chipsFit === true);
 });
+
+// A mixed pool exposes every provider, including opaque ACP model options.
+Given('the model picker has a mixed provider pool', async function (this: ThreadbearWorld) {
+  const catalog: Record<string, string[]> = {
+    claude: ['opus'],
+    codex: ['gpt-6.2-astra', 'gpt-6-astra', 'gpt-6.2-sol', 'gpt-6.1-terra'],
+    cursor: ['gpt-5.6-sol[reasoning=medium,fast=false]'],
+    grok: ['grok-4.7', 'grok-4.7-build-fast'],
+    antigravity: ['gemini-4-argon-high', 'gemini-4-argon-low'],
+  };
+  const accounts = Object.entries(catalog).map(([provider, ids]) => ({
+    id: `${provider}-main`, provider, title: provider,
+    defaultModel: ids[0], models: ids.map(id => ({ id, model: id, title: id })),
+  }));
+  await this.app.do({ cmd: 'mock', method: 'accounts', params: {
+    accounts, pools: [{ id: 'claude', title: 'Models', accountIds: accounts.map(a => a.id) }],
+  } });
+});
+
+When('I browse {string} models in the picker', async function (this: ThreadbearWorld, provider: string) {
+  await this.app.do({ cmd: 'click', tip: `Browse ${provider} models` });
+});
+
+Then('the selected model chip contains {string}', async function (this: ThreadbearWorld, model: string) {
+  await this.until(`selected model ${model}`, d => (d.composer as { chip?: string }).chip?.includes(model));
+});
+
+Then('the model picker uses the {string} login', async function (this: ThreadbearWorld, provider: string) {
+  let lines: string[] = [];
+  for (let n = 0; n < 40; n++) {
+    lines = await menuLines(this, 'model');
+    if (lines.some(l => l.startsWith('--- Login: Auto') && l.includes(provider))) return;
+    await sleep(150);
+  }
+  assert.fail(`login did not change to ${provider}: ${lines.join('\n')}`);
+});

@@ -156,3 +156,22 @@ Feature: The chips under the message box
     And I paste the picture into the composer
     And the composer holds 2 pictures
     Then clicking the thumbnail of picture 1 opens picture 1 of 2
+
+  # GPUI adds provider browsing inside a mixed pool; Swift is frozen.
+  @composer.modelpicker @swift-pending
+  Scenario: A mixed pool lets me choose a Codex family and an older exact version
+    Given the model picker has a mixed provider pool
+    When I open the model picker
+    And I browse "Codex" models in the picker
+    And I search the model picker for "gpt-6-astra" and press Return
+    Then the selected model chip contains "gpt-6-astra"
+    And the model picker uses the "codex" login
+
+  @composer.modelpicker @swift-pending
+  Scenario: Choosing Cursor keeps its model parameters
+    Given the model picker has a mixed provider pool
+    When I open the model picker
+    And I browse "Cursor" models in the picker
+    And I search the model picker for "sol" and press Return
+    Then the selected model chip contains "gpt-5.6-sol[reasoning=medium,fast=false]"
+    And the model picker uses the "cursor" login

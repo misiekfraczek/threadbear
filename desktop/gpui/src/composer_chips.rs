@@ -147,27 +147,33 @@ impl Composer {
     /// A pick from a provider column or pool that isn't the thread's own
     /// (ThreadSettings.pick): the model moves with it. Without pools a
     /// provider's column moves the thread to that provider's account.
-    fn pick_model(&self, row: &PickerRow, column: &str, data: &ChipData, cx: &mut App) {
+    fn pick_model(&self, row: &PickerRow, column: &str, picked_provider: &str, data: &ChipData, cx: &mut App) {
         let Some(settings) = data.settings() else { return };
-        let model = (!row.is_default).then(|| row.id.clone());
+        let model = (picked_provider != "claude" || !row.is_default).then(|| row.id.clone());
         if settings.uses_pools() {
-            if settings.pool().is_some_and(|p| p.id == column) || column == PINNED_COLUMN {
+            if (settings.pool().is_some_and(|p| p.id == column) && settings.provider == picked_provider) || column == PINNED_COLUMN {
                 return self.set_model(model, cx);
             }
             // On a new thread the draft moves to that pool and its provider
             // (AppModel.choosePool); the model is remembered under it.
             if data.is_new {
-                let provider = data.logins.pool(column).and_then(|p| p.account_ids.iter().find_map(|id| data.logins.account(id))).map(|a| a.provider_id().to_owned());
+                let provider = Some(picked_provider.to_owned());
                 return self.change_thread(|_| {}, json!({ "poolId": column, "provider": provider, "model": model }), cx);
             }
             // Picks the pool, and in it the model, on the provider the column
             // shows: a pool with both providers' logins would otherwise keep
             // the thread's own, and model null (the default row) names none.
-            let provider = data.logins.pool(column).and_then(|p| p.account_ids.iter().find_map(|id| data.logins.account(id))).map(|a| a.provider_id().to_owned());
+            let provider = Some(picked_provider.to_owned());
+            let guess_provider = picked_provider.to_owned();
+            let guess_account = data.logins.pool(column).and_then(|p| threadbear_core::new_thread::pool_logins(p, &data.logins.accounts, Some(picked_provider)).first().map(|a| a.id.clone()));
             let (pool, guess_pool, guess_model) = (column.to_owned(), column.to_owned(), model.clone());
             self.change_thread(
                 move |t| {
                     t.pool_id = Some(guess_pool);
+                    t.provider = guess_provider;
+                    if let Some(account) = guess_account { t.account_id = account; }
+                    t.effort = None;
+                    t.effort_in_use = None;
                     t.model = guess_model;
                 },
                 json!({ "poolId": pool, "provider": provider, "model": model }),
@@ -758,6 +764,8 @@ pub(crate) struct ModelPickerView {
     column: Option<String>,
     /// The Login line's list is open.
     login_open: bool,
+    provider: Option<String>,
+    show_all: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -771,7 +779,7 @@ impl ModelPickerView {
             }
             cx.notify();
         });
-        ModelPickerView { composer, search, column: None, login_open: false, _subs: vec![sub] }
+        ModelPickerView { composer, search, column: None, login_open: false, provider: None, show_all: false, _subs: vec![sub] }
     }
 
     /// The column the list shows, the provider its models are from, and its
@@ -782,13 +790,19 @@ impl ModelPickerView {
         let own_column = if pools { settings.pool().map_or(PINNED_COLUMN.to_owned(), |p| p.id.clone()) } else { settings.provider.clone() };
         let column = self.column.clone().unwrap_or(own_column);
         let query = self.search.read(cx).value().to_string();
-        let provider = if pools {
-            data.logins.pool(&column).and_then(|p| p.account_ids.iter().find_map(|id| data.logins.account(id))).map_or(settings.provider.clone(), |a| a.provider_id().to_owned())
-        } else {
-            column.clone()
-        };
-        let (main, older): (Vec<_>, Vec<_>) = settings.rows(&provider, &query).into_iter().partition(|r| !r.is_older);
+        let providers = self.providers(&data, &column);
+        let provider = self.provider.as_ref().filter(|p| providers.contains(p))
+            .or_else(|| providers.iter().find(|p| **p == settings.provider))
+            .or(providers.first()).cloned()?;
+        let (main, older): (Vec<_>, Vec<_>) = settings.rows_in_column(&column, &provider, &query).into_iter().partition(|r| !r.is_older);
         Some((column, provider, main.into_iter().chain(older).collect()))
+    }
+
+    fn providers(&self, data: &ChipData, column: &str) -> Vec<String> {
+        let Some(settings) = data.settings() else { return Vec::new() };
+        if settings.uses_pools() {
+            data.logins.pool(column).map(|p| threadbear_core::new_thread::pool_providers(p, &data.logins.accounts)).unwrap_or_else(|| vec![settings.provider])
+        } else { vec![column.to_owned()] }
     }
 
     /// Return in the search: the first model listed, as a click on it would.
@@ -796,9 +810,9 @@ impl ModelPickerView {
     fn pick_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(composer) = self.composer.upgrade() else { return };
         let data = composer.read(cx).chip_data(cx);
-        let Some((column, _, rows)) = self.listed(&data, cx) else { return };
+        let Some((column, provider, rows)) = self.listed(&data, cx) else { return };
         let Some(first) = rows.into_iter().next() else { return };
-        composer.update(cx, |c, cx| c.pick_model(&first, &column, &data, cx));
+        composer.update(cx, |c, cx| c.pick_model(&first, &column, &provider, &data, cx));
         window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
     }
 }
@@ -837,72 +851,59 @@ impl Render for ModelPickerView {
         let query = self.search.read(cx).value().to_string();
         let Some((column, provider, rows)) = self.listed(&data, cx) else { return div().into_any_element() };
         let (main, older): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| !r.is_older);
-        let levels = settings.effort_levels();
+        let levels = if provider == settings.provider { settings.effort_levels() } else { Vec::new() };
         let chosen = settings.effective_effort();
-        let width = if pools { 440. } else { 380. };
-        let rail_width = if pools { 96. } else { 44. };
+        let width = if pools { 500. } else { 440. };
+        let rail_width = if pools { 112. } else { 44. };
         let this = cx.entity().downgrade();
         let (fg, secondary) = (cx.theme().foreground, cx.theme().muted_foreground);
         let (active_fill, hover_fill) = (style::primary_opacity(cx, 0.1), style::primary_opacity(cx, 0.06));
         // Down the whole of the popover's left, a shade off its fill
         // (`PickerRail`). Its height comes from the row below stretching it,
         // and v_flex keeps its buttons at the top.
-        let rail = v_flex().w(px(rail_width)).flex_shrink_0().py(px(6.)).gap(px(4.)).bg(style::primary_opacity(cx, 0.03)).children(columns.into_iter().enumerate().map(|(i, (id, title, subtitle, providers))| {
-            let active = id == column;
-            let this = this.clone();
-            let color = if active { fg } else { secondary };
-            let tip = match &subtitle {
-                Some(sub) if pools => format!("{title}: {sub}"),
-                _ => title.clone(),
-            };
-            let button = if pools {
-                // `PoolButton`: the pool's providers' logos, its title, and
-                // its logins and best room.
-                v_flex()
-                    .id(("picker-rail", i))
-                    .mx(px(6.))
-                    .h(px(if providers.is_empty() { 40. } else { 56. }))
-                    .px(px(4.))
-                    .items_center()
-                    .justify_center()
-                    .gap(px(1.))
-                    .rounded(px(7.))
-                    .when(!providers.is_empty(), |s| {
-                        s.child(h_flex().gap(px(4.)).pb(px(3.)).children(providers.iter().map(|p| crate::icons::provider_mark(p).with_size(px(15.)).text_color(color))))
-                    })
-                    .child(div().max_w_full().text_size(px(12.)).text_color(color).truncate().child(title))
-                    .when_some(subtitle, |s, sub| s.child(div().text_size(px(10.5)).text_color(style::faint_text(cx)).child(sub)))
-            } else {
-                // `IconButton`: a provider's logo, its name in the tip.
-                v_flex()
-                    .id(("picker-rail", i))
-                    .mx(px(7.))
-                    .size(px(30.))
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(7.))
-                    .child(crate::icons::provider_mark(providers.first().map_or("claude", String::as_str)).with_size(px(16.)).text_color(color))
-            };
-            button
-                .cursor_pointer()
-                .when(active, |s| s.bg(active_fill))
-                .when(!active, |s| s.hover(move |s| s.bg(hover_fill)))
-                .tip(tip.clone())
-                .on_click(move |_, _, cx| {
-                    if let Some(this) = this.upgrade() {
-                        this.update(cx, |this, cx| {
-                            this.column = Some(id.clone());
+        let pool_columns = columns.clone();
+        let rail_columns = if pools {
+            self.providers(&data, &column).into_iter().map(|p| (p.clone(), data.logins.provider_title(&p), None, vec![p])).collect()
+        } else { columns };
+        let rail = v_flex().w(px(rail_width)).flex_shrink_0().p(px(6.)).gap(px(4.)).bg(style::primary_opacity(cx, 0.03))
+            .children(rail_columns.into_iter().map(|(id, title, _, _)| {
+                let active = if pools { id == provider } else { id == column };
+                let this = this.clone();
+                h_flex().id(SharedString::from(format!("picker-provider-{id}"))).role(Role::Button).aria_label(title.clone())
+                    .h(px(36.)).px(px(7.)).gap(px(6.)).rounded(px(7.)).cursor_pointer()
+                    .when(active, |s| s.bg(active_fill)).when(!active, |s| s.hover(move |s| s.bg(hover_fill)))
+                    .text_color(if active { fg } else { secondary })
+                    .child(crate::icons::provider_mark(&id).with_size(px(15.)))
+                    .when(pools, |s| s.child(div().text_size(px(12.)).truncate().child(title.clone())))
+                    .tip(format!("Browse {title} models"))
+                    .on_click(move |_, _, cx| {
+                        if let Some(this) = this.upgrade() { this.update(cx, |this, cx| {
+                            if pools { this.provider = Some(id.clone()); } else { this.column = Some(id.clone()); }
+                            this.show_all = false;
                             cx.notify();
-                        });
-                    }
-                })
-        }));
+                        }); }
+                    })
+            }));
+        let pool_header = pools.then(|| h_flex().px(px(10.)).py(px(6.)).gap(px(4.))
+            .child(div().text_size(px(11.)).text_color(secondary).child("Pool:"))
+            .children(pool_columns.into_iter().map(|(id, title, _, _)| {
+                let active = id == column;
+                let this = this.clone();
+                div().id(SharedString::from(format!("picker-pool-{id}"))).role(Role::Button)
+                    .px(px(8.)).py(px(5.)).rounded(px(5.)).text_size(px(12.)).cursor_pointer()
+                    .when(active, |s| s.bg(active_fill)).hover(move |s| s.bg(hover_fill))
+                    .child(title.clone()).tip(format!("Browse models in {title}"))
+                    .on_click(move |_, _, cx| { if let Some(this) = this.upgrade() { this.update(cx, |this, cx| {
+                        this.column = Some(id.clone()); this.provider = None; this.show_all = false; cx.notify();
+                    }); } })
+            })));
         let row_view = |row: PickerRow, cx: &App| {
             let composer = self.composer.clone();
             let (data, column, picked) = (self.chip_snapshot(cx), column.clone(), row.clone());
+            let picked_provider = provider.clone();
             model_row(row, &provider, cx, move |window, cx| {
                 if let Some(c) = composer.upgrade() {
-                    c.update(cx, |c, cx| c.pick_model(&picked, &column, &data, cx));
+                    c.update(cx, |c, cx| c.pick_model(&picked, &column, &picked_provider, &data, cx));
                 }
                 window.dispatch_action(Box::new(gpui_kit::base::actions::Cancel), cx);
             })
@@ -912,7 +913,14 @@ impl Render for ModelPickerView {
             list = list.child(div().p(px(10.)).text_size(px(13.)).text_color(cx.theme().muted_foreground).child(if query.is_empty() { "No models listed yet" } else { "Nothing matches" }));
         }
         list = list.children(main.into_iter().map(|r| row_view(r, cx)));
-        if !older.is_empty() {
+        if !older.is_empty() && provider != "claude" {
+            let this = this.clone();
+            list = list.child(div().id("picker-all-models").role(Role::Button).px(px(10.)).py(px(8.)).text_size(px(12.)).cursor_pointer()
+                .child(if self.show_all { "Show fewer models" } else { "Show all versions and models" })
+                .tip("Show or hide other model versions; search always includes them")
+                .on_click(move |_, _, cx| { if let Some(this) = this.upgrade() { this.update(cx, |this, cx| { this.show_all = !this.show_all; cx.notify(); }); } }));
+        }
+        if !older.is_empty() && (provider == "claude" || self.show_all) {
             list = list.child(div().px(px(10.)).pt(px(8.)).pb(px(2.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(style::faint_text(cx)).child("Older")).children(older.into_iter().map(|r| row_view(r, cx)));
         }
         let composer_for_effort = self.composer.clone();
@@ -959,7 +967,7 @@ impl Render for ModelPickerView {
         // down the whole popover beside the list: h_flex centres its children
         // on the cross axis, which left the rail floating mid-height with its
         // shade only behind its buttons (12 Nov).
-        h_flex().w(px(width)).items_stretch().child(rail).child(div().w(px(1.)).bg(style::hairline(cx))).child(right).into_any_element()
+        v_flex().w(px(width)).children(pool_header).child(h_flex().items_stretch().child(rail).child(div().w(px(1.)).bg(style::hairline(cx))).child(right)).into_any_element()
     }
 }
 
@@ -1184,7 +1192,7 @@ fn model_row(row: PickerRow, provider: &str, cx: &App, action: impl Fn(&mut Wind
     let (fg, secondary) = (cx.theme().foreground, cx.theme().muted_foreground);
     let (selected_fill, hover_fill) = (style::primary_opacity(cx, 0.1), style::primary_opacity(cx, 0.06));
     h_flex()
-        .id(SharedString::from(format!("model-{}", row.id))).role(Role::Button)
+        .id(SharedString::from(format!("model-{}", row.id))).role(Role::Button).tip(format!("{}{}", row.id, row.subtitle.as_ref().map_or(String::new(), |s| format!(" · {s}"))))
         .gap(px(10.))
         .pl(px(6.))
         .pr(px(10.))
@@ -1280,8 +1288,10 @@ fn picker_lines_with(data: &ChipData, login: Option<(String, (String, Option<Str
         for pool in &data.logins.pools {
             let is_own = settings.pool().is_some_and(|p| p.id == pool.id);
             lines.push(format!("# {}{}", if is_own { "[x] " } else { "[ ] " }, pool.title));
-            let provider = pool.account_ids.iter().find_map(|id| data.logins.account(id)).map_or("claude".to_owned(), |a| a.provider_id().to_owned());
-            add_rows(settings.rows(&provider, ""), &mut lines);
+            for provider in threadbear_core::new_thread::pool_providers(pool, &data.logins.accounts) {
+                lines.push(format!("## {}", data.logins.provider_title(&provider)));
+                add_rows(settings.rows_in_column(&pool.id, &provider, ""), &mut lines);
+            }
         }
     } else {
         let mut seen: Vec<String> = Vec::new();
@@ -1381,7 +1391,7 @@ pub(crate) fn picker_click(composer: &Entity<Composer>, title: &str, cx: &mut Ap
         if let Some(own) = settings.pool() {
             order.sort_by_key(|p| p.id != own.id);
         }
-        order.iter().map(|p| (p.id.clone(), p.account_ids.iter().find_map(|id| data.logins.account(id)).map_or("claude".to_owned(), |a| a.provider_id().to_owned()))).collect()
+        order.iter().flat_map(|p| threadbear_core::new_thread::pool_providers(p, &data.logins.accounts).into_iter().map(|provider| (p.id.clone(), provider))).collect()
     } else {
         let mut providers: Vec<String> = Vec::new();
         for a in &data.logins.accounts {
@@ -1392,8 +1402,8 @@ pub(crate) fn picker_click(composer: &Entity<Composer>, title: &str, cx: &mut Ap
         providers.into_iter().map(|p| (p.clone(), p)).collect()
     };
     for (column, provider) in &columns {
-        if let Some(row) = settings.rows(provider, "").into_iter().find(|r| r.title == title) {
-            composer.update(cx, |c, cx| c.pick_model(&row, column, &data, cx));
+        if let Some(row) = settings.rows_in_column(column, provider, "").into_iter().find(|r| r.title == title || r.id == title) {
+            composer.update(cx, |c, cx| c.pick_model(&row, column, provider, &data, cx));
             return Ok(());
         }
     }

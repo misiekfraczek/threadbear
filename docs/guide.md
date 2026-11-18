@@ -588,6 +588,13 @@ own commands and your skills (`/compact`, `/context`, `/cost`, `/clear`,
 uncommitted changes, or what you write after it), `/clear` or `/new`,
 `/status`, and `/` with the name of one of your Codex skills.
 
+In the desktop app's model picker, choose a pool at the top, then a
+provider on the left. A mixed pool lists all its providers. Codex and the
+other non-Claude integrations show model families with their versions
+underneath. “Show all versions and models” reveals other versions; search
+includes them even while collapsed. Picking a version keeps that exact model,
+including Cursor's options or Antigravity's variant. Claude's list is unchanged.
+
 Two are Threadbear's own, on both: `/model` and `/effort` change the
 thread's model and effort level, the same as the menus under the message
 box, so the change sticks. On their own they say what the thread is on and

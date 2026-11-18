@@ -1207,6 +1207,15 @@ them), `-32000` anything else with a readable `message`.
 
 ### Models and effort across providers
 
+The GPUI model picker lists every provider in the selected pool, in pool
+order. Browsing a provider does not change a thread. Selecting a model sends
+the pool ID, explicit provider and exact ModelChoice.id, even when it is
+that provider's default; Claude retains its existing default alias behaviour.
+The picker displays family and version separately for recognised non-Claude
+IDs. Full IDs, including ACP parameters, remain selectable and searchable.
+Unknown models retain the CLI's label. Older versions are expandable.
+
+
 The Mac app offers **Continue with Codex Sol** above the composer when the
 latest failed Claude turn has the provider's safeguards refusal error and
 the thread's runner has an unrestricted Codex login with room and

@@ -890,8 +890,8 @@ async function dispatch(client, method, p) {
         const pool = poolOf(p.poolId);
         if (!pool) throw rpcError(-32602, `no pool ${p.poolId}`);
         s.poolId = pool.id;
-        if (!pool.accountIds.includes(s.accountId)) {
-          const sameProvider = pickInPool(pool, s.provider);
+        if (!pool.accountIds.includes(s.accountId) || (p.provider && p.provider !== s.provider)) {
+          const sameProvider = pickInPool(pool, p.provider ?? s.provider);
           const next = sameProvider ?? pickInPool(pool);
           if (next) {
             if (providerOf(next) !== s.provider) {
@@ -1885,6 +1885,7 @@ async function dispatch(client, method, p) {
       // Replaces the account list ({accounts}), adds a login, or plays a runner from
       // before step 4 ({old: true}: no usage, no clis.*) until {old: false}.
       if (Array.isArray(p.accounts)) accounts = p.accounts;
+      if (Array.isArray(p.pools)) { validatePools(p.pools); pools = p.pools; }
       // {add, pool}: one more login, put in that pool (a Grok one, say).
       if (p.add?.id) {
         accounts = [...accounts.filter((a) => a.id !== p.add.id), p.add];

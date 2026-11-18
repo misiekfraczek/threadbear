@@ -324,9 +324,58 @@ pub fn chip_title(model: Option<&str>, effort: Option<&str>, choices: &[ModelCho
     }
 }
 
+/// A readable family and version, without changing the CLI's opaque ID.
+/// Unknown naming schemes keep the CLI's own label.
+fn family_title(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map_or_else(String::new, |first| format!("{}{}", first.to_uppercase(), chars.as_str()))
+}
+
+fn model_options(options: &str) -> String {
+    options.split(',').filter(|s| !s.is_empty()).map(|option| {
+        match option.split_once('=') {
+            Some(("context", value)) => format!("{value} context"),
+            Some(("reasoning" | "reasoning_effort" | "effort", value)) => format!("{} effort", family_title(value)),
+            Some(("fast", "true")) => "Fast".into(),
+            Some(("fast", "false")) => "Standard speed".into(),
+            Some(("thinking", "true")) => "Thinking".into(),
+            Some(("thinking", "false")) => "Thinking off".into(),
+            _ => option.to_owned(),
+        }
+    }).collect::<Vec<_>>().join(" · ")
+}
+
+fn model_family(id: &str) -> Option<(String, String, Vec<u32>)> {
+    let (base, options) = id.split_once('[').map_or((id, ""), |(b, o)| (b, o.trim_end_matches(']')));
+    let words: Vec<&str> = base.split('-').collect();
+    let (brand, version, family, variant) = match words.as_slice() {
+        ["gpt", v, f @ ("astra" | "sol" | "terra" | "luna")] => ("GPT", *v, *f, String::new()),
+        ["gemini", v, f, rest @ ..] => ("Gemini", *v, *f, rest.join(" ")),
+        ["grok", v, rest @ ..] => ("Grok", *v, "grok", rest.join(" ")),
+        ["composer", v] => ("Composer", *v, "composer", String::new()),
+        ["claude", f, rest @ ..] if !rest.is_empty() => {
+            let version = rest.join(".");
+            let numbers = rest.iter().map(|x| x.parse::<u32>()).collect::<Result<Vec<_>, _>>().ok()?;
+            let name = family_title(f);
+            return Some((name, format!("Claude {version}{}", if options.is_empty() { String::new() } else { format!(" · {}", model_options(options)) }), numbers));
+        }
+        _ => return None,
+    };
+    let numbers = version.split('.').map(|x| x.parse::<u32>()).collect::<Result<Vec<_>, _>>().ok()?;
+    if family.is_empty() { return None; }
+    let mut title = family_title(family);
+    // Grok's Build Fast is a distinct choice, not an older Grok.
+    if brand == "Grok" && !variant.is_empty() { title.push_str(&format!(" {}", variant.split_whitespace().map(|w| family_title(w)).collect::<Vec<_>>().join(" "))); }
+    let mut detail = if brand == "GPT" { format!("GPT-{version}") } else { format!("{brand} {version}") };
+    if !variant.is_empty() && brand != "Grok" { detail.push_str(&format!(" · {variant}")); }
+    if !options.is_empty() { detail.push_str(&format!(" · {}", model_options(options))); }
+    Some((title, detail, numbers))
+}
+
 /// ModelPicker.rows: one account's list. For Claude the main rows are the
 /// aliases plus whatever the default and the chosen model are; dated and old
-/// full ids are older. Codex ids are all dashed, so every model is a main row.
+/// full ids are older. Other providers show the latest of each recognised
+/// family, plus the current and default choices; the rest remain searchable.
 pub fn picker_rows(choices: &[ModelChoice], default_id: Option<&str>, selected: Option<&str>, query: &str, provider: &str) -> Vec<PickerRow> {
     let codex = provider != "claude" && !provider.is_empty();
     let fallback: Vec<ModelChoice> = if codex {
@@ -336,12 +385,22 @@ pub fn picker_rows(choices: &[ModelChoice], default_id: Option<&str>, selected: 
     };
     let known: &[ModelChoice] = if choices.is_empty() { &fallback } else { choices };
     let matches = |c: &ModelChoice, id: Option<&str>| id.filter(|s| !s.is_empty()).is_some_and(|id| c.id == id || c.model == id);
-    let is_main = |c: &ModelChoice| codex || c.id.chars().all(char::is_alphabetic) || matches(c, default_id) || matches(c, selected);
+    let mut latest: HashMap<String, (Vec<u32>, String)> = HashMap::new();
+    if codex {
+        for c in known {
+            if let Some((family, _, version)) = model_family(&c.id) {
+                let entry = latest.entry(family).or_insert_with(|| (version.clone(), c.id.clone()));
+                if version > entry.0 { *entry = (version, c.id.clone()); }
+            }
+        }
+    }
+    let is_main = |c: &ModelChoice| (codex && model_family(&c.id).is_none_or(|(family, _, _)| latest.get(&family).is_some_and(|(_, id)| id == &c.id))) || (!codex && c.id.chars().all(char::is_alphabetic)) || matches(c, default_id) || matches(c, selected);
     let mut rows: Vec<PickerRow> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut add = |c: &ModelChoice, older: bool, rows: &mut Vec<PickerRow>| {
-        if seen.insert(c.model.clone()) {
-            rows.push(PickerRow { id: c.id.clone(), title: c.title.clone(), subtitle: c.description.clone(), is_default: matches(c, default_id), is_selected: matches(c, selected), is_older: older });
+        if seen.insert(if codex { c.id.clone() } else { c.model.clone() }) {
+            let (title, subtitle) = if codex { model_family(&c.id).map(|(t, d, _)| (t, Some(d))).unwrap_or_else(|| (c.title.clone(), c.description.clone())) } else { (c.title.clone(), c.description.clone()) };
+            rows.push(PickerRow { id: c.id.clone(), title, subtitle, is_default: matches(c, default_id), is_selected: matches(c, selected), is_older: older });
         }
     };
     for c in known.iter().filter(|c| is_main(c)) {
@@ -550,6 +609,17 @@ impl<'a> ChipSettings<'a> {
         picker_rows(choices, default.as_deref(), if own { self.effective_model() } else { None }.as_deref(), query, provider)
     }
 
+    /// Only list models from logins belonging to the displayed pool.
+    pub fn rows_in_column(&self, column: &str, provider: &str, query: &str) -> Vec<PickerRow> {
+        let Some(pool) = self.logins.pool(column).filter(|_| self.uses_pools()) else { return self.rows(provider, query) };
+        let accounts = crate::new_thread::pool_logins(pool, &self.logins.accounts, Some(provider));
+        let Some(account) = accounts.iter().find(|a| a.id == self.account).or(accounts.first()) else { return Vec::new() };
+        let choices: Vec<ModelChoice> = accounts.iter().flat_map(|a| a.models.clone()).collect();
+        let own = self.pool_id.as_deref() == Some(column) && self.provider == provider;
+        let default = if own { self.default_model() } else { self.logins.defaults.model_for(provider).map(str::to_owned).or_else(|| account.default_model.clone()) };
+        picker_rows(&choices, default.as_deref(), if own { self.effective_model() } else { None }.as_deref(), query, provider)
+    }
+
     pub fn effort_levels(&self) -> Vec<String> {
         self.logins.effort_levels(self.effective_model().as_deref(), self.choices(), &self.provider)
     }
@@ -668,6 +738,58 @@ mod tests {
         // No Claude aliases for a provider with no list of its own.
         for provider in ["grok", "antigravity", "future-provider"] {
             assert!(picker_rows(&[], None, None, "", provider).is_empty());
+        }
+    }
+
+    #[test]
+    fn mixed_pool_lists_each_provider_without_models_from_outside_the_pool() {
+        let mut l = logins();
+        l.pools[0].account_ids.push("codex-main".into());
+        l.accounts.insert(0, Account { id: "codex-outside".into(), provider: "codex".into(), models: vec![ModelChoice { id: "outside-only".into(), model: "outside-only".into(), ..Default::default() }], ..Default::default() });
+        let s = settings(&l);
+        assert_eq!(crate::new_thread::pool_providers(&l.pools[0], &l.accounts), vec!["claude", "codex"]);
+        let rows = s.rows_in_column("claude", "codex", "");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "gpt-6.1-sol");
+        assert!(!rows[0].is_selected);
+        assert!(s.rows_in_column("claude", "cursor", "").is_empty());
+    }
+
+    #[test]
+    fn older_selected_model_stays_visible_and_unknown_labels_survive() {
+        let ids = ["gpt-6-astra", "gpt-6.2-astra", "new-unknown"];
+        let choices: Vec<ModelChoice> = ids.iter().map(|id| ModelChoice { id: (*id).into(), model: (*id).into(), title: (*id).into(), ..Default::default() }).collect();
+        let rows = picker_rows(&choices, None, Some("gpt-6-astra"), "", "codex");
+        assert!(rows.iter().any(|r| r.id == "gpt-6-astra" && r.is_selected && !r.is_older));
+        assert!(rows.iter().any(|r| r.title == "new-unknown" && !r.is_older));
+    }
+
+    #[test]
+    fn compact_models_keep_exact_ids_and_latest_family_versions() {
+        let ids = ["gpt-6-astra", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.2-sol", "future-model"];
+        let choices: Vec<ModelChoice> = ids.iter().map(|id| ModelChoice { id: (*id).into(), model: (*id).into(), title: (*id).into(), ..Default::default() }).collect();
+        let rows = picker_rows(&choices, None, None, "", "codex");
+        let astra = rows.iter().find(|r| r.id == "gpt-6.2-astra").unwrap();
+        assert_eq!(astra.title, "Astra");
+        assert_eq!(astra.subtitle.as_deref(), Some("GPT-6.2"));
+        assert!(!astra.is_older);
+        assert!(rows.iter().find(|r| r.id == "gpt-6-astra").unwrap().is_older);
+        assert!(!rows.iter().find(|r| r.id == "future-model").unwrap().is_older);
+        assert_eq!(picker_rows(&choices, None, None, "6-astra", "codex")[0].id, "gpt-6-astra");
+    }
+
+    #[test]
+    fn cursor_parameters_and_google_variants_remain_selectable() {
+        for (provider, ids, title) in [
+            ("cursor", vec!["gpt-5.6-sol[context=272k,reasoning=medium,fast=false]", "gpt-5.6-sol[reasoning=high,fast=true]"], "Sol"),
+            ("antigravity", vec!["gemini-4-argon-high", "gemini-4-argon-low"], "Argon"),
+        ] {
+            let choices: Vec<ModelChoice> = ids.iter().map(|id| ModelChoice { id: (*id).into(), model: (*id).into(), title: (*id).into(), ..Default::default() }).collect();
+            let rows = picker_rows(&choices, None, None, "", provider);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].title, title);
+            assert_ne!(rows[0].subtitle, rows[1].subtitle);
+            assert_eq!(rows[1].id, ids[1]);
         }
     }
 
