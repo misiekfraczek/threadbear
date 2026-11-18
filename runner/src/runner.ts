@@ -671,6 +671,11 @@ export const LIVE_SHARE_MS = 10_000;
 // How often the account list is read again, so a new login is noticed
 // (and its models asked for) without a client asking.
 const ACCOUNT_RESCAN_MS = 10_000;
+// How often a login its usage readings call blocked or out of room is
+// asked for its limits again (AgentAdapter.usage), so a reset, early or on
+// time, shows without a turn on it. A Codex read is a short app-server
+// process and no model call.
+export const USAGE_PROBE_MS = 5 * 60_000;
 // accounts.updated: the first change goes out at once, then at most one
 // this often, always ending on the latest list.
 const ACCOUNTS_THROTTLE_MS = 5_000;
@@ -790,6 +795,7 @@ export class Runner {
   // runner.json's or the built-in ones.
   sharedPools?: import('./shared-pools.ts').SharedPools;
   ranDry = new Map<string, number>();
+  usageProbeTimer?: TimerHandle;
   // Threads waiting for the API to be reachable again (waitingForNetwork):
   // one timer probes for all of them, backing off from NET_PROBE_FIRST_MS.
   netTimer?: TimerHandle;
@@ -924,6 +930,7 @@ export class Runner {
     this.accountsShown = accountsKey(this.safeAccounts());
     this.poolsShown = JSON.stringify(this.pools());
     void this.probeModels();
+    this.armUsageProbe();
     // Usage readings and a rescan that finds another list both reach
     // clients through the same throttle as what the probes learn.
     if (this.usage?.onChange) this.unsubs.push(this.usage.onChange(() => this.accountsChanged()));
@@ -949,6 +956,36 @@ export class Runner {
       } catch (e) {
         this.log.warn('could not read the model list', { accountId: account.id, error: String(e) });
       } finally {this.probingModels.delete(account.id);}
+    }
+  }
+
+  // Every USAGE_PROBE_MS: each login that isn't OK to run on (blocked, or
+  // under the minimum room) and whose adapter can read its limits without
+  // a turn is asked, one at a time, and the reading goes to the usage
+  // store. Without it a blocked login stayed blocked until the reset its
+  // last reading named, even when the provider reset it sooner, since
+  // nothing reads a login no thread runs on (18 Nov 2026).
+  armUsageProbe(): void {
+    this.usageProbeTimer?.cancel();
+    this.usageProbeTimer = this.clock.setTimeout(() => {
+      this.usageProbeTimer = undefined;
+      if (this.stopping) return;
+      void this.probeUsage().finally(() => {
+        if (!this.stopping) this.armUsageProbe();
+      });
+    }, USAGE_PROBE_MS);
+  }
+
+  async probeUsage(): Promise<void> {
+    const targets = this.safeAccounts().filter((a) => a.usage && !loginOk(a) && this.adapters[a.provider]?.usage);
+    for (const account of targets) {
+      if (this.stopping) return;
+      try {
+        const reading = await this.adapters[account.provider]!.usage!(account);
+        if (reading) this.usage?.record(account.id, reading);
+      } catch (e) {
+        this.log.warn('could not read the usage limits', { accountId: account.id, error: String(e) });
+      }
     }
   }
 
@@ -1190,6 +1227,7 @@ export class Runner {
     this.roomTimer?.cancel();
     this.netTimer?.cancel();
     this.rescanTimer?.cancel();
+    this.usageProbeTimer?.cancel();
     this.accountsTimer?.cancel();
     this.liveTimer?.cancel();
     for (const off of this.unsubs.splice(0)) off();

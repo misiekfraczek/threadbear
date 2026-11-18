@@ -325,6 +325,10 @@ export interface AgentAdapter {
   // What the account's CLI offers as models, without starting a turn.
   // Optional: a provider without a picker leaves it out.
   models?(account: Account): Promise<ModelChoice[]>;
+  // The login's limits as a usage reading, without starting a turn (Codex:
+  // account/rateLimits/read). The runner asks it of a login its readings
+  // call blocked or out of room, so an early reset is noticed. Null: none.
+  usage?(account: Account): Promise<Omit<Extract<AdapterOutput, { kind: 'limits' }>, 'kind'> | null>;
   // The slash commands the account's CLI offers in a folder (skills
   // included), without starting a turn, for the composer's picker.
   commands?(account: Account, cwd: string, untrusted?: Record<string, unknown>): Promise<SlashCommand[]>;

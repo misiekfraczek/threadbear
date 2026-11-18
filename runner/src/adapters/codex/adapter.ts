@@ -28,7 +28,7 @@ import {
 import { runsAsCodeByName } from '../../code-writes.ts';
 import { CodexApprovals } from './approvals.ts';
 import { CodexTools, dynamicToolSpecs, toolGuidance, type ToolDefinition } from './tools.ts';
-import { CodexNormalizer, limitsFromAccount } from './normalize.ts';
+import { CodexNormalizer, limitsFromAccount, limitsFromRateLimits } from './normalize.ts';
 import { placePictures } from '../../pictures.ts';
 import { parseCommand, type SlashCommand } from '../../slash-commands.ts';
 import type {
@@ -180,6 +180,22 @@ export class CodexAdapter implements AgentAdapter {
           if (!cursor) break;
         }
         return out;
+      },
+      (p, live) => this.track(p, live),
+    );
+  }
+
+  // account/rateLimits/read with no thread loaded, as a usage reading: how
+  // the runner finds out a blocked login has room again (runner.ts,
+  // probeUsage).
+  async usage(account: Account): Promise<Omit<Extract<AdapterOutput, { kind: 'limits' }>, 'kind'> | null> {
+    return withShortLivedProcess(
+      this.shortLived(account, `usage:${account.id}`),
+      async (p) => {
+        const out = limitsFromRateLimits(await p.request<GetAccountRateLimitsResponse>('account/rateLimits/read', null));
+        if (!out) return null;
+        const { kind: _, ...reading } = out;
+        return reading;
       },
       (p, live) => this.track(p, live),
     );

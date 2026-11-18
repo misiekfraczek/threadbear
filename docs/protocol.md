@@ -2322,6 +2322,14 @@ thread to another login when the one it's on runs out of room.
   too, it moves on again while another login has room (since 12 Nov 2026;
   it used to wait after one move). It can't loop: each login that runs dry
   stays blocked until its window resets.
+- **Reading a blocked login again** (since 18 Nov 2026). Every 5 minutes
+  the runner asks each login that isn't OK to run on (blocked, or under
+  1%) for its limits without starting a turn, where its provider can
+  (Codex: `account/rateLimits/read` in a short app-server process, no
+  model call), and records the reading. A provider that resets a login
+  early (OpenAI does) lifts the block within 5 minutes; before this it
+  held until the reset the last reading named, since nothing read a login
+  no thread ran on.
 - **Waiting.** When nothing in the pool has room the thread gets
   `waitingForRoom: { until, accountId? }`: the earliest time one of the
   pool's logins is back, plus a minute (30 minutes from now if no reset
