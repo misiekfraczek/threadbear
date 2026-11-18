@@ -4,7 +4,10 @@
 # Bez zależności: Python 3 i unittest z systemu, git.
 set -euo pipefail
 RUN="${1:?podaj nazwę przebiegu}"
-ROOT="/tmp/koordynator-eval/$RUN"
+BASE="${TMPDIR:-/tmp}"; BASE="${BASE%/}"
+ROOT="$BASE/koordynator-eval/$RUN"
+# Pamięć Claude Code z poprzednich przebiegów o tej nazwie skaziłaby przebieg (wyniki 18.11, problem A).
+rm -rf "$HOME"/.claude/projects/*koordynator-eval-"$RUN"*
 rm -rf "$ROOT"; mkdir -p "$ROOT"
 cd "$ROOT"
 

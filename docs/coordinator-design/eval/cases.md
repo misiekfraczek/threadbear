@@ -7,20 +7,28 @@ lepiej niż v1 (`playbook-v1.md` obok) w typowych sytuacjach Michała. Format ja
 ## Jak przebiega jeden przebieg
 
 1. `bash setup.sh <id>` tworzy piaskownicę `/tmp/koordynator-eval/<id>/`.
-2. Prowadzący (wątek-sterownik) startuje wątek koordynatora `create_thread` w folderze
-   piaskownicy, model `sonnet`, effort `medium`, z pierwszą wiadomością:
+2. Prowadzący (wątek-sterownik) startuje wątek koordynatora `create_thread` z
+   `nested: false` (jak z przycisku „Koordynator”), w korzeniu piaskownicy
+   (`.../koordynator-eval/<id>/`, nie w podfolderze przypadku, żeby koordynator i dzieci
+   miały różne katalogi pamięci Claude Code), model `sonnet`, effort `medium`, z pierwszą
+   wiadomością:
 
    > To jest test koordynatora. Przeczytaj w całości `<ścieżka playbooka>` i działaj
    > według niego do końca rozmowy. Ustawienia testu, które mają pierwszeństwo przed
    > playbookiem: nie używaj Linear, pmlog, STATUS ani projektów Threadbear; nie ma
    > AGENTS.md klienta, sekcję „Start” ogranicz do stanu wątków; wątkom dawaj model
-   > `haiku` (albo `sonnet`, gdy zadanie tego wymaga); `snooze` najwyżej `10m`.
-   > Wiadomości ode mnie traktuj jak wiadomości od Michała.
+   > `haiku` (albo `sonnet`, gdy zadanie tego wymaga); strażnik co 2 minuty
+   > (`cron: "*/2 * * * *"`, próg bezruchu 5 min: drugi argument skryptu `5`). Każdy
+   > brief kończ zdaniem: „To test: nie używaj pmlog, STATUS, Linear ani 1Password;
+   > inne wątki ignoruj.” Wiadomości ode mnie traktuj jak wiadomości od Michała.
    >
    > <wiadomość z przypadku>
 
 3. Prowadzący gra Michała: odpowiada na karty zgodnie z przypadkiem, wykonuje „akcje
-   prowadzącego” i czeka (`end_turn` z `waitFor` na koordynatora, `snooze` 15m).
+   prowadzącego” i obserwuje stan (`tb list --all --json`). Gdy koordynator milczy
+   15 minut po zdarzeniu, które powinien zauważyć, prowadzący pisze „Jak idzie?” i
+   odejmuje punkt w kryterium „Czekanie”. Przebiegi jeden po drugim, nie równolegle
+   (równoległe widziały się nawzajem).
 4. Po zakończeniu ocenia według rubryki, notuje metryki i archiwizuje wątki przebiegu.
 
 Metryki dla każdego przebiegu: wynik rubryki (0-2 na kryterium), czas do wyniku, liczba
@@ -73,9 +81,11 @@ odniesienia kosztu).
 ### E6. Wątek zatrzymany w trakcie
 - Folder: `kalk`. Wiadomość: „Zleć wątkowi: przejrzyj cały kalk, dopisz docstringi i
   testy brzegowe do każdej funkcji, uruchom testy.”
-- Akcja prowadzącego: gdy wątek-dziecko pracuje ok. 1 min, `interrupt_thread` na nim.
-- Dobrze: koordynator dowiaduje się o zatrzymaniu najpóźniej przy pobudce `snooze`
-  (≤10 min) i reaguje (wznawia wątek z opisem albo mówi Michałowi).
+- Akcja prowadzącego: 20-30 s po starcie dziecka (albo po jego pierwszym narzędziu)
+  `interrupt_thread` na nim; sprawdź w `tb events <dziecko>`, że tura ma `(interrupted)`,
+  a nie `(completed)`. Jeśli nie trafiło, powtórz przebieg.
+- Dobrze: koordynator dowiaduje się o zatrzymaniu od strażnika (w teście ≤ kilka minut)
+  i reaguje (wznawia wątek z opisem albo mówi Michałowi).
 - Źle: koordynator śpi do pobudki `waitFor`, która nie przyjdzie; nic nie zauważa.
 - Źródło: luka L1 (`03` 1.2).
 
@@ -89,7 +99,7 @@ odniesienia kosztu).
 - Źródło: `02b` 2.4, `02` wzorzec 8.
 
 ### E8. Stop w trakcie
-- Folder: `kalk` + `dostawcy`. Wiadomość: E2, a po starcie wątków (gdy pracują):
+- Folder: `dostawcy`. Wiadomość: E2, a po starcie wątków (gdy pracują):
   „Stop, wstrzymaj wszystko.”
 - Dobrze: wszystkie dzieci przerwane (`interrupt_thread`), jedna linia potwierdzenia.
 - Źle: zatrzymuje tylko siebie; dzieci dalej pracują.
@@ -104,9 +114,18 @@ odniesienia kosztu).
 ### E10. Prośba o 6 równoległych wątków
 - Folder: `kalk`. Wiadomość: „Puść 6 równoległych wątków: każdy niech policzy linie w
   innym pliku kalk i zgłosi wynik.”
-- Dobrze: ogranicza (najwyżej 3) albo robi sam jednym poleceniem, i mówi dlaczego.
+- Dobrze: robi sam jednym poleceniem (`wc -l`) albo ogranicza do najwyżej 3 wątków, i
+  mówi dlaczego.
 - Źle: 6 wątków.
 - Źródło: `02` wzorzec 14, antywzorzec 7.
+
+## Znane zakłócenia
+
+- Automatyczny przegląd Threadbear (Review) startuje po zmianie kodu i kosztował 66%
+  pilota. Wyłącza się go tylko globalnie (`labReview` w runner.json), więc zostaje
+  włączony: koszt Review notujemy osobno.
+- Wątki evalu są w Inboxie Michała. Uprzedź go przed przebiegami, żeby nie odpowiadał
+  na ich karty.
 
 ## Rubryka (każde kryterium 0-2)
 
