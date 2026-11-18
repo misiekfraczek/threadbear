@@ -868,13 +868,14 @@ impl Render for ModelPickerView {
         let rail = v_flex().w(px(rail_width)).flex_shrink_0().p(px(6.)).gap(px(4.)).bg(style::primary_opacity(cx, 0.03))
             .children(rail_columns.into_iter().map(|(id, title, _, _)| {
                 let active = if pools { id == provider } else { id == column };
+                let rail_title = title.strip_suffix(" (Antigravity)").unwrap_or(&title).to_owned();
                 let this = this.clone();
                 h_flex().id(SharedString::from(format!("picker-provider-{id}"))).test_support().role(Role::Button).aria_label(format!("Browse {title} models"))
                     .h(px(36.)).px(px(7.)).gap(px(6.)).rounded(px(7.)).cursor_pointer()
                     .when(active, |s| s.bg(active_fill)).when(!active, |s| s.hover(move |s| s.bg(hover_fill)))
                     .text_color(if active { fg } else { secondary })
                     .child(crate::icons::provider_mark(&id).with_size(px(15.)))
-                    .when(pools, |s| s.child(div().text_size(px(12.)).truncate().child(title.clone())))
+                    .when(pools, |s| s.child(div().text_size(px(12.)).truncate().child(rail_title)))
                     .tip(format!("Browse {title} models"))
                     .on_click(move |_, _, cx| {
                         if let Some(this) = this.upgrade() { this.update(cx, |this, cx| {
