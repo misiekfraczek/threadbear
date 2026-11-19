@@ -1299,7 +1299,9 @@ room left on the login your next new thread would use), shows how much room each
 has left before it hits its limits: the weekly one, and the 5-hour one for
 logins that still have it (Claude Team does, Max plans don't any more).
 Threadbear learns these numbers from the threads it runs, so a login's bars
-fill in once it has run something.
+fill in once it has run something. When a Claude or Codex login is blocked or has less than 1% left,
+Threadbear checks its limits every five minutes. A successful reading shows
+the room restored by an early reset, even while the login is idle.
 
 At the top it shows what you've spent: tokens today (and what a usual day
 had spent by this time), in the last hour and over the last 7 days, with a

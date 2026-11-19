@@ -4,7 +4,7 @@ import { CONFINED_NO_SANDBOX, sandboxSpawner, type SandboxConfig } from '../../s
 import os from 'node:os';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { HookInput, McpServerConfig, ModelInfo, Options, PermissionResult, Query, SDKControlGetContextUsageResponse, SDKUserMessage, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
-import type { Account, ContextUsage, EffortLevel, ModelChoice, PermissionMode, Question, QueuedAnswers, QueuedCall } from '../../protocol.ts';
+import type { Account, ContextUsage, EffortLevel, ModelChoice, UsageWindow, PermissionMode, Question, QueuedAnswers, QueuedCall } from '../../protocol.ts';
 import { isEffortLevel } from '../../protocol.ts';
 import fs from 'node:fs';
 import type { AgentAdapter, AgentSession, RewindRequest, RewindResult, SessionSink, StartSessionOptions, UserInput } from '../types.ts';
@@ -179,6 +179,50 @@ export class ClaudeAdapter implements AgentAdapter {
         // already closed
       }
       abort.abort();
+    }
+  }
+
+  async usage(account: Account) {
+    const abort = new AbortController();
+    const input = new InputQueue();
+    const q = (this.deps.queryFn ?? sdkQuery)({
+      prompt: input,
+      options: {
+        cwd: os.tmpdir(), pathToClaudeCodeExecutable: this.deps.claudePath,
+        env: cliEnv(account), settingSources: [], tools: [], strictMcpConfig: true,
+        persistSession: false, abortController: abort,
+        spawnClaudeCodeProcess: groupSpawner(this.deps.registry, this.deps.log, () => {}, `usage:${account.id}`),
+      },
+    });
+    const timeout = setTimeout(() => abort.abort(), 30_000);
+    try {
+      const report = await q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true });
+      const limits = report.rate_limits;
+      if (!report.rate_limits_available || !limits) return null;
+
+      const windows: UsageWindow[] = [];
+      function add(kind: UsageWindow['kind'], title: string, meter: NonNullable<typeof limits>['seven_day']) {
+        const used = meter?.utilization;
+        if (typeof used !== 'number' || !Number.isFinite(used) || used < 0 || used > 100) return;
+        const reset = Date.parse(meter?.resets_at ?? '');
+        windows.push({ kind, title, remainingPercent: 100 - used,
+          ...(Number.isFinite(reset) ? { resetsAt: new Date(reset).toISOString() } : {}) });
+      }
+      add('five_hour', '5-hour', limits.five_hour);
+      add('weekly', 'Weekly', limits.seven_day);
+      if (!windows.length) return null;
+      const blocked = windows.some(w => w.remainingPercent === 0);
+      add('weekly_model', 'Weekly Opus', limits.seven_day_opus);
+      add('weekly_model', 'Weekly Sonnet', limits.seven_day_sonnet);
+      for (const meter of limits.model_scoped ?? []) {
+        if (meter.display_name) add('weekly_model', `Weekly ${meter.display_name}`, meter);
+      }
+      return { windows, blocked };
+    } finally {
+      clearTimeout(timeout);
+      input.end();
+      abort.abort();
+      q.close();
     }
   }
 
