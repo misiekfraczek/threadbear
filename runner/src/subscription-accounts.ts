@@ -13,7 +13,7 @@ export function subscriptionStatus(provider: SubscriptionProvider, response: unk
     return { state: 'loginRequired', reason: 'Sign in with the official CLI.' };
   const meta = r?._meta;
   const tier = meta?.antigravity?.tier;
-  if (['g1-pro-tier', 'g1-ultra-tier'].includes(tier?.id) && typeof tier.name === 'string')
+  if (['g1-pro-tier', 'g1-ultra-tier', 'g1-ultra-lite-tier'].includes(tier?.id) && typeof tier.name === 'string')
     return { state: 'ready', plan: tier.name };
   return { state: 'unknown', reason: 'The CLI has not confirmed a supported subscription.' };
 }
