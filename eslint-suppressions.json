@@ -131,7 +131,7 @@
   },
   "convex/push.ts": {
     "@convex-dev/no-process-env": {
-      "count": 6
+      "count": 9
     },
     "@typescript-eslint/no-explicit-any": {
       "count": 1
@@ -669,6 +669,11 @@
       "count": 1
     }
   },
+  "runner/test/unit/push-clear.test.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 3
+    }
+  },
   "runner/test/unit/push-hold.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 22
@@ -758,12 +763,17 @@
   },
   "runner/test/unit/runner-providers.test.ts": {
     "@typescript-eslint/no-explicit-any": {
-      "count": 5
+      "count": 6
     }
   },
   "runner/test/unit/runner-restart-carry-on.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 3
+    }
+  },
+  "runner/test/unit/runner-subscription-fallback.test.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 4
     }
   },
   "runner/test/unit/runner.test.ts": {
@@ -822,6 +832,11 @@
   "runner/test/unit/subagents.test.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 2
+    }
+  },
+  "runner/test/unit/subscription-fallback.test.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
     }
   },
   "runner/test/unit/sync-main.test.ts": {

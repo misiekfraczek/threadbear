@@ -528,7 +528,7 @@ fn model_family(id: &str) -> Option<(String, String, Vec<u32>)> {
             " {}",
             variant
                 .split_whitespace()
-                .map(|w| family_title(w))
+                .map(family_title)
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
