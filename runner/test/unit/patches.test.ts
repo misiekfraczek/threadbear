@@ -122,7 +122,6 @@ test('rendering the Simulator panel: a screenshot becomes an image ref, no devic
 
 import { loadPatchSet, readPatchModule, runCommand, slug, webPage } from '../../src/patches.ts';
 import { checkAction } from '../helpers/protocol-check.ts';
-import { tick } from '../helpers/fakes.ts';
 
 function writePatch(dir: string, name: string, text: string): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -383,6 +382,8 @@ test('a panel with an items function is a list panel, filled by renderListPanel 
           (await sh("echo from-sh")).trim(),
           { title: "", detail: "dropped: no title" },
           { title: "odd", tone: "loud", extra: 1 },
+          { title: "bundle", tone: "warning" },
+          { title: "typecheck", tone: "working" },
           { title: "grouped", section: " Shipped · 2 ", trailing: "5d" },
           { title: "long", section: "x".repeat(200), trailing: "y".repeat(50) },
           { title: "blank", section: "  ", trailing: 3 },
@@ -413,6 +414,8 @@ test('a panel with an items function is a list panel, filled by renderListPanel 
       { title: 'main', detail: app, tone: 'done' },
       { title: 'from-sh' },
       { title: 'odd' },
+      { title: 'bundle', tone: 'warning' },
+      { title: 'typecheck', tone: 'working' },
       { title: 'grouped', section: 'Shipped · 2', trailing: '5d' },
       { title: 'long', section: 'x'.repeat(80), trailing: 'y'.repeat(24) },
       { title: 'blank' },

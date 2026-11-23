@@ -5,8 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { FakeAccounts, makeHarness, tick, tmpDir, withCodex } from '../helpers/fakes.ts';
+import { escapeRegExp, skipOnWindows } from '../helpers/platform.ts';
 import { checkSummary } from '../helpers/protocol-check.ts';
-import { claudeCommands, claudeSettingsWithoutCommands, CLAUDE_PATCH_ID, setMaxWalkForTests } from '../../src/claude-trust.ts';
+import { claudeCommands, claudeCommandsKinds, claudeSettingsWithoutCommands, CLAUDE_PATCH_ID, setMaxWalkForTests } from '../../src/claude-trust.ts';
 import { PatchTrust } from '../../src/patch-trust.ts';
 import { trustedSettings, untrustedSettings } from '../../src/adapters/claude/adapter.ts';
 
@@ -155,6 +156,8 @@ test('trust is per folder in the patch trust file, a worktree counts as its main
   const main = path.join(root, 'app');
   fs.mkdirSync(main);
   git(main, 'init', '-q', '-b', 'main');
+  // The checkout in the worktree must read the same bytes as main, whatever git's system settings say about line endings.
+  git(main, 'config', 'core.autocrlf', 'false');
   const { script } = hooked(main);
   git(main, 'add', '-A');
   git(main, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'first');
@@ -218,7 +221,9 @@ test("runner: a Claude thread in a folder with untrusted hooks starts without th
   const s = h.adapter.last;
   // The repo's allow rule is held back with its hooks.
   assert.deepEqual(s.opts.untrustedProjectSettings, {});
-  assert.ok(h.events(thread.id).some((e) => e.type === 'system.note' && /Skipped this folder's Claude Code hooks, commands, permissions and environment settings \(\.claude\/settings\.json\): you haven't trusted them yet/.test(e.text)));
+  // The file as the platform writes it: .claude/settings.json, and .claude\settings.json on Windows only.
+  const skipped = new RegExp(`Skipped this folder's Claude Code hooks, commands, permissions and environment settings \\(${escapeRegExp(path.join('.claude', 'settings.json'))}\\): you haven't trusted them yet`);
+  assert.ok(h.events(thread.id).some((e) => e.type === 'system.note' && skipped.test(e.text)));
   let t = h.runner.get(thread.id);
   assert.deepEqual(checkSummary(t), []);
   const waiting = t.patches?.find((p) => p.id === CLAUDE_PATCH_ID);
@@ -623,6 +628,80 @@ test("F23: frontmatter read the way YAML reads it: an alias, a lower-case skill.
   fs.mkdirSync(path.dirname(nested), { recursive: true });
   fs.writeFileSync(nested, '---\nname: x\nhooks:\n  Stop:\n    - hooks:\n        - type: command\n          command: say hi\n---\n');
   assert.deepEqual(claudeCommands(repo, home)?.files, [nested]);
+});
+
+test("F23: the skill files picked from git's one listing are the ones git's own pattern finds, and both kinds share one look", () => {
+  const home = tmpDir();
+  const repo = path.join(home, 'picks');
+  fs.mkdirSync(repo, { recursive: true });
+  git(repo, 'init', '-q', '-b', 'main');
+  const skill = '---\nname: s\nhooks:\n  Stop:\n    - hooks:\n        - type: command\n          command: say hi\n---\n';
+  const write = (rel: string) => {
+    fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+    fs.writeFileSync(path.join(repo, rel), skill);
+  };
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored/\n');
+  for (const rel of [
+    'pkg/.claude/skills/a/SKILL.md',
+    'deep/x/y/.CLAUDE/Skills/b/Skill.MD',
+    'pkg/.claude/skills/skill.md',
+    'pkg/.claude/skills/c/d/e/SKILL.md',
+    'foo.claude/skills/f/SKILL.md',
+    'pkg/.claude/skillsx/g/SKILL.md',
+    'pkg/.claude/skills/h/notskill.md',
+    'pkg/.claude/skills/i/SKILL.md.bak',
+    'with space/.claude/skills/j k/SKILL.md',
+  ]) write(rel);
+  git(repo, 'add', '-A');
+  git(repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x');
+  // Untracked (one in a folder named like a tracked line, which only the
+  // tag tells apart), ignored, and tracked but deleted.
+  write('new/.claude/skills/k/SKILL.md');
+  write(`100644 ${'a'.repeat(40)} 0\tx/.claude/skills/m/SKILL.md`);
+  write('ignored/.claude/skills/l/SKILL.md');
+  fs.rmSync(path.join(repo, 'pkg/.claude/skills/c/d/e/SKILL.md'));
+  const byGit = git(repo, 'ls-files', '-co', '--exclude-standard', '-z', '--', ':(glob,icase)**/.claude/skills/**/skill.md')
+    .split('\0')
+    .filter(Boolean)
+    .map((f) => path.join(repo, f))
+    .filter((f) => fs.existsSync(f))
+    .sort();
+  assert.equal(byGit.length, 6);
+  assert.deepEqual(claudeCommands(repo, home)?.files, byGit);
+  const [full, asks] = claudeCommandsKinds(repo, home, [false, true]);
+  assert.deepEqual(full, claudeCommands(repo, home, { grants: false }));
+  assert.deepEqual(asks, claudeCommands(repo, home, { grants: true }));
+});
+
+test("F23: a checkout git can't list leaves its skills unchecked rather than walking for them", () => {
+  const home = tmpDir();
+  const repo = path.join(home, 'broken');
+  fs.mkdirSync(repo, { recursive: true });
+  git(repo, 'init', '-q', '-b', 'main');
+  // Where the walk doesn't look, which git would have listed.
+  const hidden = path.join(repo, 'node_modules', 'pkg', '.claude', 'skills', 'x', 'SKILL.md');
+  fs.mkdirSync(path.dirname(hidden), { recursive: true });
+  fs.writeFileSync(hidden, '---\nname: x\nhooks:\n  Stop:\n    - hooks:\n        - type: command\n          command: say hi\n---\n');
+  git(repo, 'add', '-A');
+  assert.deepEqual(claudeCommands(repo, home)?.files, [hidden]);
+  // An index git refuses, as a listing too big for its buffer fails.
+  fs.writeFileSync(path.join(repo, '.git', 'index'), 'not an index');
+  const found = claudeCommands(repo, home);
+  assert.ok(found?.incomplete, 'unchecked, not trusted');
+  assert.equal(new PatchTrust({ claudeHome: home }).checkClaude(repo).trusted, false);
+  // Opened through a link into the repo, whose own ancestors have no .git.
+  const link = path.join(home, 'elsewhere', 'open-here');
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  fs.symlinkSync(path.join(repo, 'node_modules'), link);
+  assert.ok(claudeCommands(link, home)?.incomplete, 'through a link');
+  // A repo shaped like a bare one with its work tree in place: no .git, but git finds it.
+  const bare = path.join(home, 'bareish');
+  fs.mkdirSync(bare);
+  git(bare, 'init', '-q', '--bare');
+  git(bare, 'config', 'core.bare', 'false');
+  git(bare, 'config', 'core.worktree', '.');
+  fs.writeFileSync(path.join(bare, 'index'), 'not an index');
+  assert.ok(claudeCommands(bare, home)?.incomplete, 'a repo git finds without a .git');
 });
 
 test('F23: reading frontmatter and following commands stays quick on a hostile file', () => {
@@ -1047,7 +1126,7 @@ test('review 7: plain frontmatter hooks, as Claude\'s docs write them, still can
 
 // ---- The review's eighth round ----
 
-test('review 8: a submodule with a newline in its name, BASH_ENV by a bare name, --preserve-symlinks in NODE_OPTIONS, a subshell function, escaped JavaScript names', () => {
+test('review 8: a submodule with a newline in its name, BASH_ENV by a bare name, --preserve-symlinks in NODE_OPTIONS, a subshell function, escaped JavaScript names', skipOnWindows('Windows cannot have a newline in a folder name, which this test makes'), () => {
   const home = tmpDir();
   const repo = path.join(home, 'cloned');
   fs.mkdirSync(repo, { recursive: true });

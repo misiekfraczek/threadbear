@@ -41,16 +41,55 @@ impl RunnerConfig {
     pub fn read_token(&self) -> Result<String, String> {
         std::fs::read_to_string(self.token_path())
             .map(|s| s.trim().to_string())
-            .map_err(|e| format!("Couldn't read the runner's token at {}: {e}", self.token_path().display()))
+            .map_err(|e| {
+                format!(
+                    "Couldn't read the runner's token at {}: {e}",
+                    self.token_path().display()
+                )
+            })
     }
 }
 
-/// The runner keeps the Mac's folder names on every platform for now
-/// (INSTALL.md, "A runner on Linux"). A Windows runner may choose
-/// %APPDATA%\Threadbear instead; this follows whatever it picks.
+/// The runner's data dir, as runner/src/platform.ts's dataDirFor has it:
+/// the Mac's folder names on macOS and Linux (INSTALL.md, "A runner on
+/// Linux"), %LOCALAPPDATA%\Threadbear on Windows.
 pub fn default_home() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join("Library").join("Application Support").join("Threadbear")
+    if cfg!(windows) {
+        windows_home(
+            std::env::var_os("LOCALAPPDATA")
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from),
+            &home,
+        )
+    } else {
+        mac_home(&home)
+    }
+}
+
+fn mac_home(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("Threadbear")
+}
+
+/// Windows: %LOCALAPPDATA%\Threadbear, where the runner lives. An app from
+/// before 19 Nov kept its own settings in the Mac's folder names under the
+/// profile (where the WSL runner's token was copied), so those two files
+/// come across once, while the new folder has none. Drop this once the
+/// Windows PCs have all started a newer app.
+fn windows_home(local: Option<PathBuf>, home: &Path) -> PathBuf {
+    let new = local
+        .unwrap_or_else(|| home.join("AppData").join("Local"))
+        .join("Threadbear");
+    let old = mac_home(home);
+    for name in ["desktop-settings.json", "gpui-prefs.json"] {
+        let (from, to) = (old.join(name), new.join(name));
+        if from.is_file() && !to.exists() && std::fs::create_dir_all(&new).is_ok() {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+    new
 }
 
 /// Why a scripted app (one with THREADBEAR_AUTOMATION set) mustn't start
@@ -72,16 +111,27 @@ pub fn scripted_refusal(config: &RunnerConfig, real: &Path, allowed: bool) -> Op
     // A file not there yet (a token before the runner's first start) by its
     // folder, so a linked `secrets` still counts.
     let resolved = |p: &Path| {
-        std::fs::canonicalize(p).unwrap_or_else(|_| match (p.parent().and_then(|d| std::fs::canonicalize(d).ok()), p.file_name()) {
-            (Some(dir), Some(name)) => dir.join(name),
-            _ => p.to_path_buf(),
+        std::fs::canonicalize(p).unwrap_or_else(|_| {
+            match (
+                p.parent().and_then(|d| std::fs::canonicalize(d).ok()),
+                p.file_name(),
+            ) {
+                (Some(dir), Some(name)) => dir.join(name),
+                _ => p.to_path_buf(),
+            }
         })
     };
-    let live = RunnerConfig { home: real.to_path_buf(), port: port_from_runner_json(real).unwrap_or(DEFAULT_PORT) };
+    let live = RunnerConfig {
+        home: real.to_path_buf(),
+        port: port_from_runner_json(real).unwrap_or(DEFAULT_PORT),
+    };
     let why = if resolved(&config.home) == resolved(real) {
         format!("won't use the real data folder ({})", real.display())
     } else if resolved(&config.token_path()) == resolved(&live.token_path()) {
-        format!("won't use the live runner's token ({} is it)", config.token_path().display())
+        format!(
+            "won't use the live runner's token ({} is it)",
+            config.token_path().display()
+        )
     } else if config.port == live.port {
         format!("won't connect on the live runner's port ({})", live.port)
     } else {
@@ -105,12 +155,56 @@ fn expand_home(p: &str) -> PathBuf {
 fn port_from_runner_json(home: &Path) -> Option<u16> {
     let text = std::fs::read_to_string(home.join("runner.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    v.get("port")?.as_u64().and_then(|p| u16::try_from(p).ok()).filter(|p| *p > 0)
+    v.get("port")?
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p > 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_uses_local_app_data_and_brings_the_old_settings_across_once() {
+        let dir = std::env::temp_dir().join(format!("tb-desktop-home-{}", std::process::id()));
+        let local = dir.join("AppData").join("Local");
+        let new = local.join("Threadbear");
+        let old = mac_home(&dir);
+        // Nothing anywhere: the native runner's place, and nothing made.
+        assert_eq!(windows_home(Some(local.clone()), &dir), new);
+        assert!(!new.exists());
+        // An older app's settings, and a copied token, in the old place:
+        // the settings come across, the token doesn't, and the old place
+        // is never used.
+        std::fs::create_dir_all(old.join("secrets")).unwrap();
+        std::fs::write(old.join("secrets").join("runner-token"), "t").unwrap();
+        std::fs::write(old.join("desktop-settings.json"), "{\"a\":1}").unwrap();
+        std::fs::write(old.join("gpui-prefs.json"), "{\"b\":2}").unwrap();
+        assert_eq!(windows_home(Some(local.clone()), &dir), new);
+        assert_eq!(
+            std::fs::read_to_string(new.join("desktop-settings.json")).unwrap(),
+            "{\"a\":1}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("gpui-prefs.json")).unwrap(),
+            "{\"b\":2}"
+        );
+        assert!(!new.join("secrets").exists());
+        // Once there, the new folder's own are kept.
+        std::fs::write(new.join("desktop-settings.json"), "{\"a\":3}").unwrap();
+        assert_eq!(windows_home(Some(local), &dir), new);
+        assert_eq!(
+            std::fs::read_to_string(new.join("desktop-settings.json")).unwrap(),
+            "{\"a\":3}"
+        );
+        // No LOCALAPPDATA: where Windows puts it.
+        assert_eq!(
+            windows_home(None, &dir),
+            dir.join("AppData").join("Local").join("Threadbear")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_the_port_from_runner_json() {
@@ -144,14 +238,24 @@ mod tests {
             let borrowed = base.join("borrowed");
             std::fs::create_dir_all(&borrowed).unwrap();
             std::os::unix::fs::symlink(real.join("secrets"), borrowed.join("secrets")).unwrap();
-            assert!(scripted_refusal(&at(borrowed, 1234), &real, false).unwrap().contains("token"));
+            assert!(scripted_refusal(&at(borrowed, 1234), &real, false)
+                .unwrap()
+                .contains("token"));
         }
         // The real folder not made yet still counts.
-        assert!(scripted_refusal(&at(base.join("none"), 1234), &base.join("none"), false).is_some());
+        assert!(
+            scripted_refusal(&at(base.join("none"), 1234), &base.join("none"), false).is_some()
+        );
         // The live runner's port, from its runner.json, else the default.
-        assert!(scripted_refusal(&at(other.clone(), 9555), &real, false).unwrap().contains("port"));
-        assert!(scripted_refusal(&at(other.clone(), DEFAULT_PORT), &base.join("none"), false).unwrap().contains("port"));
-        assert_eq!(scripted_refusal(&at(other.clone(), 1234), &real, false), None);
+        assert!(scripted_refusal(&at(other.clone(), 9555), &real, false)
+            .unwrap()
+            .contains("port"));
+        assert!(
+            scripted_refusal(&at(other.clone(), DEFAULT_PORT), &base.join("none"), false)
+                .unwrap()
+                .contains("port")
+        );
+        assert_eq!(scripted_refusal(&at(other, 1234), &real, false), None);
         // Told it may.
         assert_eq!(scripted_refusal(&at(real.clone(), 9555), &real, true), None);
         std::fs::remove_dir_all(&base).unwrap();

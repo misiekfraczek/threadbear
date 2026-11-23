@@ -22,7 +22,7 @@
 //    the url a picture in file storage the runner uploads (sync:iconUploadUrl,
 //    sync:setProjectIcon); a runner before 5 sends projects without icons.
 // 6: sync:issueToken, sync:listTokens and sync:revokeToken, so the Mac app
-//    pairs phones and signs browsers in through the runner (docs/protocol.md,
+//    pairs phones and signs browsers in through the runner (docs/protocol/moves.md,
 //    "Devices") with no Convex CLI; tokens carry a kind.
 // 7: sharing (docs/website.md, "Sharing"). Thread rows carry `share`
 //    ({ access, slug, people? }), and share:view, share:sendCode and
@@ -34,7 +34,7 @@
 //    thread's pictures go to file storage (sync:addShareImage), shown by
 //    share:view. A runner sends `share` only to a backend of 8 or later.
 // 9: schedules can live here rather than in each runner's schedules.json
-//    (step 6; docs/protocol.md, Schedules, "Runners"): sync:schedules,
+//    (step 6; docs/protocol/projects.md, Schedules, "Runners"): sync:schedules,
 //    sync:saveSchedule, sync:deleteSchedule, sync:adoptSchedules,
 //    sync:claimSchedule, sync:releaseSchedule, sync:scheduleRan and
 //    sync:requestScheduleRun. A runner moves its schedules here only from 9.
@@ -132,7 +132,7 @@
 //    can, so the phone's row says "Waiting for connection", not Failed. A
 //    runner sends it only to a backend of 34 or later; an older phone
 //    ignores it and shows Failed.
-// 35: secrets (docs/protocol.md, "Secrets"). A thread row's
+// 35: secrets (docs/protocol/threads.md, "Secrets"). A thread row's
 //    pendingApproval can be `kind: "secret"` with the card's label, reason
 //    and the runner's public key; phone:secret queues the phone's sealed
 //    answer (or a decline) as a respond command, and finishCommand drops
@@ -150,20 +150,20 @@
 //    a thread's pictures, with phone:messages' noImages. A runner uses
 //    upsertAccounts only with a backend of 37 or later and ignores firstSeen
 //    from none; an older phone goes on using phone:thread.
-// 38: pools shared between runners (docs/protocol.md, "Pools"): the
+// 38: pools shared between runners (docs/protocol/settings.md, "Pools"): the
 //    `pools` table, sync:pools, sync:savePools and sync:adoptPools. A runner
 //    follows it only with a backend of 38 or later; before, each keeps its
 //    own runner.json pools.
 // 39: sync:sharedUsage, every runner's latest usage reading of each login
 //    with an email, so a login signed in on several machines shows the
-//    newest reading on each (docs/protocol.md, Accounts, "Shared
+//    newest reading on each (docs/protocol/settings.md, Accounts, "Shared
 //    readings"). A runner subscribes only with a backend of 39 or later.
 // 40: projectThreads, a row per thread per project kept by the thread
 //    writes, and phone:projectThreads, a project's threads newest first,
 //    archived ones included, so the website's project page can list all of
 //    them. The backend links the threads it already has by itself
 //    (sync:linkProjects); nothing changes on the runner.
-// 41: runner keys (docs/protocol.md, "Runner keys"). Besides the owner
+// 41: runner keys (docs/protocol/keys.md, "Runner keys"). Besides the owner
 //    key (RUNNER_KEY), a key per runner (runnerKeys, sync:addRunnerKey),
 //    which acts as that runnerId alone: its own heartbeat, threads,
 //    messages, schedules, commands and Pocket cards, and none of the
@@ -178,14 +178,14 @@
 //    ignore.
 // 42: phone:update's archive takes a verdict ("worked", "didntWork" or
 //    "notNeeded"), the pick from the done card's Archive menu, which the
-//    runner keeps as the thread's archiveVerdict (docs/protocol.md, "Who
+//    runner keeps as the thread's archiveVerdict (docs/protocol/threads.md, "Who
 //    archived a thread"). A phone sends it only to a backend of 42 or
 //    later; an older runner ignores it and just archives.
 // 43: phone:threadsAt and phone:threadsSince, a list read once and then only
 //    the rows written since. Thread rows carry updatedMs. An older phone goes
 //    on using phone:threads, and an older runner's writes go through the same
 //    upsertThreads, which stamps them.
-// 44: other runners' threads through the backend (docs/protocol.md, "Other
+// 44: other runners' threads through the backend (docs/protocol/runners.md, "Other
 //    runners' threads through the backend"): relay.ts, owner only, for the
 //    main Mac's runner to read another runner's thread (remoteTail,
 //    remoteMessages, remoteThread) and ask it to act (queueCommand,
@@ -227,7 +227,7 @@
 //    before. phone:project still returns them whole.
 // 51: an owned schedule can carry `check`, a shell command its runner runs
 //    before each run. An older runner sends none.
-// 52: full sync (docs/full-convex.md step 4). eventBodies, sync:appendBodies,
+// 52: full sync (docs/archive/full-convex.md step 4). eventBodies, sync:appendBodies,
 //    sync:remoteBody and phone:eventBody: a tool's output, input and diffs under
 //    the seq of its row, only from a runner with sync.full on. heldPictures,
 //    phone:requestPicture, phone:heldPicture and a `picture` command: one tool
@@ -244,7 +244,7 @@
 // 54: a runner key's archived threads stay in threadIndex (within its cap,
 //    archived rows giving way first), so the main Mac's Archived list has
 //    other machines' archived threads and can open and unarchive them
-//    (docs/protocol.md, "Other runners' threads"). A runner sends the
+//    (docs/protocol/runners.md, "Other runners' threads"). A runner sends the
 //    archived rows an older backend dropped once, on first hearing 54.
 // 55: an owned schedule can carry `checkTimeoutSecs`, how long its check may
 //    take (60 s without). An older runner sends none.
@@ -260,7 +260,7 @@
 //    the same runner order the phone sets (API 56), for the Mac's Settings >
 //    Runners. An older runner sends the Mac no order, and its Settings list
 //    the runners as before.
-// 59: reply buttons (docs/protocol.md, "Reply buttons"). A message row can
+// 59: reply buttons (docs/protocol/events.md, "Reply buttons"). A message row can
 //    carry `buttons`, the state of the buttons its text links ([title](button:<id>)),
 //    which the runner sends again when one is pressed (appendMessages patches
 //    just them); phone:messages returns them, and phone:press queues a `press`
@@ -289,7 +289,7 @@
 //    weren't queued, and sync:pruneFiles any left after a day. A runner
 //    sends pictures to another runner only from 63: an older backend would
 //    drop them and send the words alone.
-// 64: moving a thread to another runner (docs/protocol.md, "Moving a thread
+// 64: moving a thread to another runner (docs/protocol/moves.md, "Moving a thread
 //    to another runner"; convex/moves.ts). The threadMoves table, startMove
 //    and cancelMove for the main Mac, moves and each step for the move's
 //    own runners, and move chunks through /runner/upload outside a runner
@@ -343,7 +343,7 @@
 //    for another runner's. A runner sends the ids only from 75, as an
 //    older backend hides the member from the other runners' keys.
 // 76: threads rows carry `review`, another lab's review ledger from the
-//    last turn's turn.completed (docs/protocol.md, "Review by another
+//    last turn's turn.completed (docs/protocol/needs-you.md, "Review by another
 //    lab"), and `cardTurn`, the turn it and `looseEnds` are from, so
 //    another Mac draws them as this runner's own Mac does. A plan's message
 //    row can carry `planDecision` (go or revise), sent again once it's
@@ -375,4 +375,103 @@
 //    place of a phone token, and tokens:claim trades it for the token from
 //    the phone's own scanner. A runner pairs phones only from 80, so no
 //    token goes into a QR code again.
-export const API_VERSION = 80;
+// 81: browser sign-in codes. sync:issuePairingCode takes `kind: "browser"`,
+//    and the website's sign-in link carries that one-use code (#code=) in
+//    place of a browser token, which it trades with tokens:claim.
+//    sync:issueToken refuses browsers too, so no reusable token goes into a
+//    link again. A runner signs browsers in only from 81.
+// 82: phone:projectThreads takes `runnerId` and reads that runner's project
+//    alone (projectThreads' by_runner_project index): a project is (runnerId,
+//    projectId), and without runnerId it gives nothing rather than every
+//    runner's threads under that id (Daybreak 141). upsertThreads keeps only
+//    web links (http or https with a host) on a thread's asks and links, from
+//    every runner, dropping the rest (Daybreak 139). Runners send only those
+//    already, so nothing changes for them.
+//    phone:thread and the lists hold rows written before to the same rule
+//    as they read them.
+// 83: a move is bound to its preview (Daybreak 142). moves:startMove takes
+//    `expect`, the digest of what the Move sheet showed, and the move's row
+//    carries it; the runner it goes to takes a move only with one that
+//    matches its own plan. moves:moveInfo keeps only a description's own
+//    fields, typed and bounded. A runner starts moves with it from 83, and
+//    an older backend refuses its startMove, so moves wait for the backend.
+// 84: shared memory (memorySync.ts). sync:putMemory (owner only) puts up the
+//    main Mac's global CLAUDE.md and memory files, sync:memorySince reads
+//    them down by sequence number, and sync:offerMemory carries what a
+//    runner key's agents saved back to the main Mac (sync:memoryOffers,
+//    sync:takeMemoryOffers). Only runners with the sharedMemory experiment on
+//    call any of them.
+// 85: sync:takeCommand takes `attempt`, the runner's id for its take: the
+//    same attempt asking again gets true, so a take whose answer was lost
+//    is run rather than dropped. finishCommand changes only a taken command
+//    (or one whose lease ran out), so a repeated or late finish can't
+//    overwrite how one ended. A taken command no runner finished in 3 hours
+//    shows as failed (lapseCommands), and its runner's late finish still
+//    settles it. relay:decideRequest takes `claim` the same way, so a claim
+//    whose answer was lost can carry on. A runner sends `attempt` and
+//    `claim` only to a backend of 85 or later.
+// 86: phone:designReviews and phone:respondReview queue a design review's
+//    read and answer on the thread's runner (reviews.list, reviews.get,
+//    reviews.respond), and phone:reviewImages reads a review's stills,
+//    which the runner puts up only once the phone has asked for that review.
+// 87: relay:picturesAtSeqs (owner only) reads the pictures pasted into
+//    another runner's messages, by seq, with their URLs: what that runner
+//    put up for the phone (replyImages, src "picture:N"). A user's message
+//    row can carry `pictures`, how many it came with, which remoteTail and
+//    remoteMessages pass on. The main Mac's runner shows them in another
+//    runner's thread and answers the app's files.read for them; a runner
+//    sends `pictures` and asks for them only from a backend of 87.
+// 88: a threadIndex row can carry the thread's `permissionMode`, which
+//    sync:threadIndexSince and sync:otherRunnersThreads pass on, so another
+//    Mac's composer shows a thread's real access. A runner sends it only to
+//    a backend of 88 or later.
+// 89: a user's message row can carry `answers`, the open card's asks it
+//    answered (each its question, `action`, and the pick, `answer`), and
+//    phone:messages passes them on, so the phone draws them as the Mac
+//    does: the question small, the answer as his words. A runner sends
+//    `answers` only to a backend of 89 or later.
+// 90: relay:queueCommand's `call` takes accounts.yearToken (the Mac's
+//    Runners panel's Year-long token… for another runner's login), and an
+//    accounts row can carry `loginEndsAt`, `signedOut` and `yearToken`
+//    (`{ madeAt? }`), never the token. A runner sends them only to a
+//    backend of 90 or later.
+// 91: sync:heartbeat takes `updateFailed` ({ kind, commit, subject, error,
+//    logFile }), a following runner's word that its update to main failed,
+//    cut to fit from a runner key and dropped from a box's. The main key
+//    reads it from sync:otherRunnersList and starts the fix thread on the
+//    main Mac itself, so the following runner no longer asks for one there
+//    on a card. A runner sends it only to a backend of 91 or later.
+// 92: sync:removeThreads takes `runnerId`, the runner whose threads went,
+//    and leaves a row that's another runner's alone, whatever the key: a
+//    restart of the main Mac removed threads it had moved to another Mac,
+//    their rows there and all. A runner sends it only to a backend of 92
+//    or later.
+// 93: phone:registerDevice takes platform "webpush" (the Android app's
+//    F-Droid build): apnsToken is its UnifiedPush endpoint and the new
+//    `webPush` ({ p256dh, auth }) its keys; push.ts posts each notification
+//    there itself, encrypted (RFC 8291) and VAPID-signed (webPush.ts). The
+//    action phone:webPushKey ({ token }) gives the phone this deployment's
+//    VAPID public key to register with. The app registers this way only
+//    with a backend of 93 or later.
+// 94: virtual runners from the Mac (docs/virtual-runners.md, slice 5): a
+//    cloud token is a state machine (valid, dead), boxes:cloudTokens says
+//    which; a box whose login has none waits (needsToken) until one is set;
+//    boxes:startThread takes cwd and accountId and writes the thread's
+//    sidebar row; the exchange gives tokenSetAt; a box says a refused token
+//    (boxes:tokenRefused) and fetches the new one (boxes:boxCloudToken);
+//    otherRunnersList's box carries service, token and login. A runner
+//    offers virtual runners only on a backend of 94 or later.
+// 95: sync:addReplyImage takes a live page, mediaType text/html (the
+//    livePages experiment, docs/live-pages-design), uploaded as plain bytes;
+//    phoneImage carries `mediaType` for a reply's media, so the phones run
+//    a page in a sealed view rather than decode it. A runner sends pages
+//    only to a backend of 95 or later.
+// 96: a threadIndex row (sync:setThreadIndex) takes `request`, Mike's first
+//    message to the thread as one line (docs/protocol/threads.md, "What Mike first
+//    asked"), for the Mac's Feed of another runner's threads. A runner sends
+//    it only to a backend of 96 or later.
+// 97: an owned schedule can carry `provider`, with poolId: the kind of
+//    login a pool of several kinds starts its threads on, as the Mac's
+//    picker had it. A runner sends it only to a backend of 97 or later; an
+//    older runner starts the thread on the model's kind.
+export const API_VERSION = 97;

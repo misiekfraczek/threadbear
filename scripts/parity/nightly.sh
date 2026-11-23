@@ -1,9 +1,17 @@
 #!/bin/bash
 # The nightly parity run, from Mike's main Mac: copies main to Tinker Desk,
-# runs scripts/parity/run.sh there in its desktop session (the simulator and
-# the GPUI app's window need one), and brings the pictures back to
-# ~/Library/Caches/Threadbear/parity/<time>/ (index.html shows them side by
-# side). The last 7 runs are kept.
+# runs scripts/parity/run.sh there in its desktop session (the simulator,
+# the Android emulator and the GPUI app's window need one), brings the
+# pictures back to ~/Library/Caches/Threadbear/parity/<time>/ (index.html
+# shows them side by side), and has Opus compare each scenario's iPhone,
+# Android and website pictures with the Mac's (looks.ts). The last 7 runs
+# are kept.
+#
+# Mike's setup only: nothing calls it but his schedule, and it needs a
+# parity host (THREADBEAR_PARITY_HOST or checkHosts) with Xcode, Chrome,
+# Desk Runner and the Android SDK in /Volumes/TinkerSSD/android-parity,
+# plus a small-model pool here for the comparison. check.sh, CI and setup
+# never run it, so a fork without those never meets it (docs/parity-run.md).
 #
 #   scripts/parity/nightly.sh          run it now and wait (about 3 minutes warm)
 #   scripts/parity/nightly.sh --check  for the schedule's check (5 minutes at
@@ -36,7 +44,10 @@ if [ "${1:-}" = "--check" ]; then
   latest=$(ls -d "$KEEP"/20* 2>/dev/null | sort | tail -1)
   if [ -n "$latest" ] && [ -f "$latest/results.json" ] && [ ! -f "$latest/.reported" ]; then
     touch "$latest/.reported"
-    problems=$(/usr/bin/python3 -c 'import json,sys; [print(f) for f in json.load(open(sys.argv[1]))["failures"]]' "$latest/results.json" 2>/dev/null)
+    problems=$(/usr/bin/python3 -c 'import json,sys
+j=json.load(open(sys.argv[1]))
+[print(f) for f in j["failures"] + j.get("differences", [])]
+if j.get("lookErrors"): print("The looks check could not compare some scenarios: " + "; ".join(j["lookErrors"]))' "$latest/results.json" 2>/dev/null)
     [ -n "$problems" ] && printf 'The parity run of %s found:\n%s\nIts pictures: %s/index.html\n' "$(basename "$latest")" "$problems" "$latest"
     exit 0
   fi
@@ -64,8 +75,12 @@ stage=$(mktemp -d)
 git -C "$ROOT" archive "$main" | tar -x -C "$stage"
 # Into the same folder each night, so packages and Swift builds stay warm;
 # --delete keeps it to main's files, apart from what builds make.
-"${SSH[@]}" "$HOST" "mkdir -p $REMOTE/src" &&
-  rsync -a --delete --exclude node_modules --exclude .build --exclude .parity-packages -e "${SSH[*]}" "$stage/" "$HOST:$REMOTE/src/" >> "$dest/run.log" 2>&1
+# Its symlinks go first, as rsync puts them back: macOS's rsync won't write
+# a file where one was (21 Nov: main turned the iPhone kit's links to the
+# Swift app into files, and the copy failed).
+"${SSH[@]}" "$HOST" "mkdir -p $REMOTE/src && find $REMOTE/src \( -name node_modules -o -name .build -o -name build -o -name .gradle \) -prune -o -type l -exec rm -f {} +" &&
+  rsync -a --delete --exclude node_modules --exclude .build --exclude .parity-packages \
+    --exclude /android-native/.gradle --exclude /android-native/app/build --exclude /android-native/kit/build -e "${SSH[*]}" "$stage/" "$HOST:$REMOTE/src/" >> "$dest/run.log" 2>&1
 copied=$?
 rm -rf "$stage"
 if [ $copied -ne 0 ]; then
@@ -80,21 +95,50 @@ fi
 . "$ROOT/scripts/remote-guard-lib.sh"
 alive_stdin 7
 pidfile="$REMOTE/run-$stamp-$$.pid"
-"${SSH[@]}" "$HOST" "find $REMOTE -maxdepth 1 -name 'run-*.pid*' -mtime +7 -exec rm -f {} + 2>/dev/null; true" >/dev/null 2>&1
+# The last run's pictures and log go first: on 19 Nov a run that never
+# started brought back the night before's, and they were reported as new.
+"${SSH[@]}" "$HOST" "find $REMOTE -maxdepth 1 -name 'run-*.pid*' -mtime +7 -exec rm -f {} + 2>/dev/null; rm -rf $REMOTE/out $REMOTE/run.log; true" >/dev/null 2>&1
 inner="echo \$\$ >$pidfile; [ ! -e $pidfile.gone ] || exit 129; cd ~/$REMOTE/src && bash scripts/parity/run.sh ~/$REMOTE/out > ~/$REMOTE/run.log 2>&1; echo exit \$? >> ~/$REMOTE/run.log"
 # In the background with a wait, so a TERM, HUP or INT to this script stops
 # the ssh, and with it the run, at once (Codex's review).
-"${SSH[@]}" "$HOST" "perl $REMOTE/src/scripts/perf-lock.pl --desk $pidfile bash -c $(single_quoted "$inner")" <&7 >/dev/null 2>&1 &
+# What perf-lock says (why a run couldn't start, such as Desk Runner missing
+# a permission) goes in the run's log.
+"${SSH[@]}" "$HOST" "perl $REMOTE/src/scripts/perf-lock.pl --desk $pidfile bash -c $(single_quoted "$inner")" <&7 >> "$dest/run.log" 2>&1 &
 ssh_pid=$!
-trap 'kill $ssh_pid 2>/dev/null; exit 143' TERM
-trap 'kill $ssh_pid 2>/dev/null; exit 129' HUP
-trap 'kill $ssh_pid 2>/dev/null; exit 130' INT
+# A time limit, so a run that hangs gives up the host's build lock. On 18 Nov
+# one sat from 02:10 to 07:10 (behind a macOS prompt nobody was there to
+# answer), and every build and check for that Mac queued behind it. A warm
+# run takes about 3 minutes, a cold GPUI build under load about 40. Stopping
+# the ssh is the usual way out: the host's hangup guard stops the run and
+# frees the locks. THREADBEAR_PARITY_LIMIT is in seconds.
+limit=${THREADBEAR_PARITY_LIMIT:-7200}
+( sleep "$limit" & sleeper=$!
+  trap 'kill $sleeper 2>/dev/null; exit 0' TERM
+  wait $sleeper && kill -0 $ssh_pid 2>/dev/null && touch "$dest/.timed-out" && kill $ssh_pid 2>/dev/null ) &
+watchdog=$!
+trap 'kill $ssh_pid $watchdog 2>/dev/null; exit 143' TERM
+trap 'kill $ssh_pid $watchdog 2>/dev/null; exit 129' HUP
+trap 'kill $ssh_pid $watchdog 2>/dev/null; exit 130' INT
 wait $ssh_pid
+kill $watchdog 2>/dev/null
+wait $watchdog 2>/dev/null
 trap - TERM HUP INT
 rsync -a -e "${SSH[*]}" "$HOST:$REMOTE/out/" "$dest/" >/dev/null 2>&1
-"${SSH[@]}" "$HOST" "grep -v '^dev-app: screencapture' ~/$REMOTE/run.log" >> "$dest/run.log" 2>&1
+"${SSH[@]}" "$HOST" "[ ! -f ~/$REMOTE/run.log ] || grep -v '^dev-app: screencapture' ~/$REMOTE/run.log" >> "$dest/run.log" 2>&1
+# Last, so --check's tail of the log ends with it.
+[ -f "$dest/.timed-out" ] && echo "stopped after $((limit / 60)) minutes, nightly.sh's time limit (THREADBEAR_PARITY_LIMIT), so it gave up $HOST's build lock" >> "$dest/run.log"
+# The looks check, here where the Claude logins are, then the page again
+# with what it found.
+if [ -f "$dest/results.json" ]; then
+  . "$ROOT/runner/scripts/find-node.sh"
+  if NODE="$(threadbear_find_node)"; then
+    echo "comparing the pictures with the Mac's" >> "$dest/run.log"
+    "$NODE" "$ROOT/scripts/parity/looks.ts" "$dest" >> "$dest/run.log" 2>&1 || echo "the looks check failed" >> "$dest/run.log"
+    "$NODE" "$ROOT/scripts/parity/gallery.mjs" "$dest" > /dev/null 2>> "$dest/run.log"
+  fi
+fi
 [ -f "$dest/results.json" ] || touch "$dest/.failed"
 # The last 7 runs.
 ls -d "$KEEP"/20* 2>/dev/null | sort -r | tail -n +8 | while read -r old; do rm -rf "$old"; done
 echo "$dest/index.html"
-[ -f "$dest/results.json" ] && /usr/bin/python3 -c 'import json,sys; f=json.load(open(sys.argv[1]))["failures"]; [print(x) for x in f]; sys.exit(1 if f else 0)' "$dest/results.json"
+[ -f "$dest/results.json" ] && /usr/bin/python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); f=j["failures"]+j.get("differences",[]); [print(x) for x in f]; sys.exit(1 if f else 0)' "$dest/results.json"

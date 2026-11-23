@@ -8,12 +8,15 @@
 // Everything here runs real git. Nothing ever pushes.
 import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { realPath } from './platform.ts';
 import type { WorktreePatch } from './patches.ts';
 import { inBackground } from './background.ts';
 import { mainCheckoutOf as linkedMainCheckout } from './patch-trust.ts';
 import { untrustedGitArgs } from './safe-git.ts';
-import { LAND_TIMES_FILE, joinQueue, leaveQueue, queueDir, readEntry, setRunning, waiting, waitingLine, writeEntry, type QueueEntry } from './land-queue.ts';
+import { carryAcross, formatChanges, crossings, mergeAcross, remakeOwn, touchesFormatted, TreeFormatter, type FormatCommit } from './format-replay.ts';
+import { LAND_TIMES_FILE, joinQueue, leaveQueue, queueDir, readEntry, readRunning, ridesFree, setRunning, typicalCheckSeconds, waiting, waitingLine, writeEntry, type QueueEntry } from './land-queue.ts';
 
 // What a thread's record keeps about its worktree.
 export type WorktreeRecord = {
@@ -141,12 +144,10 @@ export async function mainCheckoutOf(cwd: string): Promise<string | undefined> {
   return (await listCheckouts(cwd))?.find((c) => c.branch === MAIN)?.path;
 }
 
+// The real form of a path, to compare two by (platform.ts: on Windows git's
+// long names and a cwd's 8.3 short ones are one folder).
 export function realpath(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p);
-  }
+  return realPath(path.resolve(p));
 }
 
 function isDir(p: string): boolean {
@@ -220,23 +221,64 @@ async function makeWorktreeNow(opts: { cwd: string; threadId: string; patch: Wor
 
   if (keep) {
     for (const spare of await spares(mainCheckout, threads)) {
-      if (!(await claimSpare(spare))) continue;
-      if (await reuse(spare, branch, base, keep)) return done(spare);
+      const claim = await claimSpare(spare);
+      if (!claim) continue;
+      if (await reuse(spare, branch, base, keep)) {
+        fs.rmSync(claim, { force: true });
+        return done(spare);
+      }
       // Couldn't be put right: it stays unlocked, out of the pool, for
       // someone to look at, and the thread gets a new slot.
     }
   }
 
-  let where = path.join(threads, id8);
-  if (keep) {
-    let n = 1;
-    while (fs.existsSync(path.join(threads, `slot-${n}`))) n++;
-    where = path.join(threads, `slot-${n}`);
-  }
   fs.mkdirSync(threads, { recursive: true });
+  if (!keep) {
+    const where = path.join(threads, id8);
+    const add = await addWorktree(mainCheckout, branch, where, base);
+    return add === true ? done(where) : { ok: false, reason: `git worktree add failed: ${add}` };
+  }
+  // The first free slot number: no folder there, and not a path git still
+  // has registered after its folder went (git refuses to add there). One
+  // git refuses all the same (borrow-worktree.sh took it at that moment)
+  // tries the next, a few times, as the script does. 21 Nov: a slot folder
+  // removed by hand left every new thread without a worktree.
+  const registered = new Set(((await listCheckouts(mainCheckout)) ?? []).map((c) => path.resolve(c.path)));
+  let refused = '';
+  for (let n = 1, tries = 0; tries < 5; n++) {
+    const where = path.join(threads, `slot-${n}`);
+    if (lexists(where) || registered.has(path.resolve(where)) || registered.has(realpath(where))) continue;
+    const add = await addWorktree(mainCheckout, branch, where, base);
+    if (add === true) return done(where);
+    refused = add;
+    tries++;
+  }
+  return { ok: false, reason: `git worktree add failed: ${refused}` };
+}
+
+// `git worktree add -b`, which makes the branch before it looks at the
+// folder: when it then refuses, the branch it made goes too (it was checked
+// not to be there before, and is at `base` with nothing checked out), or the
+// thread's next try would be refused for it. true, or why not.
+async function addWorktree(mainCheckout: string, branch: string, where: string, base: string): Promise<true | string> {
   const add = await git(mainCheckout, ['worktree', 'add', '-b', branch, where, base]);
-  if (!add.ok) return { ok: false, reason: `git worktree add failed: ${firstLine(add.stderr)}` };
-  return done(where);
+  if (add.ok) return true;
+  const left = await gitOut(mainCheckout, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+  const checkouts = left === base ? await listCheckouts(mainCheckout) : undefined;
+  // Deleted only if it's still at base as git deletes it (update-ref's old
+  // value), so a branch moved on meanwhile stays (Codex's review, 21 Nov).
+  if (checkouts && !checkouts.some((c) => c.branch === branch)) await git(mainCheckout, ['update-ref', '-d', `refs/heads/${branch}`, base]);
+  return firstLine(add.stderr.split('\n').filter((l) => !l.startsWith('Preparing worktree')).join('\n'));
+}
+
+// Whether anything is at `p`, a link to nowhere too.
+function lexists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------- spares
@@ -250,7 +292,7 @@ async function makeWorktreeNow(opts: { cwd: string; threadId: string; patch: Wor
 // everything git doesn't track except the kept folders, and checks out its
 // branch there, so its first build only recompiles what changed.
 
-const SPARE = 'threadbear spare';
+export const SPARE = 'threadbear spare';
 
 // How many spares a repo keeps. Each holds its build caches (a gigabyte or
 // so for Threadbear's), so past this an archived thread's worktree is
@@ -271,24 +313,42 @@ async function spares(mainCheckout: string, threads: string): Promise<string[]> 
 // one's unlink finding no file still counts as success, so both took the
 // spare (Codex, 8 Nov). A rename of git's lock file is atomic, so only
 // one claimer wins; borrow-worktree.sh claims the same way.
-async function claimSpare(spare: string): Promise<boolean> {
+//
+// The renamed file stays, touched, until the spare is set up, and the borrow
+// sweep counts it as the folder being used (borrows.ts lastUsed): between
+// the claim and the checkout the folder is detached and unlocked, which the
+// sweep would otherwise take for a spare claimed and never set up, and put
+// back in the pool under the thread setting it up (Codex's review, 21 Nov).
+// Returns the claim's file, or undefined when another got there first.
+async function claimSpare(spare: string): Promise<string | undefined> {
   const admin = await gitOut(spare, ['rev-parse', '--absolute-git-dir']);
-  if (!admin) return false;
+  if (!admin) return undefined;
   const lock = path.join(admin, 'locked');
-  const claimed = `${lock}.claimed-${process.pid}-${Date.now()}`;
+  const claimed = `${lock}${CLAIMED}${process.pid}-${Date.now()}`;
+  // Touched before the rename, so it's never there with an old time.
+  const now = new Date();
   try {
+    fs.utimesSync(lock, now, now);
     fs.renameSync(lock, claimed);
   } catch {
-    return false;
+    return undefined;
   }
-  fs.rmSync(claimed, { force: true });
-  return true;
+  return claimed;
 }
+
+// What a claimed spare's lock file is renamed to: locked<CLAIMED><pid>-<ms>.
+export const CLAIMED = '.claimed-';
 
 // A claimed spare, made like new on `branch` at `base`. The kept folders
 // are left as they are; everything else git doesn't track goes, ignored
 // files too (an old thread's node_modules, say), and setup runs again.
+//
+// Not one with changes to tracked files: a spare never has them (its
+// cleanup or give-back saw it clean), so someone is working there, and the
+// reset would take their work (21 Nov). It stays unlocked, out of the pool.
 async function reuse(where: string, branch: string, base: string, keep: string[]): Promise<boolean> {
+  const status = await git(where, ['status', '--porcelain', '--untracked-files=no']);
+  if (!status.ok || status.stdout.trim()) return false;
   const exclude = keep.flatMap((k) => ['-e', `/${k.replace(/^\/+|\/+$/g, '')}`]);
   for (const args of [['reset', '-q', '--hard'], ['clean', '-ffdxq', ...exclude], ['checkout', '-q', '-b', branch, base]]) {
     if (!(await git(where, args)).ok) return false;
@@ -304,7 +364,7 @@ export function worktreeInstructions(w: WorktreeRecord): string {
   return [
     `This thread has its own git worktree of ${w.repo} at ${w.path}, on the branch ${w.branch}, made from ${MAIN}.`,
     `Commit your work there, on that branch. Other threads work in worktrees of their own, and the main checkout at ${w.mainCheckout} isn't yours to edit.`,
-    `When the work is done and checked, run \`tb land\` in the worktree: it rebases the branch on ${MAIN}, runs the repo's check and fast-forwards ${MAIN} to it. It never pushes. It may first wait for another thread's landing, so run it in the background with the longest timeout allowed. After landing you can carry on, and the next \`tb land\` lands only what's new.`,
+    `When the work is done and checked, run \`tb land\` in the worktree: it rebases the branch on ${MAIN}, runs the repo's check and fast-forwards ${MAIN} to it. It may first wait for another thread's landing, so run it in the background with the longest timeout allowed. After landing you can carry on, and the next \`tb land\` lands only what's new.`,
   ].join(' ');
 }
 
@@ -333,8 +393,14 @@ export type LandOptions = {
   hold?: (root: string, files: string[]) => Promise<string | undefined>;
   // `tb land --despite-red`: this landing is the repair for what's red, so
   // `hold` isn't asked about its own files. In the queue it's a fix: it
-  // goes first in any group check and the halving never leaves it out.
+  // goes first in any group check, outside the halving's limit (setAside
+  // has the one way it's left out).
   despiteRed?: boolean;
+  // `tb land --allow-format <id>`: the format commands this landing adds to
+  // .git-blame-ignore-revs, or config files they run with that it changes,
+  // which later landings run on this Mac, were shown and are meant
+  // (formatChanges' id for exactly those). The Land chip never passes it.
+  allowFormat?: string;
   // Where readCheck looks from, relative to the worktree's root (a
   // subfolder's patch can ask for its own check). Only landings that look
   // from the same place are checked together, so the check read on the
@@ -342,6 +408,17 @@ export type LandOptions = {
   checkFrom?: string;
   // The check hosts this landing asks for: THREADBEAR_CHECK_HOST if left out.
   checkHost?: string;
+  // Push main to origin once it has landed, folding GitHub's main in first
+  // when that has moved too (pushMain). The CLI's comes from runner.json's
+  // `pushAfterLanding`, so only the owner's own Mac pushes.
+  push?: boolean;
+  // The CLI's: on SIGTERM, SIGINT or SIGHUP while waiting for the landing
+  // lock, leave the line, say so, and exit (land, `stopped`).
+  sayWhenStopped?: boolean;
+  // Called once it holds the landing lock (the CLI's worker stops listening
+  // for its follower then: land-detach.ts). False: the tb that was run has
+  // gone meanwhile, so it stops before its check, out of the line.
+  onLocked?: () => boolean;
 };
 
 // The hosts a landing asked for, as check.sh would take them (an ssh host
@@ -415,7 +492,7 @@ export async function land(t: LandTarget, opts: LandOptions = {}): Promise<numbe
     // Refusals, and conflicts with main as it is now, come straight away
     // rather than after the wait. It's done again with the lock held, as
     // main will have moved.
-    const ready = await prepare(t, out, err, opts.despiteRed ? undefined : opts.hold);
+    const ready = await prepare(t, out, err, opts.despiteRed ? undefined : opts.hold, opts.allowFormat);
     if (typeof ready === 'number') return ready;
 
     // A dry run, and a branch with a merge on it (it's merged with main,
@@ -431,6 +508,9 @@ export async function land(t: LandTarget, opts: LandOptions = {}): Promise<numbe
           branch: t.branch, path: t.path, base: ready.base, commit: ready.commit, check: check ?? null, checkFrom: opts.checkFrom ?? '',
           ...(checkHost ? { checkHost } : {}),
           ...(opts.despiteRed ? { fix: true } : {}),
+          // Read by scripts/sync-main.sh: only a landing that will push is
+          // one it leaves GitHub's main to.
+          ...(opts.push ? { push: true } : {}),
         });
         entryHeld = await holdLock(entryLockFile(common, entry.id), false);
         if (!entryHeld) throw new Error('entry lock taken');
@@ -439,16 +519,55 @@ export async function land(t: LandTarget, opts: LandOptions = {}): Promise<numbe
         entry = undefined; // it still lands, by itself
       }
     }
-    let release: () => Promise<void>;
+    // Left out of its group meanwhile (findBroken): it stops waiting and
+    // says why now, not after the checks of everyone still in the line.
+    const refused = (): QueueEntry['refused'] => (entry ? readEntry(common, entry.id)?.refused : undefined);
+    let release: (() => Promise<void>) | undefined;
+    // Stopped while it waits (an agent's time limit, Ctrl-C): it's out of
+    // the line, as nobody would hear how its landing went, so it says so in
+    // what its thread reads. On 17 Nov two waits killed by the two-hour
+    // limit left their threads thinking they were still queued.
+    // One already in the running group's check may still land with it (a
+    // holder lands one whose tb has gone, if its branch hasn't moved), and
+    // one whose group has landed has: it says which (Codex's review).
+    const stopped = (signal: NodeJS.Signals): void => {
+      const now = entry && readEntry(common, entry.id);
+      const inCheck = !!entry && !!readRunning(common)?.entries?.includes(entry.id);
+      const said = now?.result
+        ? `it had already landed with its group (${now.result.landed.slice(0, 9)} on ${MAIN}); its next tb land moves ${t.branch} there.`
+        : inCheck
+          ? `${t.branch} is out of the line, but it was in the group being checked, which may still land it: its next tb land says whether it did, and lands it if not.`
+          : `${t.branch} is out of the line and nothing of it landed. Run tb land again to rejoin (in the background, with the longest timeout).`;
+      if (entry && !now?.result && !inCheck) leaveQueue(common, entry.id);
+      err(`tb land was stopped (${signal}) while it waited in the landing queue: ${said}`);
+      process.exit(128 + (os.constants.signals[signal] ?? 15));
+    };
+    const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+    if (opts.sayWhenStopped) for (const s of signals) process.once(s, stopped);
     try {
-      release = await lockLanding(path.join(common, 'threadbear-land.lock'), out, () => waitingLine(common, timesFile, entry));
+      release = await lockLanding(path.join(common, 'threadbear-land.lock'), out, () => waitingLine(common, timesFile, entry) + longWait(asked), () => !!refused());
     } catch (e) {
       err(`Couldn't lock the repo for landing: ${(e as Error).message}`);
+      return 1;
+    } finally {
+      for (const s of signals) process.removeListener(s, stopped);
+    }
+    if (release && opts.onLocked && !opts.onLocked()) {
+      await release();
+      err(`tb land was stopped just as it got the landing lock, before its check: ${t.branch} is out of the line and nothing of it landed. Run tb land again to rejoin.`);
+      return 129;
+    }
+    if (!release) {
+      err(refused()?.text ?? `${t.branch} was left out of its group's check, so nothing landed. Run tb land again.`);
       return 1;
     }
     try {
       const mine = entry && readEntry(common, entry.id);
       if (mine?.result) return await landedByAnother(t, mine, out);
+      if (mine?.refused) {
+        err(mine.refused.text);
+        return 1;
+      }
       // An earlier tb of this branch, killed, may have landed while this one
       // waited.
       await recoverLandedFor(t, common, out);
@@ -543,7 +662,7 @@ const entryLockFile = (common: string, id: string): string => path.join(queueDir
 async function ownerWaiting(common: string, e: QueueEntry): Promise<boolean> {
   if (!fs.existsSync(entryLockFile(common, e.id))) return false;
   const now = readEntry(common, e.id);
-  if (!now || now.result) return false;
+  if (!now || now.result || now.refused) return false;
   try {
     const free = await holdLock(entryLockFile(common, e.id), false);
     if (!free) return true;
@@ -678,8 +797,9 @@ async function landedByAnother(t: LandTarget, e: QueueEntry, out: (line: string)
 // While it waits it says where it is in the line, and again every few
 // minutes.
 // An OS lock on `file`, held by a small child until released or this
-// process exits; undefined if `wait` is false and someone else has it.
-async function holdLock(file: string, wait: boolean): Promise<(() => Promise<void>) | undefined> {
+// process exits; undefined if `wait` is false and someone else has it, or if
+// `stop` fired while it waited.
+async function holdLock(file: string, wait: boolean, stop?: AbortSignal): Promise<(() => Promise<void>) | undefined> {
   const holder = "process.stdin.resume(); process.stdin.on('end', () => process.exit(0)); process.stdout.write('locked');";
   const mac = process.platform === 'darwin';
   // 75 is EX_TEMPFAIL for lockf, and explicitly chosen for flock. A
@@ -691,14 +811,26 @@ async function holdLock(file: string, wait: boolean): Promise<(() => Promise<voi
   const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
   let errors = '';
   child.stderr.on('data', (d) => { errors += d; });
+  const giveUp = (): void => { child.kill(); };
+  stop?.addEventListener('abort', giveUp);
   const acquired = await new Promise<boolean>((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code) => {
-      if (!wait && code === 75) resolve(false);
+      if ((!wait && code === 75) || stop?.aborted) resolve(false);
       else reject(new Error(errors.trim() || `landing lock exited (${code})`));
     });
     child.stdout.once('data', () => resolve(true));
   });
+  // Stopped, even just as the lock came: the child was killed, and with it
+  // the lock, so this must never be taken for holding it. (No await between
+  // taking the listener off and asking: after this, nothing kills the child.)
+  stop?.removeEventListener('abort', giveUp);
+  if (stop?.aborted) {
+    child.stdin.end();
+    child.kill();
+    await closed;
+    return undefined;
+  }
   if (!acquired) return undefined;
   return async () => {
     child.stdin.end();
@@ -706,8 +838,11 @@ async function holdLock(file: string, wait: boolean): Promise<(() => Promise<voi
   };
 }
 
-async function lockLanding(file: string, out: (line: string) => void, where: () => string): Promise<() => Promise<void>> {
-  const take = (wait: boolean) => holdLock(file, wait);
+// Undefined when `gone` says, while it waits, that there's nothing to wait
+// for any more.
+async function lockLanding(file: string, out: (line: string) => void, where: () => string, gone: () => boolean = () => false): Promise<(() => Promise<void>) | undefined> {
+  const stop = new AbortController();
+  const take = (wait: boolean) => holdLock(file, wait, wait ? stop.signal : undefined);
   const release = await take(false);
   if (release) return release;
   const say = (first: boolean) => {
@@ -721,15 +856,38 @@ async function lockLanding(file: string, out: (line: string) => void, where: () 
   };
   say(true);
   const timer = setInterval(() => say(false), landLimits.progressMs);
+  const watch = setInterval(() => {
+    let is = false;
+    try {
+      is = gone();
+    } catch {
+      // Asked again next time.
+    }
+    if (is) stop.abort();
+  }, landLimits.goneMs);
   try {
-    return (await take(true))!;
+    return await take(true);
   } finally {
     clearInterval(timer);
+    clearInterval(watch);
   }
 }
 
-// How often a waiting landing says where it is. Tests shorten it.
-export const landLimits = { progressMs: 3 * 60_000 };
+// A wait this long is near an agent's tool time limit (two hours for Claude
+// Code's longest), which stops it and takes it out of the line, so it says so
+// while there's still time to plan for it (18 Nov).
+function longWait(asked: number, now = Date.now()): string {
+  if (now - asked < landLimits.longWaitMs) return '';
+  return ` It has waited ${Math.round((now - asked) / 60_000)} min: if what ran tb land stops it before it gets the lock (an agent's tool time limit), it leaves the line and says so, and needs running again. Once its check starts, that carries on whatever happens to it.`;
+}
+
+// How often a waiting landing says where it is, and looks for having been
+// left out of its group; and the longest a failed group's landings are each
+// run alone for (findBroken; otherwise about one check's time). Tests
+// shorten them.
+export const landLimits: { progressMs: number; goneMs: number; aloneMs?: number; aloneMinMs: number; aloneGraceMs: number; longWaitMs: number } = {
+  progressMs: 3 * 60_000, goneMs: 5_000, aloneMinMs: 60_000, aloneGraceMs: 30_000, longWaitMs: 90 * 60_000,
+};
 
 // A passing check prints nothing of its own, so on 9 Nov finding out where
 // landings spent their time meant scraping transcripts and running timed
@@ -812,6 +970,7 @@ async function prepare(
   out: (line: string) => void,
   err: (line: string) => void,
   hold?: LandOptions['hold'],
+  allowFormat?: string,
 ): Promise<number | { hasMerge: boolean; base: string; commit: string; commits: string }> {
   const fail = (...lines: string[]): number => {
     err(lines.join('\n'));
@@ -848,7 +1007,30 @@ async function prepare(
   if (merges === undefined) return fail(`Couldn't read ${t.branch}'s history in ${t.path}, so nothing landed. Run tb land again.`);
   const hasMerge = Boolean(merges);
   const behind = !(await git(t.path, ['merge-base', '--is-ancestor', base, t.branch])).ok;
-  if (hasMerge && behind) {
+  // A format commit on main the branch doesn't have yet (one listed in
+  // .git-blame-ignore-revs, like the whole of desktop/ through cargo fmt)
+  // conflicts with every change to the files it formatted. It's crossed with
+  // each commit formatted as it was made (format-replay.ts), so only real
+  // conflicts are left.
+  const cross = behind ? await crossings(t.path, t.branch, base).catch((): FormatCommit[] => []) : [];
+  const crossHint = cross.length
+    ? ` It crosses ${cross.map((f) => `${f.commit.slice(0, 10)} (${f.entry.subject})`).join(', ')}, which only reformatted files: scripts/replay-over-format.sh${hasMerge ? ` --merge ${MAIN}` : ''} in ${t.path} does that part for you and stops only at real conflicts.`
+    : '';
+  const crossMerge = hasMerge && cross.length > 0 && (await touchesFormatted(t.path, `${(await gitOut(t.path, ['merge-base', base, t.branch])) ?? base}..${t.branch}`, cross).catch(() => true));
+  if (hasMerge && behind && crossMerge) {
+    const merged = await mergeAcross(t.path, base, { message: `Merge branch '${MAIN}' into ${t.branch}` });
+    for (const n of merged.notes) out(n);
+    if (!merged.ok) {
+      if ('conflict' in merged) {
+        return fail(
+          `Bringing ${MAIN} into ${t.branch} (it has a merge on it, so it isn't rebased) ran into conflicts ${merged.step}, in:`,
+          ...merged.conflict.map((f) => `  ${f}`),
+          `That was undone, so ${t.branch} is as it was and ${MAIN} wasn't touched.${crossHint} Sort out those files, commit, then run tb land again.`,
+        );
+      }
+      return fail(`Couldn't bring ${MAIN} into ${t.branch}, so nothing landed: ${merged.error}`);
+    }
+  } else if (hasMerge && behind) {
     const merged = await git(t.path, ['merge', '--no-edit', MAIN]);
     if (!merged.ok) {
       const conflicted = (await gitOut(t.path, ['diff', '--name-only', '--diff-filter=U'])) ?? '';
@@ -863,18 +1045,35 @@ async function prepare(
       return fail(`git merge ${MAIN} failed in ${t.path}, so nothing landed: ${firstLine(merged.stderr || merged.stdout)}`);
     }
   } else if (!hasMerge) {
-    const rebase = await git(t.path, ['rebase', base]);
+    if (cross.length) {
+      const carried = await carryFormatted(t, base, cross, out);
+      if (carried) return fail(...carried);
+    }
+    // A tool's commit of its own (format-tool: the split of docs/protocol.md)
+    // is always made again on main, even where a rebase would go through:
+    // a section main added since has to go where the tool puts it.
+    const tool = await remadeOwn(t, base, out, true);
+    if (Array.isArray(tool)) return fail(...tool);
+    const rebase = tool === 'done' ? { ok: true, stdout: '', stderr: '' } : await git(t.path, ['rebase', base]);
     if (!rebase.ok) {
       const conflicted = (await gitOut(t.path, ['diff', '--name-only', '--diff-filter=U'])) ?? '';
       await git(t.path, ['rebase', '--abort']);
-      if (conflicted) {
-        return fail(
-          `Rebasing ${t.branch} on ${MAIN} ran into conflicts in:`,
-          ...conflicted.split('\n').map((f) => `  ${f}`),
-          `The rebase was undone, so ${t.branch} is as it was and ${MAIN} wasn't touched. Run git rebase ${MAIN} in ${t.path}, sort out those files, finish the rebase, then run tb land again.`,
-        );
+      // A branch bringing in a format commit of its own (the split of
+      // docs/protocol.md, say) conflicts with whatever main changed since in
+      // the files it rewrote: that commit is made again on main instead, by
+      // its own tool (format-replay.ts, remakeOwn).
+      const remade = conflicted ? await remadeOwn(t, base, out) : undefined;
+      if (Array.isArray(remade)) return fail(...remade);
+      if (remade !== 'done') {
+        if (conflicted) {
+          return fail(
+            `Rebasing ${t.branch} on ${MAIN} ran into conflicts in:`,
+            ...conflicted.split('\n').map((f) => `  ${f}`),
+            `The rebase was undone, so ${t.branch} is as it was and ${MAIN} wasn't touched.${crossHint || ` Run git rebase ${MAIN} in ${t.path}, sort out those files and finish the rebase.`} Then run tb land again.`,
+          );
+        }
+        return fail(`git rebase ${MAIN} failed in ${t.path}, so nothing landed: ${firstLine(rebase.stderr || rebase.stdout)}`);
       }
-      return fail(`git rebase ${MAIN} failed in ${t.path}, so nothing landed: ${firstLine(rebase.stderr || rebase.stdout)}`);
     }
   }
 
@@ -901,6 +1100,23 @@ async function prepare(
       'Put the Important: line in the same last paragraph as Co-Authored-By (no blank line between them), or at the end of the message if there is none. Use git commit --amend or git rebase to reword, then run tb land again.',
     );
   }
+  // 2b'. A format command this landing would add to main's
+  // .git-blame-ignore-revs: tb land runs main's on this Mac in later
+  // landings, so it lands only once it's been shown and asked for by its id
+  // (Gemini's review of finding 151, 21 Nov).
+  // A config file one of them runs with (a tool's own script, the
+  // toolchain file) counts the same.
+  const added = await formatChanges(t.path, base, t.branch).catch(() => undefined);
+  if (!added) return fail(`Couldn't read ${t.branch}'s .git-blame-ignore-revs or its format config in ${t.path}, so nothing landed. Run tb land again.`);
+  if ((added.entries.length || added.configs.length) && allowFormat !== added.id) {
+    const q = (s: string) => JSON.stringify(s);
+    return fail(
+      `${t.branch} changes what later tb lands run on this Mac to format code (.git-blame-ignore-revs), so nothing landed:`,
+      ...added.entries.map((e) => `  ${e.adds ? 'format-tool' : 'format-command'} ${q(e.command)} over ${e.paths.map(q).join(' ')}${e.config.length ? `, config ${e.config.map(q).join(' ')}` : ''} (${q(e.subject)})`),
+      ...added.configs.map((p) => `  config file ${q(p)} changed`),
+      `If that's meant, land it with tb land --allow-format ${added.id}.`,
+    );
+  }
   // 2c. Held while something it would set off on GitHub is red on main.
   if (hold) {
     const held = await holdFor(t.path, base, t.branch, hold);
@@ -910,6 +1126,84 @@ async function prepare(
   const commit = await gitOut(t.path, ['rev-parse', 'HEAD']);
   if (!commit) return fail(`Couldn't read HEAD in ${t.path}.`);
   return { hasMerge, base, commit, commits };
+}
+
+// A branch with a format commit of its own whose rebase conflicted, with
+// that commit made again on main (format-replay.ts, remakeOwn): 'done' once
+// the branch is moved there, the lines to fail with on a real conflict in
+// its other commits, or undefined when it has no such commit (or it
+// couldn't be remade, which leaves the rebase's conflict to say).
+async function remadeOwn(t: LandTarget, main: string, out: (line: string) => void, toolsOnly = false): Promise<'done' | string[] | undefined> {
+  const before = await gitOut(t.path, ['rev-parse', t.branch]);
+  if (!before) return undefined;
+  try {
+    const r = await remakeOwn(t.path, main, before, { toolsOnly });
+    if (!r) return undefined;
+    if (!r.ok) {
+      if ('error' in r) {
+        out(r.error);
+        return undefined;
+      }
+      // A tool the branch's own list names and main's doesn't: never run
+      // here, so it's made again by hand (format-replay.ts, remakeOwn).
+      if ('untrusted' in r) {
+        return [
+          `${t.branch} brings in a format commit made by a command that ${MAIN}'s .git-blame-ignore-revs doesn't list, so it wasn't run here and nothing landed:`,
+          ...r.untrusted.map((u) => `  ${u.commit.slice(0, 10)} (${JSON.stringify(u.subject)}): ${JSON.stringify(u.command)}${u.why === 'config' ? `, with config files ${t.branch} changes` : ''}`),
+          `tb land only runs a format command main already lists, exactly, with config main has. In ${t.path}: git rebase ${MAIN}, keep ${MAIN}'s side of that commit's files, run the command yourself and commit it with the same subject, then run tb land again.`,
+        ];
+      }
+      return [
+        `${t.branch} brings in a format commit, made again on ${MAIN}, but ${r.at.slice(0, 10)} (${r.subject}) conflicts with ${MAIN} in:`,
+        ...r.conflict.map((f) => `  ${f}`),
+        `Nothing changed, so ${t.branch} is as it was. Sort out those files (git rebase ${MAIN}, and for the format commit run its tool again rather than merge it), then run tb land again.`,
+      ];
+    }
+    const moved = await git(t.path, ['reset', '--keep', r.tip]);
+    if (!moved.ok) return [`Couldn't move ${t.branch} to its remade commits in ${t.path}, so nothing landed: ${firstLine(moved.stderr || moved.stdout)}`];
+    for (const n of r.notes) out(n);
+    out(`Made ${r.remade.map((c) => c.slice(0, 10)).join(', ')} again on ${MAIN} with the tool its .git-blame-ignore-revs entry names, so it's that tool's output on ${MAIN} as it is now (${t.branch} was at ${before.slice(0, 10)}).`);
+    return 'done';
+  } catch (e) {
+    out(`Couldn't make its format commit again (${e instanceof Error ? e.message : String(e)}).`);
+    return undefined;
+  }
+}
+
+// The branch's commits carried across the format commits main has and it
+// doesn't, each formatted as they were made, onto main (format-replay.ts).
+// Only when it changes something they format; otherwise a plain rebase
+// can't trip on them. Undefined when that's done (or not needed, or the
+// formatter can't run here, which a plain rebase then tries), or the lines
+// to fail with on a real conflict. Nothing moves unless it all went on.
+async function carryFormatted(t: LandTarget, main: string, cross: FormatCommit[], out: (line: string) => void): Promise<string[] | undefined> {
+  const from = await gitOut(t.path, ['merge-base', main, t.branch]);
+  const tip = await gitOut(t.path, ['rev-parse', t.branch]);
+  if (!from || !tip) return undefined;
+  const names = cross.map((f) => `${f.commit.slice(0, 10)} (${f.entry.subject})`).join(', ');
+  try {
+    if (!(await touchesFormatted(t.path, `${from}..${tip}`, cross))) return undefined;
+    out(`Carrying ${t.branch} across ${names}, each commit formatted as that was made...`);
+    const r = await carryAcross(t.path, { base: from, tip, onto: main, formatter: new TreeFormatter(t.path, cross) });
+    for (const n of r.notes) out(n);
+    if (r.ok) {
+      const moved = await git(t.path, ['reset', '--keep', r.tip]);
+      if (!moved.ok) return [`Couldn't move ${t.branch} to its carried commits in ${t.path}, so nothing landed: ${firstLine(moved.stderr || moved.stdout)}`];
+      out(`Carried ${r.count} commit${r.count === 1 ? '' : 's'} across it (${t.branch} was at ${tip.slice(0, 10)}).`);
+      return undefined;
+    }
+    if ('conflict' in r) {
+      return [
+        `Carrying ${t.branch} across ${names}, with each commit formatted as that was made, ran into real conflicts at ${r.at.slice(0, 10)} (${r.subject}), in:`,
+        ...r.conflict.map((f) => `  ${f}`),
+        `Nothing changed, so ${t.branch} is as it was and ${MAIN} wasn't touched. Run scripts/replay-over-format.sh in ${t.path}: it does the same and stops at the conflict for you to sort out (then git rebase --continue). Then run tb land again.`,
+      ];
+    }
+    out(`Couldn't carry it across with formatting (${r.error}), so it's rebased as it is.`);
+  } catch (e) {
+    out(`Couldn't carry it across with formatting (${e instanceof Error ? e.message : String(e)}), so it's rebased as it is.`);
+  }
+  return undefined;
 }
 
 // Why what `from...to` changes can't land now (opts.hold), or undefined.
@@ -971,6 +1265,26 @@ async function replay(cwd: string, from: string, to: string, onto: string): Prom
   return pick(cwd, list, onto);
 }
 
+// replay(), except that a branch crossing a format commit on the way (one
+// it doesn't have, that changes files it changes) is carried across with
+// each commit formatted as that was made (format-replay.ts), as its own tb
+// land would.
+// `trusted` is main: `onto` may have waiting branches stacked on it that
+// haven't landed, whose lists are theirs.
+async function replayFormatted(cwd: string, from: string, to: string, onto: string, trusted: string): Promise<string | undefined> {
+  try {
+    const cross = await crossings(cwd, to, onto, trusted);
+    if (cross.length && (await touchesFormatted(cwd, `${from}..${to}`, cross))) {
+      if (!(await git(cwd, ['merge-base', '--is-ancestor', from, onto])).ok) return undefined;
+      const r = await carryAcross(cwd, { base: from, tip: to, onto, formatter: new TreeFormatter(cwd, cross) });
+      return r.ok ? r.tip : undefined;
+    }
+  } catch {
+    // Couldn't tell: as before there were format commits.
+  }
+  return replay(cwd, from, to, onto);
+}
+
 // Commits `list`, oldest first, made again on `onto` without touching any
 // worktree, as rebase would; undefined if one doesn't go on cleanly.
 async function pick(cwd: string, list: string[], onto: string): Promise<string | undefined> {
@@ -1010,6 +1324,9 @@ async function stackWaiting(
   checkFrom: string,
   withFixes = true,
   includeOthers = true,
+  // After a failed group's landings were each run alone (findBroken): only
+  // the ones that passed go into this landing's next check. Fixes still do.
+  allowed?: Set<string>,
 ): Promise<{ tip: string; group: { entry: QueueEntry; tip: string; commits: string }[] }> {
   let tip = main;
   let cap = limit;
@@ -1020,31 +1337,314 @@ async function stackWaiting(
   // it out. On 13 Nov a group behind a broken main was halved down three
   // checks, each failing on main's own error, while the one-line repair
   // waited behind it for a group of its own.
+  // Not once main has been shown to pass what a group with it failed
+  // (ordinaryAt): then it's counted and halved like any other.
   const all = waiting(common);
-  const ordered = withFixes ? [...all.filter((e) => e.fix), ...all.filter((e) => !e.fix)] : all.filter((e) => !e.fix);
+  const free = (e: QueueEntry): boolean => ridesFree(e, main);
+  const ordered = withFixes ? [...all.filter(free), ...all.filter((e) => !free(e))] : all.filter((e) => !free(e));
   for (const e of ordered) {
     if (e.pid === process.pid && e.path === t.path) continue; // this one
-    const c = e.fix ? Infinity : Math.min(cap, e.limit !== undefined && e.limitAt === main ? e.limit : Infinity);
-    if (!e.fix && counted + 2 > c) continue;
-    if (!e.fix && !includeOthers) continue;
+    if (e.alone) continue; // its own tb checks it by itself
+    const c = free(e) ? Infinity : Math.min(cap, e.limit !== undefined && e.limitAt === main ? e.limit : Infinity);
+    if (!free(e) && counted + 2 > c) continue;
+    if (!free(e) && !includeOthers) continue;
+    if (!free(e) && allowed && !allowed.has(e.id)) continue;
     if (e.path === t.path || e.branch === t.branch) continue;
     if ((e.check ?? null) !== check || (e.checkFrom ?? '') !== checkFrom) continue;
     if (!(await ownerWaiting(common, e))) continue;
     if ((await gitOut(e.path, ['rev-parse', 'HEAD'])) !== e.commit) continue;
     if (!(await git(t.path, ['merge-base', '--is-ancestor', e.base, main])).ok) continue;
     if ((await gitOut(t.path, ['rev-list', '--merges', `${e.base}..${e.commit}`])) !== '') continue;
-    const next = await replay(t.path, e.base, e.commit, tip);
+    const next = await replayFormatted(t.path, e.base, e.commit, tip, main);
     if (!next || next === tip) continue;
+    // One that would change what format commands main runs lands alone,
+    // through its own tb land and its --allow-format, never as a rider.
+    const fmt = await formatChanges(t.path, tip, next).catch(() => undefined);
+    if (!fmt || fmt.entries.length || fmt.configs.length) continue;
     const commits = await gitOut(t.path, ['log', '--oneline', '--first-parent', `${tip}..${next}`]);
     if (commits === undefined) continue;
     group.push({ entry: e, tip: next, commits });
     tip = next;
-    if (!e.fix) {
+    if (!free(e)) {
       counted++;
       cap = c;
     }
   }
   return { tip, group };
+}
+
+// The `./check.sh --only` a failed check ends with: what to run again to see
+// the same failure, as THREADBEAR_CHECK_ONLY takes it. Undefined for a check
+// that says no such thing (another repo's, or one that died before its end).
+// The output of the last run in a check's: check-remote.sh runs it again on
+// another host when one drops out or runs out of disk, and what the earlier
+// one said (what failed, what ran) isn't this one's.
+function lastRun(text: string): string {
+  const starts = [...text.matchAll(/^(?:Checking on \S+ \(|So the checks run on this Mac instead\b)/gm)];
+  const at = starts.at(-1)?.index;
+  return at === undefined ? text : text.slice(at);
+}
+
+export function onlyFailed(text: string): string | undefined {
+  text = lastRun(text);
+  const said = [...text.matchAll(/^To run only what failed again: (?:\.\/check\.sh )?--only "([A-Za-z0-9 ._/=;()-]{1,4000})"$/gm)].at(-1)?.[1];
+  return said && !said.startsWith('-') ? said : undefined;
+}
+
+// The steps a run with --only says it ran (check.sh's last line for one), or
+// undefined when it says no such thing.
+export function onlyRan(text: string): Set<string> | undefined {
+  text = lastRun(text);
+  const said = [...text.matchAll(/^--only ran: "([A-Za-z0-9 ._/;()-]{0,4000})"$/gm)].at(-1)?.[1];
+  return said === undefined ? undefined : new Set(said.split(';').filter(Boolean));
+}
+
+// A checkout for findBroken's runs, beside the landing lock: a clone that
+// borrows the repo's objects, so it's small and has the commits tb land
+// makes. Not a worktree, so nothing that lists worktrees meets it, and not a
+// thread's own worktree, where its agent would see another landing's files
+// come and go. Kept between landings: a check host keeps a mirror of each
+// checkout that sends to it, and a new one each time would copy the lot.
+async function aloneCheckout(common: string): Promise<string | undefined> {
+  const dir = path.join(common, 'threadbear-land-alone');
+  const top = await gitOut(dir, ['rev-parse', '--show-toplevel']);
+  if (top && realpath(top) === realpath(dir)) return dir;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    return undefined;
+  }
+  return (await git(common, ['clone', '-q', '--shared', '--no-checkout', common, dir])).ok ? dir : undefined;
+}
+
+type Alone = 'passed' | 'failed' | 'unknown';
+
+// A group's check failed. Before it's narrowed down by halves, each with a
+// whole check of its own: what failed (the steps, and for the runner's unit
+// tests the files, that the check's last line names) is run on each landing
+// by itself, on main without the others. That's seconds each for a few test
+// files, not the 5 to 9 minutes of a check. In the four days to 17 Nov about
+// a third of branches reached the line already broken, as a thread only runs
+// a file or two itself, and each took its whole group's check down with it:
+// 54 failed group checks, 9 hours of the check hosts, landings waiting 35
+// minutes at the median on the 16th, one broken branch at the front of a
+// group of eight costing four checks before anything landed.
+//
+// Main goes first: nobody is blamed for what main fails by itself, nor for a
+// step main didn't run (exit 0 from a check that skipped what was asked
+// isn't a pass; Codex's review, 17 Nov). Only then is a landing that fails
+// it alone the answer for its own tb, with that run's output; one that
+// passes goes into the next check. `unknown` is a run that said nothing
+// either way (no host could take it, it was stopped, the time ran out
+// before its turn): never a reason to refuse. Undefined when it can't tell
+// anything; the halving is still there.
+async function findBroken(a: {
+  t: LandTarget;
+  common: string;
+  main: string;
+  own: string;
+  group: { entry: QueueEntry }[];
+  check: string;
+  only: string;
+  // The check host the group's check failed on, when it said one. Every run
+  // here goes to that host and no other: a test that fails only on the Linux
+  // box (13 Nov had one) would otherwise pass for a landing run on the Mac
+  // and fail for the next one run on Linux, which would be refused for it.
+  host?: string;
+  env: NodeJS.ProcessEnv;
+  shell?: string[];
+  timesFile: string;
+}): Promise<{ own: Alone; ownText: string; failed: Map<string, string>; passed: Set<string>; left: number; only: string; mainFailed: string[]; brokeOnMain: boolean } | 'main fails it' | undefined> {
+  const dir = await aloneCheckout(a.common);
+  if (!dir) return undefined;
+  const started = Date.now();
+  const usual = Math.max(5 * 60_000, (typicalCheckSeconds(a.timesFile) ?? 600) * 1000);
+  // The time left, which each run is held to as well: one waiting in a busy
+  // host's line would otherwise keep the landing lock for as long as that
+  // took. At least a minute, so the last one in gets a real try.
+  const leftMs = (): number => (landLimits.aloneMs ?? usual) - (Date.now() - started);
+  const run = async (branch: string, commit: string, only: string, extra: NodeJS.ProcessEnv = {}): Promise<{ state: Alone; text: string }> => {
+    // main is where check.sh looks for what a checkout changes, and nothing
+    // of an earlier run stays (a clone of our own: nobody keeps work here).
+    if (!(await git(dir, ['checkout', '-q', '-f', '--detach', commit])).ok ||
+        !(await git(dir, ['update-ref', `refs/heads/${MAIN}`, a.main])).ok ||
+        !(await git(dir, ['clean', '-q', '-fdx'])).ok) return { state: 'unknown', text: '' };
+    const forMs = Math.max(landLimits.aloneMinMs, leftMs());
+    // check-remote.sh stops at THREADBEAR_CHECK_MAX_SECS by itself, its wait
+    // in the host's line included, and tidies up there; the limit on
+    // runCheck is for when that didn't happen, and for other checks.
+    const r = await runCheck(a.check, dir, a.shell, {
+      ...(a.host ? { THREADBEAR_CHECK_HOST: a.host } : a.env),
+      THREADBEAR_CHECK_ONLY: only,
+      THREADBEAR_CHECK_HOST_ONLY: '1',
+      THREADBEAR_CHECK_MAX_SECS: String(Math.ceil(forMs / 1000)),
+      ...extra,
+    }, forMs + landLimits.aloneGraceMs);
+    const times = parseCheckTimes(r.text);
+    // `passed`, not `ok`, and neither `check` nor `intact`: nothing that
+    // reads this log for whole checks (typicalCheckSeconds, the updater's
+    // passedLandCheck) can take a few test files for one.
+    logCheckTimes(a.timesFile, {
+      at: new Date().toISOString(),
+      branch,
+      commit,
+      alone: true,
+      only,
+      passed: r.ok,
+      ...(r.ok ? {} : { exit: r.code }),
+      seconds: Math.round(r.durationMs / 1000),
+      ...times,
+    });
+    // One that was stopped says nothing. Nor does one whose host isn't the
+    // group's: another one, or a host named by one and not the other (the
+    // group's own line can be lost off the front of a long output; with no
+    // host known the runs aren't sent to one, and then none may name one).
+    // Nor one no host could run (out of disk, every host unreachable).
+    if (r.stopped || times.host !== a.host || r.code === CHECK_HOSTS_UNAVAILABLE) return { state: 'unknown', text: r.text };
+    // Failed means the check ran to its end and named a step that failed.
+    return { state: r.ok ? 'passed' : onlyFailed(r.text) ? 'failed' : 'unknown', text: r.text };
+  };
+
+  // Main runs every step asked for, changed or not (THREADBEAR_CHECK_ALL is
+  // check.sh's --all): the Swift steps never run on main with nothing
+  // changed, and a skip is no pass, so on 17 Nov a broken mock test was
+  // never looked for alone and four hours of group checks halved instead.
+  // Only the steps main passes are run on the landings: one main fails by
+  // itself says nothing about them, but needn't hide another that it passes
+  // (that day the group failed the desktop core tests and the mock tests).
+  const base = await run(MAIN, a.main, a.only, { THREADBEAR_CHECK_ALL: '1' });
+  const ran = onlyRan(base.text);
+  if (base.state === 'unknown' || !ran) return undefined;
+  // A main that failed says which steps it passed in check.sh's own lines.
+  const okOnMain = new Set(parseCheckTimes(base.text).steps.filter((s) => s.status === 'ok').map((s) => s.name));
+  const passedOnMain = (name: string): boolean => ran.has(name) && (base.state === 'passed' || okOnMain.has(name));
+  // Failed, not just skipped: what says main itself is broken, so a fix in
+  // the line may be its repair (landLocked lets the fixes ride free again).
+  const failOnMain = new Set(parseCheckTimes(base.text).steps.filter((s) => s.status === 'FAIL').map((s) => s.name));
+  const brokeOnMain = base.state === 'failed' && a.only.split(';').some((e) => ran.has(e.split('=')[0]) && failOnMain.has(e.split('=')[0]));
+  const kept = a.only.split(';').filter((e) => passedOnMain(e.split('=')[0]));
+  if (!kept.length) return brokeOnMain ? 'main fails it' : undefined;
+  const only = kept.join(';');
+  const mainFailed = a.only.split(';').map((e) => e.split('=')[0]).filter((name) => !kept.some((k) => k.split('=')[0] === name));
+
+  const failed = new Map<string, string>();
+  const passed = new Set<string>();
+  let left = 0;
+  const mine = leftMs() > 0 ? await run(a.t.branch, a.own, only) : { state: 'unknown' as const, text: '' };
+  for (const g of a.group) {
+    if (leftMs() <= 0) {
+      left++;
+      continue;
+    }
+    const alone = await replayFormatted(a.t.path, g.entry.base, g.entry.commit, a.main, a.main);
+    const r = alone && alone !== a.main ? await run(g.entry.branch, alone, only) : { state: 'unknown' as const, text: '' };
+    if (r.state === 'failed') failed.set(g.entry.id, r.text);
+    else if (r.state === 'passed') passed.add(g.entry.id);
+    else left++;
+  }
+  return { own: mine.state, ownText: mine.text, failed, passed, left, only, mainFailed, brokeOnMain };
+}
+
+// The landings of a group counted against the limit, as their entries are
+// now: not the fixes that ride outside it (ridesFree).
+const countedIn = (common: string, main: string, group: { entry: QueueEntry }[]): number =>
+  group.filter((g) => !ridesFree(readEntry(common, g.entry.id) ?? g.entry, main)).length;
+
+// The limit a failed group check leaves on its landings: half of it,
+// rounded up, the holder counted.
+const halvedLimit = (common: string, main: string, group: { entry: QueueEntry }[]): number =>
+  Math.max(1, Math.ceil((countedIn(common, main, group) + 1) / 2));
+
+// A group's check failed: each of its landings may be checked with at most
+// half as many from now on, on this main (it lapses once main moves). Done
+// at once, so it holds whatever happens to the holder's tb next: on 18 Nov
+// two holders' tbs were killed just after their groups failed, the halving
+// went with them, and the next holder stacked the same mix again.
+// `fixesToo` counts the fixes in and halves them with the rest
+// (ordinaryAt), so it holds for them too. Returns what puts each entry
+// back as it was, for a failure findBroken then explains by name, where
+// halving would only slow the rest down, or one main fails by itself.
+export function halveGroup(common: string, main: string, group: { entry: QueueEntry }[], fixesToo: boolean): () => void {
+  const before = new Map<string, Pick<QueueEntry, 'limit' | 'limitAt' | 'ordinaryAt'>>();
+  const live = group.map((g) => readEntry(common, g.entry.id)).filter((e): e is QueueEntry => !!e && !e.result);
+  for (const e of live) before.set(e.id, { limit: e.limit, limitAt: e.limitAt, ordinaryAt: e.ordinaryAt });
+  const counted = group.filter((g) => {
+    const e = readEntry(common, g.entry.id) ?? g.entry;
+    return fixesToo || !ridesFree(e, main);
+  }).length;
+  const limit = Math.max(1, Math.ceil((counted + 1) / 2));
+  for (const e of live) {
+    writeEntry(common, {
+      ...e,
+      limit: Math.min(e.limitAt === main ? e.limit ?? Infinity : Infinity, limit),
+      limitAt: main,
+      ...(fixesToo && ridesFree(e, main) ? { ordinaryAt: main } : {}),
+    });
+  }
+  return () => {
+    for (const [id, was] of before) {
+      const now = readEntry(common, id);
+      if (!now || now.result) continue;
+      const { limit: _l, limitAt: _a, ordinaryAt: _o, ...rest } = now;
+      writeEntry(common, {
+        ...rest,
+        ...(was.limit !== undefined ? { limit: was.limit } : {}),
+        ...(was.limitAt !== undefined ? { limitAt: was.limitAt } : {}),
+        ...(was.ordinaryAt !== undefined ? { ordinaryAt: was.ordinaryAt } : {}),
+      });
+    }
+  };
+}
+
+// What an --only names, each step's files one by one ("runner unit
+// tests=a.ts b.ts" is two), or the step by itself where it names none.
+export const lookedFor = (only: string): string[] =>
+  only.split(';').flatMap((e) => {
+    const [name, files] = [e.split('=')[0], e.split('=').slice(1).join('=')];
+    return files.trim() ? files.trim().split(/\s+/).map((f) => `${name}=${f}`) : [name];
+  });
+
+// Main is seen to fail by itself some of what a group failed: every fix
+// waiting rides free again on it, so a repair goes into the next check.
+export function freeFixes(common: string, main: string): void {
+  for (const e of waiting(common)) {
+    if (e.ordinaryAt !== main || e.result) continue;
+    const { ordinaryAt: _o, ...rest } = e;
+    writeEntry(common, rest);
+  }
+}
+
+// A landing passed after a group check of it failed (landLocked): those of
+// that group left out of the passing one are where the failure was. One by
+// itself is set aside to be checked alone, never in anyone's group again;
+// so is any fix among them (a fix rides in every group outside the limit,
+// so the one way it's ever left out is that a group of only fixes and the
+// holder failed). It may only fail with the holder, so it isn't refused.
+// The others keep the limit the halving gave them, moved onto the main
+// that's just landed: the failure was in them, not in the old main, and
+// starting again from whole groups lost that. On 17 Nov a broken landing
+// at the front of the line went into each holder's group in turn, the
+// halving narrowed every one down to the holder alone, and each landed
+// only itself: over four hours, nothing else from that line.
+export function setAside(common: string, oldMain: string, newMain: string, holder: string, failed: QueueEntry[], landed: Set<string>, out: (l: string) => void): void {
+  const rest = failed.map((e) => readEntry(common, e.id)).filter((e): e is QueueEntry => !!e && !e.result && !e.refused && !landed.has(e.id));
+  const one = rest.length === 1;
+  const aside: string[] = [];
+  for (const e of rest) {
+    if (one || ridesFree(e, oldMain)) {
+      writeEntry(common, {
+        ...e,
+        alone: {
+          at: Date.now(),
+          why: `Checking ${e.branch} by itself: a group check with it and ${holder} failed, and ${holder}'s next check without it passed.`,
+        },
+      });
+      aside.push(e.branch);
+    } else if (e.limit !== undefined && e.limitAt === oldMain) {
+      writeEntry(common, { ...e, limitAt: newMain, ...(e.ordinaryAt === oldMain ? { ordinaryAt: newMain } : {}) });
+    }
+  }
+  if (aside.length) out(`Set aside to be checked by ${aside.length > 1 ? 'themselves' : 'itself'}, as the group failed with ${aside.length > 1 ? 'them' : 'it'} and passed without: ${aside.join(', ')}.`);
 }
 
 async function landLocked(
@@ -1063,7 +1663,7 @@ async function landLocked(
   };
 
   // Steps 1 and 2 again: main has likely moved while this waited.
-  const ready = await prepare(t, out, err, opts.despiteRed ? undefined : opts.hold);
+  const ready = await prepare(t, out, err, opts.despiteRed ? undefined : opts.hold, opts.allowFormat);
   if (typeof ready === 'number') return ready;
   const own = ready.commit;
   const main = ready.base;
@@ -1072,6 +1672,27 @@ async function landLocked(
   // nothing about a new one, and kept every later landing checked alone.
   let limit = startLimit && startLimit.at === main ? startLimit.limit : Infinity;
   let withFixes = true;
+  // Set aside by an earlier holder (setAside): checked by itself, so a
+  // landing that broke the others' groups can't break one more.
+  const alone = times.entryId ? readEntry(common, times.entryId)?.alone : undefined;
+  if (alone) out(alone.why);
+  // Once a failed group's landings have each been run alone (findBroken):
+  // the ones that passed, which are all that go into this landing's checks
+  // from then on. It's done once for each step that failed; a group that
+  // fails after it on the same steps is halved. The steps looked for that way. A later failure of a step not among
+  // them is looked into too: halving can leave a repair out and show main's
+  // own failure in another step (Codex's review, 18 Nov), and only a run on
+  // main says that's what it is.
+  const looked = new Set<string>();
+  // Once findBroken has seen main fail some of what failed by itself: then
+  // a fix may be its repair, so this holder's later halvings leave the
+  // fixes riding free, as before 18 Nov.
+  let mainFailsToo = false;
+  let allowed: Set<string> | undefined;
+  // The others in this landing's last failed group check. When a later
+  // check without some of them passes, those it left out are where the
+  // failure was (setAside).
+  let lastFailed: QueueEntry[] | undefined;
 
   for (;;) {
     // 3. The others waiting go on main first, then this branch on top. The
@@ -1086,16 +1707,21 @@ async function landLocked(
     } catch (e) {
       return fail(`Couldn't read the repo's patches for its check: ${(e as Error).message}`);
     }
-    if (!opts.dryRun && !ready.hasMerge) {
-      let stacked = await stackWaiting(t, common, main, limit, check ?? null, opts.checkFrom ?? '', withFixes);
-      let top = stacked.group.length ? await replay(t.path, main, own, stacked.tip) : undefined;
+    // One that changes what format commands main runs (its --allow-format
+    // covers only its own change) is checked and landed by itself, so no
+    // other landing's change rides in under that yes (Gemini's third review).
+    const ownFormat = await formatChanges(t.path, main, own).catch(() => undefined);
+    const formatAlone = !ownFormat || ownFormat.entries.length > 0 || ownFormat.configs.length > 0;
+    if (!opts.dryRun && !ready.hasMerge && !alone && !formatAlone) {
+      let stacked = await stackWaiting(t, common, main, limit, check ?? null, opts.checkFrom ?? '', withFixes, true, allowed);
+      let top = stacked.group.length ? await replayFormatted(t.path, main, own, stacked.tip, main) : undefined;
       // Held on GitHub for what the others change (not a fix's, which is
       // the repair): then only the fixes go with it, and the others go by
       // themselves later, each hearing why. Still held with only the fixes
       // (this one's own change, moved by one): it goes alone.
       if (opts.hold && top && (await groupHeld(t, main, stacked.group, top, opts))) {
-        stacked = await stackWaiting(t, common, main, limit, check ?? null, opts.checkFrom ?? '', withFixes, false);
-        top = stacked.group.length ? await replay(t.path, main, own, stacked.tip) : undefined;
+        stacked = await stackWaiting(t, common, main, limit, check ?? null, opts.checkFrom ?? '', withFixes, false, allowed);
+        top = stacked.group.length ? await replayFormatted(t.path, main, own, stacked.tip, main) : undefined;
         if (top && (await groupHeld(t, main, stacked.group, top, opts))) top = undefined;
       }
       if (stacked.group.length) {
@@ -1157,7 +1783,8 @@ async function landLocked(
       // THREADBEAR_CHECK_GROUP says it's a group's check even when nobody
       // asked for a host, so check.sh never takes the holder's own (an empty
       // one would run everyone's check on this Mac; Codex's second review).
-      const r = await runCheck(check, t.path, opts.shell, group.length ? { THREADBEAR_CHECK_GROUP: '1', ...(prefer ? { THREADBEAR_CHECK_PREFER: prefer } : {}) } : {});
+      const groupEnv: NodeJS.ProcessEnv = group.length ? { THREADBEAR_CHECK_GROUP: '1', ...(prefer ? { THREADBEAR_CHECK_PREFER: prefer } : {}) } : {};
+      const r = await runCheck(check, t.path, opts.shell, groupEnv);
       setRunning(common, undefined);
       // Whether the check ran on the commit it's logged for: asked before the
       // line is written, as the runner's updater takes a passing line as
@@ -1182,7 +1809,33 @@ async function landLocked(
         check,
         ...(intact ? { intact: true } : {}),
       });
+      // No check host could run it: one ran out of disk partway (and again
+      // when tried elsewhere), or none had room or answered. That's the
+      // hosts' trouble, not any landing's, so nothing is halved or looked
+      // for: on 20 Nov a group failed when the cloud box ran out of disk,
+      // and each landing in it was checked alone for a fault none had.
+      if (!r.ok && r.code === CHECK_HOSTS_UNAVAILABLE) {
+        if (!(await back())) return fail(`No check host could run the check, so nothing landed. ${stuck}`);
+        if (carried) return fail(committedMeanwhile);
+        return fail(
+          `No check host could run the check${group.length ? ` of ${group.length + 1} landings together` : ''}, so ${MAIN} wasn't touched. That's the hosts' trouble, not ${group.length ? 'any landing in it' : 'this landing'}. The last lines of its output:`,
+          '',
+          ...r.text.trimEnd().split('\n').slice(-CHECK_TAIL_LINES),
+          '',
+          'Run tb land again: the lines above say which host and why.',
+        );
+      }
       if (!r.ok && group.length) {
+        lastFailed = group.map((g) => g.entry);
+        // The halving goes on the others' entries before anything slow
+        // (findBroken, the output, putting the branch back): a holder whose
+        // tb dies after this (an agent's two-hour command limit, 18 Nov)
+        // otherwise took the only record of the failure with it, and the
+        // next holder stacked the same mix again. Twice that day a group of
+        // eight or nine failed feature pairing and nothing was narrowed.
+        // Put back below when findBroken explains the failure by name.
+        // Fixes too (fixesToo): see below for when they ride free again.
+        let unhalve = halveGroup(common, main, group, !mainFailsToo);
         // Show the group's failure now: finding the individual landing can
         // take several more checks, and its logs are already available.
         out([
@@ -1196,15 +1849,87 @@ async function landLocked(
         // No individual landing is refused until its own check fails.
         if (!(await back())) return fail(`The check failed with ${group.length + 1} landings together, so nothing landed. ${stuck}`);
         if (carried) return fail(committedMeanwhile);
-        // Fixes always come along, so once it's down to this one and the
-        // fixes, the fixes are left out next, to see whose it is.
-        const counted = group.filter((g) => !g.entry.fix).length;
-        if (counted === 0) withFixes = false;
-        limit = Math.max(1, Math.ceil((counted + 1) / 2));
-        for (const g of group) {
-          const now = readEntry(common, g.entry.id);
-          if (now && !now.result) writeEntry(common, { ...now, limit: Math.min(now.limitAt === main ? now.limit ?? Infinity : Infinity, limit), limitAt: main });
+        // Which of them broke it: first by running only what failed on each
+        // alone (findBroken), when the check says what that was. Not for a
+        // check read from a subfolder (it runs from the root here). With a
+        // fix in the group too: what main fails by itself is never blamed
+        // on anyone (findBroken runs main first), and a broken "fix" is
+        // found like any other. On 17 Nov half the line had landed with
+        // --despite-red, so no failed group was ever looked into alone, and
+        // a broken fix at the front of it failed every group for hours.
+        const said = opts.checkFrom ? undefined : onlyFailed(r.text);
+        // By file where it names them (the runner's unit tests): main may
+        // fail one file of a step and a pair of landings another.
+        const parts = said ? lookedFor(said) : [];
+        const only = parts.some((k) => !looked.has(k)) ? said : undefined;
+        if (only) {
+          for (const k of parts) looked.add(k);
+          out('Running only what failed on each of them by itself, to find which broke it.');
+          setRunning(common, {
+            startedAt: Date.now(), branches: [t.branch, ...together], pid: process.pid,
+            entries: [...(times.entryId ? [times.entryId] : []), ...group.map((g) => g.entry.id)],
+          });
+          const failedOn = parseCheckTimes(r.text).host;
+          const result = await findBroken({
+            t, common, main, own, group, check, only, env: groupEnv, shell: opts.shell, timesFile: times.file,
+            ...(failedOn && HOST_NAME.test(failedOn) ? { host: failedOn } : {}),
+          });
+          const found = typeof result === 'object' ? result : undefined;
+          // Main fails some of what failed by itself: a fix may be its
+          // repair, so fixes ride in every group again, outside the limit,
+          // as on 13 Nov. Otherwise what failed is in the landings, fixes
+          // as much as any, and they stay halved with the rest.
+          if (result === 'main fails it' || found?.brokeOnMain) {
+            mainFailsToo = true;
+            unhalve();
+            // Every fix in the line, not only this group's: an earlier
+            // holder that died may have halved one this group left out.
+            freeFixes(common, main);
+            unhalve = halveGroup(common, main, group, false);
+          }
+          setRunning(common, undefined);
+          const tailOf = (text: string): string => text.trimEnd().split('\n').slice(-CHECK_TAIL_LINES).join('\n').slice(-8000);
+          const why = (branch: string, text: string): string => [
+            `The check failed with ${group.length + 1} landings together, and what failed in it fails on ${branch} by itself too (on ${MAIN} at ${main.slice(0, 9)}, without the others), so ${MAIN} wasn't touched. The last lines of that run:`,
+            '',
+            tailOf(text),
+            '',
+            'Fix it, commit, and run tb land again.',
+          ].join('\n');
+          if (found?.mainFailed.length) out(`${MAIN} fails ${found.mainFailed.join(', ')} by itself too, so only ${found.only.split(';').map((e) => e.split('=')[0]).join(', ')} is run on each.`);
+          if (found) {
+            const leftOut: string[] = [];
+            for (const g of group) {
+              const text = found.failed.get(g.entry.id);
+              if (text === undefined) continue;
+              const now = readEntry(common, g.entry.id);
+              if (!now || now.result || now.refused) continue;
+              writeEntry(common, { ...now, refused: { text: why(g.entry.branch, text), at: main } });
+              leftOut.push(g.entry.branch);
+            }
+            if (leftOut.length) out(`Left out, as what failed fails on ${leftOut.length > 1 ? 'each of them' : 'it'} alone: ${leftOut.join(', ')}.`);
+            if (found.own === 'failed') {
+              unhalve();
+              return fail(why(t.branch, found.ownText));
+            }
+            // Someone was left out, or the time ran out with some not yet
+            // run: the next check is this one with those known to pass.
+            if (found.failed.size || (found.left && found.passed.size)) {
+              unhalve();
+              // Found by name, so nobody is left to check alone for it.
+              if (found.failed.size) lastFailed = undefined;
+              allowed = found.passed;
+              out(allowed.size ? 'Checking again with the ones that passed it.' : 'Checking this one again without them.');
+              continue;
+            }
+            if (!found.left && found.own === 'passed') out('Each of them passes it alone, so it takes more than one of them (or it fails only now and then).');
+            if (!found.brokeOnMain && group.some((g) => g.entry.fix)) out(`${MAIN} passes what failed by itself, so the fixes (--despite-red) in the group are halved with the rest.`);
+          }
         }
+        // Fixes come along outside the limit, so once it's down to this one
+        // and those, they're left out next, to see whose it is.
+        if (countedIn(common, main, group) === 0) withFixes = false;
+        limit = halvedLimit(common, main, group);
         out('Checking them in smaller groups to find which.');
         continue;
       }
@@ -1340,8 +2065,175 @@ async function landLocked(
     out(`Landed on ${MAIN} in ${t.mainCheckout}:`);
     out(mine);
     if (group.length) out(`In the same check, and landed with it: ${together.join(', ')}.`);
+    if (lastFailed) setAside(common, main, checked, t.branch, lastFailed, new Set(group.map((g) => g.entry.id)), out);
+    // Still under the lock: a fold of GitHub's main moves main here too.
+    // Never a reason to fail the landing, which is done.
+    if (opts.push) {
+      try {
+        await pushMain({ mainCheckout: t.mainCheckout, common, check, shell: opts.shell, timesFile: times.file, out });
+      } catch (e) {
+        out(`Landed, but ${MAIN} wasn't pushed to GitHub: ${(e as Error).message}`);
+      }
+    }
     return 0;
   }
+}
+
+// After a landing, main goes to GitHub (`push`, from runner.json's
+// pushAfterLanding). On 17 Nov main here was 36 commits ahead of GitHub's
+// and GitHub's 9 hours stale: GitHub's main had three commits of its own,
+// so scripts/sync-main.sh needed the landing lock, and with landings queued
+// all afternoon it waited over an hour and never got it (lockf isn't a fair
+// queue). The landing's own holder has the lock already, so it does it:
+//
+// - GitHub's main is behind this one: push.
+// - GitHub's has moved too: merge it in (a merge, never a rebase, so main
+//   here only ever fast-forwards and no queued landing's base is rewritten),
+//   check that merge in the land-alone checkout, fast-forward main to it and
+//   push. A conflict or failed check leaves main as it landed, says why, and
+//   isn't tried again for the same GitHub main for a few hours, as each try
+//   is a whole check with everyone waiting behind it.
+const PUSH_MEMO = 'threadbear-land-push.json';
+export const pushLimits = { retryMs: 6 * 3600_000 };
+
+async function pushMain(a: {
+  mainCheckout: string;
+  common: string;
+  check: string | undefined;
+  shell?: string[];
+  timesFile: string;
+  out: (line: string) => void;
+}): Promise<void> {
+  const { mainCheckout: mc, out } = a;
+  // Nobody's there to answer a password or host key prompt.
+  const quiet: NodeJS.ProcessEnv = { GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes' };
+  const notPushed = (why: string): void => out(`${MAIN} wasn't pushed to GitHub: ${why}`);
+  const fetch = async (): Promise<string | undefined> => {
+    const f = await git(mc, ['fetch', '-q', 'origin', MAIN], quiet);
+    if (!f.ok) {
+      notPushed(`fetching GitHub's failed (${firstLine(f.stderr || f.stdout)}). The next landing tries again, or run scripts/sync-main.sh.`);
+      return undefined;
+    }
+    return gitOut(mc, ['rev-parse', `refs/remotes/origin/${MAIN}`]);
+  };
+  const push = async (commit: string): Promise<boolean> => (await git(mc, ['push', '-q', 'origin', `${commit}:refs/heads/${MAIN}`], quiet)).ok;
+  const count = async (range: string): Promise<string> => (await gitOut(mc, ['rev-list', '--count', range])) ?? '?';
+
+  const here = await gitOut(mc, ['rev-parse', `refs/heads/${MAIN}`]);
+  if (!here) return notPushed(`couldn't read ${MAIN} in ${mc}.`);
+  let there = await fetch();
+  if (!there) return;
+  if (there === here) return;
+  if ((await git(mc, ['merge-base', '--is-ancestor', there, here])).ok) {
+    const pushed = await git(mc, ['push', '-q', 'origin', `${here}:refs/heads/${MAIN}`], quiet);
+    if (pushed.ok) return out(`Pushed ${MAIN} to GitHub (${await count(`${there}..${here}`)} commits).`);
+    // Refused because GitHub's moved meanwhile: then it's a fold, below.
+    // Anything else (credentials, a rule on the branch) is said as it is,
+    // not taken for that: a fold would only make a needless merge and run a
+    // whole check with the lock held (Codex, 17 Nov).
+    there = await fetch();
+    if (!there) return;
+    if ((await git(mc, ['merge-base', '--is-ancestor', there, here])).ok) {
+      return notPushed(`GitHub refused the push: ${firstLine(pushed.stderr || pushed.stdout)}`);
+    }
+  }
+  if ((await git(mc, ['merge-base', '--is-ancestor', here, there])).ok) {
+    return notPushed(`GitHub's already has it.`);
+  }
+
+  // Both have moved.
+  const memoFile = path.join(a.common, PUSH_MEMO);
+  let memo: { github?: string; at?: number; why?: string } | undefined;
+  try {
+    memo = JSON.parse(fs.readFileSync(memoFile, 'utf8'));
+  } catch {
+    memo = undefined;
+  }
+  if (memo?.github === there && typeof memo.at === 'number' && Date.now() - memo.at < pushLimits.retryMs) {
+    return notPushed(`GitHub's ${MAIN} has commits this one doesn't, and bringing them in failed at ${new Date(memo.at).toLocaleTimeString()} (${memo.why ?? 'see an earlier landing'}). It's tried again when GitHub's moves or in a few hours; scripts/sync-main.sh tries now.`);
+  }
+  const gave = (why: string, more = ''): void => {
+    try {
+      fs.writeFileSync(memoFile, JSON.stringify({ github: there, at: Date.now(), why }));
+    } catch {
+      // Then the next landing tries again.
+    }
+    notPushed(`GitHub's ${MAIN} has commits this one doesn't, and ${why}, so ${MAIN} here is as it landed.${more}`);
+  };
+  const theirs = (await gitOut(mc, ['log', '--oneline', '--no-decorate', `${here}..${there}`])) ?? '';
+  out(`GitHub's ${MAIN} has ${theirs.split('\n').filter(Boolean).length} commits this one doesn't; merging them in and checking that before pushing.`);
+  const merged = await git(mc, ['merge-tree', '--write-tree', '--name-only', here, there]);
+  if (!merged.ok) {
+    const files = merged.stdout.split('\n\n')[0].split('\n').slice(1).filter(Boolean);
+    return gave(merged.code === 1 ? `they conflict with it in ${files.join(', ') || 'some files'}` : `git couldn't merge them (${firstLine(merged.stderr)})`,
+      ' Bring them together by hand (scripts/sync-main.sh says how).');
+  }
+  const tree = merged.stdout.split('\n')[0].trim();
+  const message = `Bring in GitHub's ${MAIN}\n\nCommits made on GitHub that this Mac's ${MAIN} didn't have:\n\n${theirs}`;
+  const fold = await gitOut(mc, ['commit-tree', tree, '-p', here, '-p', there, '-m', message]);
+  if (!fold) return gave(`git couldn't make the merge commit`);
+
+  if (a.check) {
+    const dir = await aloneCheckout(a.common);
+    // main is where check.sh looks for what changed: GitHub's commits.
+    if (!dir ||
+        !(await git(dir, ['checkout', '-q', '-f', '--detach', fold])).ok ||
+        !(await git(dir, ['update-ref', `refs/heads/${MAIN}`, here])).ok ||
+        !(await git(dir, ['clean', '-q', '-fdx'])).ok) {
+      return notPushed(`there was no checkout to check GitHub's commits in. The next landing tries again.`);
+    }
+    out(`Running the check on the merge: ${a.check}`);
+    setRunning(a.common, { startedAt: Date.now(), branches: [`GitHub's ${MAIN}`], pid: process.pid, entries: [] });
+    // To the check hosts as a group's goes, never this Mac for one person's
+    // THREADBEAR_CHECK_HOST.
+    // From the root, as a landing's own check runs (checkFrom is only where
+    // the patch was read from).
+    const r = await runCheck(a.check, dir, a.shell, { THREADBEAR_CHECK_GROUP: '1' });
+    // A check that changed files or moved HEAD didn't check `fold` itself,
+    // as for a landing (Codex, 17 Nov).
+    const intact = (await gitOut(dir, ['rev-parse', 'HEAD'])) === fold &&
+      (await gitOut(dir, ['status', '--porcelain', '--untracked-files=all'])) === '';
+    setRunning(a.common, undefined);
+    logCheckTimes(a.timesFile, {
+      at: new Date().toISOString(),
+      branch: `origin/${MAIN}`,
+      fold: true,
+      commit: fold,
+      ok: r.ok,
+      ...(r.ok ? {} : { exit: r.code }),
+      seconds: Math.round(r.durationMs / 1000),
+      ...parseCheckTimes(r.text),
+      check: a.check,
+      ...(r.ok && intact ? { intact: true } : {}),
+    });
+    if (r.ok && !intact) return gave(`the check changed files or HEAD in ${dir} as it ran, so it didn't check the merge itself`);
+    // The hosts' trouble, not the merge's: the next landing tries again,
+    // rather than the merge being put off for hours as a failed one is.
+    if (r.code === CHECK_HOSTS_UNAVAILABLE) return notPushed(`no check host could run the check on the merge. The next landing tries again.`);
+    if (!r.ok) {
+      const tail = r.text.trimEnd().split('\n').slice(-CHECK_TAIL_LINES).join('\n').slice(-8000);
+      return gave(`the check failed on the merge${r.code !== undefined ? ` (exit ${r.code})` : ''}`, ` The last lines of its output:\n\n${tail}`);
+    }
+    out(`The check passed on the merge (${Math.round(r.durationMs / 1000)} s).`);
+  }
+
+  // As a landing moves main: only from where it was, and only main itself.
+  const unready = await mainNotReady(mc);
+  if (unready) return notPushed(unready);
+  if ((await gitOut(mc, ['rev-parse', `refs/heads/${MAIN}`])) !== here) return notPushed(`${MAIN} moved while GitHub's was being checked. The next landing tries again.`);
+  const ff = await git(mc, ['merge', '-q', '--ff-only', fold]);
+  if (!ff.ok) {
+    const files = overwrittenFiles(ff.stderr + ff.stdout);
+    return notPushed(files.length
+      ? `the main checkout at ${mc} has uncommitted changes in files GitHub's commits change (${files.join(', ')}). The next landing tries again.`
+      : `git merge --ff-only failed in ${mc}: ${firstLine(ff.stderr || ff.stdout)}`);
+  }
+  if ((await gitOut(mc, ['rev-parse', `refs/heads/${MAIN}`])) !== fold) return notPushed(`${MAIN} didn't end up at the merge; look at git reflog in ${mc}.`);
+  if (await push(fold)) {
+    fs.rmSync(memoFile, { force: true });
+    return out(`Brought GitHub's commits into ${MAIN}, checked, and pushed it to GitHub.`);
+  }
+  notPushed(`GitHub refused the push (it may have moved again). ${MAIN} here has GitHub's commits now; the next landing pushes it.`);
 }
 
 // Why tb land can't move main in the main checkout now, or undefined: HEAD
@@ -1392,7 +2284,15 @@ export function overwrittenFiles(text: string): string[] {
 
 // Runs the check through a shell, keeping the end of its output (that's
 // where a test runner says what failed).
-function runCheck(command: string, cwd: string, shell = ['/bin/sh', '-c'], extraEnv: NodeJS.ProcessEnv = {}): Promise<{ ok: boolean; code?: number; text: string; durationMs: number }> {
+// With `limitMs` (findBroken's runs), it's stopped past that, its whole
+// process group, and says so: `stopped`.
+// The exit a check sent to the check hosts (scripts/check-remote.sh) ends
+// with when no host could run it, rather than a failed step's: none had room,
+// none could be reached, or each ran out of disk partway. EX_UNAVAILABLE, as
+// the runner's self-update has it (runner/scripts/deploy-steps.mjs).
+export const CHECK_HOSTS_UNAVAILABLE = 69;
+
+function runCheck(command: string, cwd: string, shell = ['/bin/sh', '-c'], extraEnv: NodeJS.ProcessEnv = {}, limitMs?: number): Promise<{ ok: boolean; code?: number; text: string; durationMs: number; stopped?: boolean }> {
   const started = Date.now();
   // At background priority: a land's check is the full quick suite.
   const [bin, args] = inBackground(shell[0], [...shell.slice(1), command]);
@@ -1407,11 +2307,50 @@ function runCheck(command: string, cwd: string, shell = ['/bin/sh', '-c'], extra
     const env: NodeJS.ProcessEnv = { ...process.env, ...extraEnv };
     if (!extraEnv.THREADBEAR_CHECK_PREFER) delete env.THREADBEAR_CHECK_PREFER;
     if (!extraEnv.THREADBEAR_CHECK_GROUP) delete env.THREADBEAR_CHECK_GROUP;
-    const child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (!extraEnv.THREADBEAR_CHECK_ONLY) delete env.THREADBEAR_CHECK_ONLY;
+    if (!extraEnv.THREADBEAR_CHECK_HOST_ONLY) delete env.THREADBEAR_CHECK_HOST_ONLY;
+    env.THREADBEAR_CHECK_BUSY_EXIT = extraEnv.THREADBEAR_CHECK_BUSY_EXIT ?? String(CHECK_HOSTS_UNAVAILABLE);
+    if (!extraEnv.THREADBEAR_CHECK_MAX_SECS && limitMs !== undefined) delete env.THREADBEAR_CHECK_MAX_SECS;
+    // A group of its own when it has a limit, so the ssh and whatever else
+    // it started go with it.
+    const child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], ...(limitMs !== undefined ? { detached: true } : {}) });
+    let stopped = false;
+    let timers: NodeJS.Timeout[] = [];
+    let finished = false;
+    // `closed`: the run's own process has just ended. Past its limit,
+    // whatever is left of its group goes at that moment: the shell ending on
+    // SIGTERM says nothing about a child of it that ignored it, and the timer
+    // that would have killed it is cleared here. Only then, and only once:
+    // later the group's id may be some other group's (Codex's reviews, 17 Nov).
+    const done = (r: { ok: boolean; code?: number; text: string }, closed = false): void => {
+      if (finished) return;
+      finished = true;
+      if (closed && stopped) signal('SIGKILL');
+      for (const t of timers) clearTimeout(t);
+      timers = [];
+      resolve({ ...r, durationMs: Date.now() - started, ...(stopped ? { stopped: true } : {}) });
+    };
+    const signal = (s: NodeJS.Signals): void => {
+      try {
+        if (child.pid) process.kill(-child.pid, s);
+      } catch {
+        // Gone already.
+      }
+    };
+    if (limitMs !== undefined) {
+      timers.push(setTimeout(() => {
+        stopped = true;
+        signal('SIGTERM');
+        timers.push(setTimeout(() => signal('SIGKILL'), 5_000));
+        // Something of it may have left the group and kept the pipes open:
+        // the landing lock isn't held for that.
+        timers.push(setTimeout(() => done({ ok: false, text: `${text}\nStopped: it had run for ${Math.round(limitMs / 1000)} s.` }), 15_000));
+      }, limitMs));
+    }
     child.stdout.on('data', take);
     child.stderr.on('data', take);
-    child.on('error', (e) => resolve({ ok: false, text: `${text}\n${e.message}`, durationMs: Date.now() - started }));
-    child.on('close', (code) => resolve({ ok: code === 0, code: code ?? undefined, text, durationMs: Date.now() - started }));
+    child.on('error', (e) => done({ ok: false, text: `${text}\n${e.message}` }));
+    child.on('close', (code) => done({ ok: code === 0 && !stopped, code: code ?? undefined, text }, true));
   });
 }
 
@@ -1582,6 +2521,21 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
     const merged = await git(w.mainCheckout, ['merge-base', '--is-ancestor', w.branch, MAIN]);
     if (!merged.ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
   }
+  // The branch goes only as it is now, and only if that's all on main: a
+  // commit made since the look above stays on it (Codex's review, 21 Nov:
+  // -D after one look took a commit made meanwhile). Why not, or undefined.
+  const dropBranch = async (): Promise<string | undefined> => {
+    const at = await gitOut(w.mainCheckout, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`]);
+    if (!at) return `git couldn't read it`;
+    if (!(await git(w.mainCheckout, ['merge-base', '--is-ancestor', at, MAIN])).ok) return `it has commits that aren't on ${MAIN}`;
+    // Not one some checkout is on (moved there with git worktree move, say):
+    // update-ref, unlike branch -D, would delete it from under it.
+    const using = await listCheckouts(w.mainCheckout);
+    if (!using) return `git couldn't list the worktrees of ${w.mainCheckout}`;
+    if (using.some((c) => c.branch === w.branch)) return 'a checkout is on it';
+    const del = await git(w.mainCheckout, ['update-ref', '-d', `refs/heads/${w.branch}`, at]);
+    return del.ok ? undefined : firstLine(del.stderr);
+  };
   // A record can outlive its worktree without hearing (THREADBEAR-16: a
   // handover saved it while the cleanup ran), and slot folders are reused.
   // So the folder is only touched if it's still this branch's checkout:
@@ -1597,9 +2551,9 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
     if (!ours) {
       if (branchThere) {
         if (!stillOurs()) return LET_GO;
-        const del = await git(w.mainCheckout, ['branch', '-D', w.branch]);
+        const left = await dropBranch();
         // The folder's someone else's either way, so it counts as removed.
-        if (!del.ok) return { removed: true, taken: true, branchLeft: `deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
+        if (left) return { removed: true, taken: true, branchLeft: `deleting ${w.branch} failed: ${left}` };
       }
       return { removed: true, taken: true };
     }
@@ -1616,7 +2570,26 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
     const status = await gitOut(here, ['status', '--porcelain', '--untracked-files=all']);
     if (status === undefined) return { removed: false, reason: `git couldn't read ${w.path}` };
     const lines = status ? status.split('\n') : [];
-    if (lines.some((l) => !l.startsWith('??'))) return { removed: false, reason: `the worktree has uncommitted changes` };
+    const DIRTY: Cleanup = { removed: false, reason: `the worktree has uncommitted changes` };
+    if (lines.some((l) => !l.startsWith('??'))) return DIRTY;
+    // Read again just before the folder is pooled or removed: an edit made
+    // since the look above would go into a spare, whose next taker's
+    // `reset --hard` takes it, or be removed with the folder by --force
+    // (21 Nov; borrows.ts does the same). If there is one, it goes back on
+    // its branch, as it was, and stays: only while the folder is still
+    // that checkout at that commit and the thread still this runner's, as
+    // for every other change here (Codex's review, 21 Nov).
+    const editedSince = async (where: string): Promise<Cleanup | undefined> => {
+      const again = await gitOut(where, ['status', '--porcelain', '--untracked-files=all']);
+      if (again !== undefined && !again.split('\n').some((l) => l && !l.startsWith('??'))) return undefined;
+      if (head !== `ref: refs/heads/${w.branch}`) {
+        if (!stillOurs()) return LET_GO;
+        const back = worktreeFolderNow(w, head);
+        if (!back) return CHANGED;
+        await git(back, ['checkout', '-q', '-B', w.branch]);
+      }
+      return again === undefined ? { removed: false, reason: `git couldn't read ${w.path}` } : DIRTY;
+    };
     if (w.keep && (await spares(w.mainCheckout, path.dirname(w.path))).length < MAX_SPARES) {
       // Detached where it is (no files change), so the branch can go; its
       // untracked files go when the next thread takes it.
@@ -1625,13 +2598,27 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
       if (!here) return CHANGED;
       const tip = await gitOut(here, ['rev-parse', 'HEAD']);
       if (!tip) return { removed: false, reason: `git couldn't read ${w.path}` };
+      // What it's set aside at must be on main too: a commit made since the
+      // branch was looked at would be left on no branch (Codex's review).
+      if (!(await git(w.mainCheckout, ['merge-base', '--is-ancestor', tip, MAIN])).ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
+      if (!stillOurs()) return LET_GO;
+      if (!(here = worktreeFolderNow(w, head))) return CHANGED;
       if ((await git(here, ['checkout', '-q', '--detach'])).ok) {
         // From here it's on that commit, detached, not on the branch.
         head = tip;
         if (!stillOurs()) return LET_GO;
-        if (branchThere && (await git(w.mainCheckout, ['branch', '-D', w.branch])).ok) branchThere = false;
+        if (branchThere && !(await dropBranch())) branchThere = false;
         if (!stillOurs()) return LET_GO;
-        if (!branchThere && (await git(w.mainCheckout, ['worktree', 'lock', '--reason', SPARE, w.path])).ok) return { removed: true, spare: true };
+        if (!branchThere) {
+          if (!(here = worktreeFolderNow(w, head))) return CHANGED;
+          const edited = await editedSince(here);
+          if (edited) return edited;
+          // Checked again after that status: a commit or a switch made while
+          // it ran would otherwise go into the pool (Codex's review, 21 Nov).
+          if (!stillOurs()) return LET_GO;
+          if (!worktreeFolderNow(w, head)) return CHANGED;
+          if ((await git(w.mainCheckout, ['worktree', 'lock', '--reason', SPARE, w.path])).ok) return { removed: true, spare: true };
+        }
       }
       // Couldn't be set aside: removed instead, below.
     }
@@ -1639,6 +2626,17 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
     if (!stillOurs()) return LET_GO;
     // On its branch still, or detached just above (a spare that couldn't be
     // locked), and nothing else.
+    if (!(here = worktreeFolderNow(w, head))) return CHANGED;
+    // What's checked out there is still all on main (a commit made since
+    // the first look stays, with its folder). Before the last status, so
+    // nothing slow comes between that and the removal.
+    const at = await gitOut(here, ['rev-parse', 'HEAD']);
+    if (!at || !(await git(w.mainCheckout, ['merge-base', '--is-ancestor', at, MAIN])).ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
+    if (!stillOurs()) return LET_GO;
+    if (!(here = worktreeFolderNow(w, head))) return CHANGED;
+    const edited = await editedSince(here);
+    if (edited) return edited;
+    if (!stillOurs()) return LET_GO;
     if (!worktreeFolderNow(w, head)) return CHANGED;
     const rm = await git(w.mainCheckout, args);
     if (!rm.ok) return { removed: false, reason: `git worktree remove failed: ${firstLine(rm.stderr)}` };
@@ -1646,11 +2644,10 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
     if (!stillOurs()) return LET_GO;
     await git(w.mainCheckout, ['worktree', 'prune']);
   }
-  // Checked above that it's all on main, so -D loses nothing.
   if (branchThere) {
     if (!stillOurs()) return LET_GO;
-    const del = await git(w.mainCheckout, ['branch', '-D', w.branch]);
-    if (!del.ok) return { removed: true, branchLeft: `deleting ${w.branch} failed: ${firstLine(del.stderr)}` };
+    const left = await dropBranch();
+    if (left) return { removed: true, branchLeft: `deleting ${w.branch} failed: ${left}` };
   }
   // The <repo>-threads folder, once it's empty.
   try {

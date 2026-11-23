@@ -1,6 +1,24 @@
-# Made from runner/src/experiments/*.md, one line per entry: two threads
-# adding an experiment at once both keep theirs (runner/src/experiment-docs.ts).
-docs/experiments.md merge=union
+# Shell scripts keep LF in a Windows checkout too, where Git for Windows'
+# core.autocrlf would otherwise give them CRLF and bash would choke on the
+# \r (the native Windows runner runs check.sh and the worktree scripts
+# under Git Bash). Batch files are the other way round.
+*.sh text eol=lf
+*.cmd text eol=crlf
 
-# Log entries from threads arrive at once; keep them all.
-docs/gpui-port/PARITY.md merge=union
+# Made from runner/src/experiments/*.md, one line per entry: two threads
+# adding an experiment at once both keep theirs, and one taking an
+# experiment out doesn't get it back from the other, as union did (17 Nov).
+# The driver is scripts/merge-lines.mjs, set up by worktree-setup.sh; a
+# checkout without it merges the file as text, so a clash there is a
+# conflict (run `npm run experiment-docs` in runner/), never stale lines.
+docs/experiments.md merge=lines
+
+# Log entries from threads arrive at once; keep them all. (PARITY.md is the
+# generated table now, so an entry still written there conflicts and moves here.)
+docs/gpui-port/LOG.md merge=union
+
+# The lint problems recorded as exempt, a count per file and rule: two
+# landings that each change some merge by count rather than conflicting on
+# neighbouring lines (scripts/merge-suppressions.mjs, set up by
+# worktree-setup.sh as merge-lines is).
+eslint-suppressions.json merge=suppressions

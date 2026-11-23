@@ -14,6 +14,13 @@ const { sha256 } = load('lib') as { sha256: (s: string) => Promise<string> };
 const sync = load('sync');
 const relay = load('relay');
 const phone = load('phone');
+const tokens = load('tokens');
+// A browser's token as one is made since API 81: a one-use code, traded. Its row.
+const browserToken = async (s: { ctx: unknown; rows: (t: string) => any[] }, name: string) => {
+  const { code } = await call(s.ctx, sync.issuePairingCode, { key: OWNER, kind: 'browser', name });
+  await call(s.ctx, tokens.claim, { code });
+  return { id: s.rows('tokens').find((t) => t.name === name)!._id as string };
+};
 
 async function setup() {
   process.env.RUNNER_KEY = OWNER;
@@ -198,6 +205,109 @@ test("a share slug is one thread's: Mac mini's key can't take a live or retired 
   await s.ctx.db.insert('threads', thread('B', MINI, { share: { access: 'link', slug: 'dup' }, lastActivityMs: 1 }));
   const share = load('share');
   assert.equal(await call(s.ctx, share.preview, { slug: 'dup' }), null);
+});
+
+// Codex Security, 21 Nov 2026 (finding 161): a retired link stays retired
+// for a runner key, its own runner's tombstones too: not back on the thread
+// that had it, nor on another of its threads. Keeping a link that's still
+// live on the same row is fine; the thread that had a retired one still
+// mirrors, without it.
+test("Mac mini's key can't bring back a retired link of its own, on the same thread or another", async () => {
+  const s = await setup();
+  const view = async (slug: string) => (await call(s.ctx, load('share').preview, { slug })) !== null;
+  const shareOf = (id: string) => s.rows('threads').find((t) => t.threadId === id)?.share;
+  await s.mini.upsert(thread('M1', MINI, { share: { access: 'link', slug: 'oldLink' } }));
+  await s.mini.upsert(thread('M2', MINI));
+  // Still live on its own row: writing it again is fine.
+  assert.equal(await outcome(s.mini.upsert(thread('M1', MINI, { share: { access: 'link', slug: 'oldLink' } }))), 'ok');
+  assert.equal(shareOf('M1').slug, 'oldLink');
+  // Share again: old -> new retires the old one.
+  assert.equal(await outcome(s.mini.upsert(thread('M1', MINI, { share: { access: 'link', slug: 'newLink' } }))), 'ok');
+  assert.ok(s.rows('threadTombstones').some((t) => t.slug === 'oldLink' && t.runnerId === MINI));
+  // Back on the same thread: the row goes in, the link doesn't.
+  assert.equal(await outcome(s.mini.upsert(thread('M1', MINI, { title: 'still mirrored', share: { access: 'link', slug: 'oldLink' } }))), 'ok');
+  assert.equal(s.rows('threads').find((t) => t.threadId === 'M1')!.title, 'still mirrored');
+  // On another thread of its runner: refused.
+  assert.equal(await outcome(s.mini.upsert(thread('M2', MINI, { share: { access: 'link', slug: 'oldLink' } }))), 'forbidden');
+  assert.equal(shareOf('M2'), undefined);
+  assert.equal(await view('oldLink'), false);
+  assert.equal(await view('newLink'), true, 'a late write with the old link leaves the current one');
+  assert.equal(shareOf('M1').slug, 'newLink');
+  // A deleted (or pruned) thread's link likewise: on another id refused; the
+  // thread itself sent again comes back without it, its messages too.
+  await s.mini.upsert(thread('M3', MINI, { share: { access: 'link', slug: 'm3Link' } }));
+  await call(s.ctx, sync.prune, { key: MINI_KEY, runnerId: MINI, keep: ['M1', 'M2'] });
+  assert.ok(s.rows('threadTombstones').some((t) => t.slug === 'm3Link'));
+  assert.equal(await outcome(s.mini.upsert(thread('M2', MINI, { share: { access: 'link', slug: 'm3Link' } }))), 'forbidden');
+  assert.equal(await outcome(s.mini.upsert(thread('M3', MINI, { share: { access: 'off', slug: 'm3Link' } }))), 'ok');
+  assert.equal(shareOf('M3'), undefined);
+  await s.mini.append('M3', 'after the prune');
+  assert.deepEqual(textsOf(s.rows('messages'), 'M3'), ['after the prune']);
+  assert.equal(await view('m3Link'), false);
+  // The owner may still put a retired link back (its key is Mike's own),
+  // which un-retires it.
+  assert.equal(await outcome(s.owner.upsert(thread('L1', LAPTOP, { share: { access: 'link', slug: 'oldLink' } }))), 'ok');
+  assert.equal(await view('oldLink'), true);
+  assert.ok(!s.rows('threadTombstones').some((t) => t.slug === 'oldLink'));
+});
+
+// Gemini's review: a link brought back before this check (live on its row,
+// and tombstoned) goes on the runner's next write of the thread.
+test('a retired link still live on its row from before this check goes on the next write', async () => {
+  const s = await setup();
+  await s.mini.upsert(thread('R', MINI, { share: { access: 'link', slug: 'resurrected' } }));
+  await s.ctx.db.insert('threadTombstones', { threadId: 'R', runnerId: MINI, slug: 'resurrected', at: 1 });
+  assert.equal(await outcome(s.mini.upsert(thread('R', MINI, { share: { access: 'link', slug: 'resurrected' } }))), 'ok');
+  assert.equal(s.rows('threads').find((t) => t.threadId === 'R')!.share, undefined);
+  assert.equal(await call(s.ctx, load('share').preview, { slug: 'resurrected' }), null);
+});
+
+// Codex's and Gemini's second reviews: stopping sharing with a write that
+// names a retired link stops the link the row has; and a slug brought onto
+// another thread before the fix stops showing, and that thread still mirrors.
+test('a stop-sharing write naming a retired link stops the current one', async () => {
+  const s = await setup();
+  const view = async (slug: string) => (await call(s.ctx, load('share').preview, { slug })) !== null;
+  await s.mini.upsert(thread('T', MINI, { share: { access: 'link', slug: 'linkA' } }));
+  await s.mini.upsert(thread('T', MINI, { share: { access: 'link', slug: 'linkB' } }));
+  assert.equal(await view('linkB'), true);
+  assert.equal(await outcome(s.mini.upsert(thread('T', MINI, { share: { access: 'off', slug: 'linkA' } }))), 'ok');
+  assert.equal(s.rows('threads').find((t) => t.threadId === 'T')!.share.access, 'off');
+  assert.equal(await view('linkB'), false);
+});
+
+test('a retired slug moved onto another thread before the fix stops showing, and that thread still mirrors', async () => {
+  const s = await setup();
+  const view = async (slug: string) => (await call(s.ctx, load('share').preview, { slug })) !== null;
+  await s.mini.upsert(thread('M2', MINI, { share: { access: 'link', slug: 'old' } }));
+  await s.ctx.db.insert('threadTombstones', { threadId: 'M1', runnerId: MINI, slug: 'old', at: 1 });
+  assert.equal(await view('old'), false, 'share.ts serves no retired slug');
+  assert.equal(await outcome(s.mini.upsert(thread('M2', MINI, { title: 'next', share: { access: 'link', slug: 'old' } }))), 'ok');
+  const row = s.rows('threads').find((t) => t.threadId === 'M2')!;
+  assert.deepEqual([row.title, row.share], ['next', undefined]);
+  // Gemini's third review: and the write after that (the runner still has the link).
+  assert.equal(await outcome(s.mini.upsert(thread('M2', MINI, { title: 'third', share: { access: 'link', slug: 'old' } }))), 'ok');
+  assert.equal(s.rows('threads').find((t) => t.threadId === 'M2')!.title, 'third');
+  // Still not on a thread that never had it.
+  assert.equal(await outcome(s.mini.upsert(thread('M3', MINI, { share: { access: 'link', slug: 'old' } }))), 'forbidden');
+});
+
+// Codex's third review: a late stop-sharing write naming a link another
+// thread retired still stops the row's current link.
+test("a stop-sharing write naming another thread's retired link stops the current one", async () => {
+  const s = await setup();
+  const view = async (slug: string) => (await call(s.ctx, load('share').preview, { slug })) !== null;
+  await s.mini.upsert(thread('T2', MINI, { share: { access: 'link', slug: 'linkB' } }));
+  await s.ctx.db.insert('threadTombstones', { threadId: 'T1', runnerId: MINI, slug: 'linkA', at: 1 });
+  assert.equal(await outcome(s.mini.upsert(thread('T2', MINI, { share: { access: 'off', slug: 'linkA' } }))), 'ok');
+  assert.equal(s.rows('threads').find((t) => t.threadId === 'T2')!.share.access, 'off');
+  assert.equal(await view('linkB'), false);
+  // And naming another row's live link while stopping: the same.
+  await s.mini.upsert(thread('T3', MINI, { share: { access: 'link', slug: 'linkC' } }));
+  await s.owner.upsert(thread('O', LAPTOP, { share: { access: 'link', slug: 'ownersLink' } }));
+  assert.equal(await outcome(s.mini.upsert(thread('T3', MINI, { share: { access: 'off', slug: 'ownersLink' } }))), 'ok');
+  assert.equal(await view('linkC'), false);
+  assert.equal(await view('ownersLink'), true);
 });
 
 test("the owner taking a thread id over from Mac mini's runner starts it clean", async () => {
@@ -421,6 +531,15 @@ test('a key over a runner id that has a live key needs replace', async () => {
   await call(s.ctx, sync.addRunnerKey, { key: OWNER, runnerId: MINI, name: 'mac-mini', ownerRunnerId: LAPTOP, replace: true });
 });
 
+test('four runner keys can be live at once, and a fifth is refused until one is revoked', async () => {
+  const s = await setup();
+  // setup() already has the mac-mini's: three more make four (bruce, the Hetzner box, the Pixel, the Dell).
+  for (const id of ['keyed0000002', 'keyed0000003', 'keyed0000004']) await call(s.ctx, sync.addRunnerKey, { key: OWNER, runnerId: id, name: id, ownerRunnerId: LAPTOP });
+  assert.equal(await outcome(call(s.ctx, sync.addRunnerKey, { key: OWNER, runnerId: 'keyed0000005', name: 'fifth', ownerRunnerId: LAPTOP })), 'tooMany');
+  await call(s.ctx, sync.revokeRunnerKey, { key: OWNER, runnerId: 'keyed0000002' });
+  await call(s.ctx, sync.addRunnerKey, { key: OWNER, runnerId: 'keyed0000005', name: 'fifth', ownerRunnerId: LAPTOP });
+});
+
 test("names are compared as they'd look, and the name a runner key ends up with is never another's", async () => {
   const s = await setup();
   await hb(s, OWNER, LAPTOP, 'Laptop');
@@ -467,7 +586,7 @@ test("refusals don't tell a key whether another runner's thread, schedule or car
 
 test('tokens say which key issued them, and the audit lists what a key could have planted', async () => {
   const s = await setup();
-  const made = await call(s.ctx, sync.issueToken, { key: OWNER, kind: 'browser', name: "Alex's iPhone" });
+  const made = await browserToken(s, "Alex's iPhone");
   const row = s.rows('tokens').find((t) => t._id === made.id)!;
   assert.equal(row.issuedBy, 'owner');
   assert.match(row.ownerKeyPrint, /^[0-9a-f]{8}$/);
@@ -811,7 +930,7 @@ test('den threads and pushes have per-key budgets, and old thread tombstones go'
 test('the audit pages through live credentials directly, section by section, with exact rows and versions', async () => {
   const s = await setup();
   for (let i = 0; i < 400; i++) await s.ctx.db.insert('tokens', { hash: `h${i}`, name: `junk${i}`, createdAt: 1, expiresAt: Date.now() + 1e9, revokedAt: 1 });
-  const live = await call(s.ctx, sync.issueToken, { key: OWNER, kind: 'browser', name: 'live one' });
+  const live = await browserToken(s, 'live one');
   const page = await call(s.ctx, sync.audit, { key: OWNER, section: 'tokens' });
   assert.deepEqual(page.rows.map((r: { id: string }) => r.id), [live.id]);
   assert.ok(typeof page.rows[0].version === 'string');
@@ -1265,4 +1384,53 @@ test('a lab review already stored with numbers that would stop a phone reaches i
   }
   // What's stored is left alone; only what the phone gets is held.
   assert.equal(s.rows('threads').find((t) => t.threadId === UUID(11))!.review.rounds, 1e20);
+});
+
+// Codex's review of the schedule claim fix (18 Nov 2026): a run recorded
+// while the schedule was edited elsewhere keeps its old nextRunAt (the
+// runner tells it again with the new updatedAt), so its holder's claim stays
+// until then. Cleared, another process of the runner (a handover) could
+// claim the slot that just ran and send it again.
+test('scheduleRan keeps the holder’s claim while the run it recorded leaves the slot due', async () => {
+  const s = await setup();
+  const at = '2026-11-18T09:00:00.000Z';
+  await call(s.ctx, sync.saveSchedule, { key: MINI_KEY, schedule: sched(UUID(9), MINI, { threadId: 'T', nextRunAt: at }) });
+  const claim = (holder: string) => call(s.ctx, sync.claimSchedule, { key: MINI_KEY, runnerId: MINI, scheduleId: UUID(9), holder, kind: 'due', expect: at });
+  const ran = (expectUpdatedAt: string) => call(s.ctx, sync.scheduleRan, { key: MINI_KEY, scheduleId: UUID(9), holder: 'old', lastRun: { at: 'a', outcome: 'sent' }, sent: true, expectUpdatedAt, nextRunAt: '2026-11-19T09:00:00.000Z' });
+  assert.equal(await claim('old'), true);
+  // Edited meanwhile: the run counts, the slot stays, and so does the claim.
+  await ran('an older edit');
+  const row = () => s.rows('schedules').find((r) => r.id === UUID(9))!;
+  assert.deepEqual([row().runs, row().nextRunAt, row().claim?.holder], [1, at, 'old']);
+  assert.equal(await claim('new'), false, 'the other process can’t take it');
+  // Told again with the edit's updatedAt: the slot moves on and the claim goes.
+  await ran('u');
+  assert.deepEqual([row().runs, row().nextRunAt, row().claim], [1, '2026-11-19T09:00:00.000Z', undefined]);
+});
+
+// A sidebar row's mode (API 88) reaches the main Mac's watch as written, and
+// a runner key's is cut to a mode's length (18 Nov 2026: another Mac's
+// composer showed Full access for every other runner's thread).
+test("a sidebar row's mode is kept, and a runner key's is cut short", async () => {
+  const s = await setup();
+  const row = (threadId: string, permissionMode: string) => ({ threadId, title: 'x', cwd: '/', accountId: 'a', provider: 'claude', status: 'idle', needsYou: false, unread: false, preview: '', createdAt: 'c', lastActivityAt: 'l', permissionMode });
+  await call(s.ctx, sync.setThreadIndex, { key: MINI_KEY, runnerId: MINI, rows: [row('A', 'auto'), row('B', 'x'.repeat(5000))], removed: [] });
+  const got = await call(s.ctx, sync.threadIndexSince, { key: OWNER, runners: [{ runnerId: MINI }] });
+  const modes = Object.fromEntries((got as { threadId: string; permissionMode?: string }[]).map((r) => [r.threadId, r.permissionMode]));
+  assert.deepEqual(modes, { A: 'auto', B: 'x'.repeat(16) });
+});
+
+// A sidebar row's `request` (API 96, docs/protocol/threads.md "What Mike first
+// asked") reaches the main Mac's watch, for its Feed, and a runner key's is
+// cut to 400 bytes, room for the runner's 200 characters of any text.
+test("a sidebar row's request is kept, and a runner key's is cut short", async () => {
+  const s = await setup();
+  const row = (threadId: string, request: string) => ({ threadId, title: 'x', cwd: '/', accountId: 'a', provider: 'claude', status: 'idle', needsYou: false, unread: false, preview: '', createdAt: 'c', lastActivityAt: 'l', request });
+  const accented = 'é'.repeat(200);
+  await call(s.ctx, sync.setThreadIndex, { key: MINI_KEY, runnerId: MINI, rows: [row('A', 'Fix the tests'), row('B', accented), row('C', 'x'.repeat(5000))], removed: [] });
+  const got = await call(s.ctx, sync.threadIndexSince, { key: OWNER, runners: [{ runnerId: MINI }] });
+  const requests = Object.fromEntries((got as { threadId: string; request?: string }[]).map((r) => [r.threadId, r.request]));
+  assert.equal(requests.A, 'Fix the tests');
+  assert.equal(requests.B, accented, '200 characters of two bytes each fit');
+  assert.ok(Buffer.byteLength(requests.C!) <= 400);
 });

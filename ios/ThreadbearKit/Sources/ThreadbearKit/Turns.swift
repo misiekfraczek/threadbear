@@ -22,7 +22,7 @@ public struct WorkedTurn: Hashable, Sendable {
     }
 }
 
-/// A thread as the Mac shows it once its turns are over (docs/protocol.md,
+/// A thread as the Mac shows it once its turns are over (docs/protocol/needs-you.md,
 /// "Needs you", "The summary"): Mike's message, one line of work, then the
 /// reply. The phone has a small screen, so this matters more here.
 public enum Turns {
@@ -315,6 +315,26 @@ public struct AskAnswer: Codable, Sendable, Hashable {
         let more = extra.trimmingCharacters(in: .whitespacesAndNewlines)
         if !more.isEmpty { parts.append(more) }
         return parts.joined(separator: "\n\n")
+    }
+
+    /// What he wrote himself in a message that answered asks
+    /// (Decisions.extra, the Mac's `answers_extra`): the text after the
+    /// answers `message` put first, empty when he wrote nothing, or nil when
+    /// the text doesn't start with them, so the bubble shows it as it is.
+    public static func extra(text: String, answers: [AskAnswer]) -> String? {
+        guard !answers.isEmpty else { return nil }
+        var rest = Substring(text)
+        for answer in answers {
+            // Numbered or not, as `message` wrote it.
+            var number: Int?
+            if let dot = rest.firstIndex(of: "."), let n = Int(rest[..<dot]), rest[rest.index(after: dot)...].hasPrefix(" ") { number = n }
+            let block = number.map { "\($0). \(answer.action)\n   " + answer.answer.replacingOccurrences(of: "\n", with: "\n   ") }
+                ?? "\(answer.action)\n\(answer.answer)"
+            guard rest.hasPrefix(block) else { return nil }
+            rest = rest.dropFirst(block.count)
+            if rest.hasPrefix("\n\n") { rest = rest.dropFirst(2) } else if !rest.isEmpty { return nil }
+        }
+        return rest.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// The message for follow-ups ticked on the done card, as the Mac

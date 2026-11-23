@@ -10,7 +10,7 @@
 import { createSign } from 'node:crypto';
 import { v } from 'convex/values';
 import { internalAction } from './_generated/server';
-import { fcmMessage, fcmPick, fcmReason, fcmSettled, type FcmResult } from './fcmMessage';
+import { fcmClearMessage, fcmMessage, fcmPick, fcmReason, fcmSettled, type FcmResult } from './fcmMessage';
 
 type Account = { client_email: string; private_key: string; project_id: string };
 
@@ -53,6 +53,9 @@ async function accessToken(a: Account, nowMs = Date.now()): Promise<{ token: str
     body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }),
     // Bounded like the send: one key's sign-in hanging mustn't hold up the other's.
     signal: AbortSignal.timeout(10_000),
+    // Google's fixed hosts never redirect these; a redirect would carry the
+    // signed assertion (and below, the access token) somewhere else.
+    redirect: 'error',
   }).catch(() => null);
   if (!res) return { status: 0, reason: 'timeout' };
   const body = (await res.json().catch(() => ({}))) as { access_token?: string; expires_in?: number };
@@ -61,14 +64,15 @@ async function accessToken(a: Account, nowMs = Date.now()): Promise<{ token: str
   return { token: body.access_token };
 }
 
-async function sendWith(acct: Account, a: { deviceToken: string; threadId: string; encrypted?: string }): Promise<FcmResult> {
+async function sendWith(acct: Account, message: unknown): Promise<FcmResult> {
   const auth = await accessToken(acct);
   if ('status' in auth) return auth;
   const res = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(acct.project_id)}/messages:send`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${auth.token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(fcmMessage(a)),
+    body: JSON.stringify(message),
     signal: AbortSignal.timeout(10_000),
+    redirect: 'error',
   }).catch((e: Error) => (e.name === 'TimeoutError' ? 'timeout' : 'send threw'));
   if (typeof res === 'string') return { status: 0, reason: res };
   if (res.ok) return { status: 200 };
@@ -76,20 +80,29 @@ async function sendWith(acct: Account, a: { deviceToken: string; threadId: strin
   return { status: res.status, ...(reason ? { reason } : {}) };
 }
 
+// Each key in turn until one settles it (fcmSettled says why).
+async function sendAll(message: unknown): Promise<{ status: number; reason?: string }> {
+  const keys = accounts();
+  if (keys.length === 0) return { status: 0, reason: 'relay not configured' };
+  const results: FcmResult[] = [];
+  for (const acct of keys) {
+    const r = await sendWith(acct, message);
+    results.push(r);
+    // Sent, or the token's own project said what's wrong with it: no
+    // other key can do better, and Keith's phones don't wait on Mike's key.
+    if (fcmSettled(r)) break;
+  }
+  return fcmPick(results)!;
+}
+
 export const send = internalAction({
   args: { deviceToken: v.string(), threadId: v.string(), encrypted: v.optional(v.string()) },
   returns: v.object({ status: v.number(), reason: v.optional(v.string()) }),
-  handler: async (_ctx, a): Promise<{ status: number; reason?: string }> => {
-    const keys = accounts();
-    if (keys.length === 0) return { status: 0, reason: 'relay not configured' };
-    const results: FcmResult[] = [];
-    for (const acct of keys) {
-      const r = await sendWith(acct, a);
-      results.push(r);
-      // Sent, or the token's own project said what's wrong with it: no
-      // other key can do better, and Keith's phones don't wait on Mike's key.
-      if (fcmSettled(r)) break;
-    }
-    return fcmPick(results)!;
-  },
+  handler: async (_ctx, a): Promise<{ status: number; reason?: string }> => await sendAll(fcmMessage(a)),
+});
+
+export const clear = internalAction({
+  args: { deviceToken: v.string(), threadId: v.string() },
+  returns: v.object({ status: v.number(), reason: v.optional(v.string()) }),
+  handler: async (_ctx, a): Promise<{ status: number; reason?: string }> => await sendAll(fcmClearMessage(a)),
 });

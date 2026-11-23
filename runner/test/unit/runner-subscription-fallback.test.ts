@@ -11,7 +11,6 @@ function setup() {
     provider: p,
     title: p,
     configDir: '',
-    subscription: p === 'antigravity' ? { state: 'ready' } : undefined,
   }));
   const h = makeHarness(undefined, { pools: [{ id: 'all', title: 'All', accountIds: order }] }, { adapters, accounts: new FakeAccounts(accounts) });
   writeRunnerJson(h.home, { experiments: { subscriptionFallback: true } });
@@ -192,27 +191,6 @@ test('recovery reusing a live CLI persists dispatch before sending', async () =>
   assert.equal(h.store.load(thread.id)?.fallbackCycle?.pending?.phase, 'started');
 });
 
-test('an unready subscription is re-probed after login without restarting, with a bounded interval', async () => {
-  const h = setup();
-  h.runner.learnAccount('antigravity', { subscription: { state: 'loginRequired' } });
-  let probes = 0;
-  h.adapters.antigravity.models = async () => {
-    probes++;
-    if (probes === 2) h.runner.learnAccount('antigravity', { subscription: { state: 'ready' } });
-    return [];
-  };
-  await h.runner.probeModels((a) => a.id === 'antigravity');
-  h.clock.advance(59_000);
-  await tick();
-  assert.equal(probes, 1);
-  h.clock.advance(1000);
-  await tick();
-  assert.equal(probes, 2);
-  h.clock.advance(60_000);
-  await tick();
-  assert.equal(probes, 2);
-});
-
 test('a previously ready login rejected at admission is skipped only in an existing cycle', async () => {
   const h = setup();
   const { thread } = h.runner.create({ text: 'x', poolId: 'all' });
@@ -220,17 +198,14 @@ test('a previously ready login rejected at admission is skipped only in an exist
   await tick();
   limit(h.adapters.codex);
   await tick();
-  h.runner.learnAccount('grok', { subscription: { state: 'loginRequired' } });
   h.adapters.grok.last.result('failed', undefined, 'Authentication required', { errorKind: 'auth', admissionFailure: true });
   await tick();
   assert.equal(h.runner.get(thread.id).provider, 'antigravity');
   assert.equal(h.adapters.antigravity.sessions.length, 1);
   assert.equal(h.runner.ranDry.has('grok'), false, 'auth failure is not a usage limit');
-  const other = setup();
-  other.runner.create({ text: 'x', poolId: 'all' });
-  other.adapters.claude.last.result('failed', undefined, 'Authentication required', { errorKind: 'auth', admissionFailure: true });
-  await tick();
-  assert.equal(other.adapters.codex.sessions.length, 0);
+  // With no cycle open, a Claude login refused as signed out moves the
+  // thread on since Mike's release of 22 Nov 2026 (sign-in-state.ts), by his
+  // rule and not this feature's.
 });
 
 // 10 Nov 2026: Claude out of room in its 5-hour window moved a thread before
@@ -258,7 +233,8 @@ test('a move before the turn for low room says the limit, not that the login is 
 // 11 Nov 2026: a scheduled turn in a thread that had moved to Grok (then on
 // this feature's own adapter) failed in 1.5 s with "The CLI has not confirmed
 // a supported subscription", with room on Claude. No cycle was open, so
-// nothing moved it on. Only Google starts sessions that way now.
+// nothing moved it on. Only Gemini's ended sign-in is reported that way now
+// (adapters/acp/adapter.ts).
 async function onGoogle() {
   const h = setup();
   const { thread } = h.runner.create({ text: 'x', poolId: 'all' });
@@ -282,7 +258,7 @@ test('a Google login that cannot start a session moves the thread on with no cyc
   const { h, thread } = await onGoogle();
   h.runner.send(thread.id, 'Check the listing', []);
   await tick();
-  h.adapters.antigravity.last.result('failed', undefined, 'The CLI has not confirmed a supported subscription.', { admissionFailure: true });
+  h.adapters.antigravity.last.result('failed', undefined, 'Authentication required', { errorKind: 'auth', admissionFailure: true });
   await tick();
   assert.equal(h.runner.get(thread.id).provider, 'claude');
   assert.match(h.adapters.claude.last.sent[0].text, /Check the listing/);
@@ -290,11 +266,3 @@ test('a Google login that cannot start a session moves the thread on with no cyc
   assert.match(lastMove(h, thread.id), /could not start a session/);
 });
 
-test('a move off a login whose subscription is no longer confirmed says so', async () => {
-  const { h, thread } = await onGoogle();
-  h.runner.learnAccount('antigravity', { subscription: { state: 'unknown' } });
-  h.runner.send(thread.id, 'next', []);
-  await tick();
-  assert.equal(h.runner.get(thread.id).provider, 'claude');
-  assert.match(lastMove(h, thread.id), /^Moved to claude: antigravity can't take this turn, subscription is not confirmed\. /);
-});

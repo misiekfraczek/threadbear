@@ -23,12 +23,17 @@ pub fn picture_markers(text: &str, image_count: usize) -> Vec<(Range<usize>, usi
     let mut from = 0;
     while let Some(at) = text[from..].find(OPEN).map(|n| from + n) {
         let digits_at = at + OPEN.len();
-        let digits = text[digits_at..].bytes().take_while(u8::is_ascii_digit).count();
+        let digits = text[digits_at..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
         from = digits_at;
         if !(1..=3).contains(&digits) || text.as_bytes().get(digits_at + digits) != Some(&b']') {
             continue;
         }
-        let Ok(number) = text[digits_at..digits_at + digits].parse::<usize>() else { continue };
+        let Ok(number) = text[digits_at..digits_at + digits].parse::<usize>() else {
+            continue;
+        };
         let end = digits_at + digits + 1;
         from = end;
         if number == 0 || number > image_count || placed[number - 1] {
@@ -48,6 +53,10 @@ pub enum MentionKind {
     Card,
     /// Another thread, as a `thread:<id>` link, which opens in the app.
     Thread,
+    /// A file on the runner's Mac that isn't a picture (a video, a PDF, a
+    /// folder), as its full path in backticks: it isn't uploaded, the agent
+    /// opens it where it is (`find_files`).
+    File,
 }
 
 /// A Notion card or another thread mentioned in a message. A message always
@@ -85,14 +94,22 @@ pub fn find_mentions(text: &str) -> Vec<Mention> {
         return Vec::new();
     }
     let chars: Vec<char> = text.chars().collect();
-    let offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let offsets: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
     let n = chars.len();
     // Where an address from each place would stop: at the next `)` or space.
     // An address can hold `[` and `](`, so the addresses of links that fail
     // overlap, and scanning each to its end again was quadratic too.
     let mut stop = vec![n; n + 1];
     for k in (0..n).rev() {
-        stop[k] = if chars[k] == ')' || is_space(chars[k]) { k } else { stop[k + 1] };
+        stop[k] = if chars[k] == ')' || is_space(chars[k]) {
+            k
+        } else {
+            stop[k + 1]
+        };
     }
     let mut found = Vec::new();
     let mut i = 0;
@@ -129,13 +146,27 @@ pub fn find_mentions(text: &str) -> Vec<Mention> {
         };
         // The first of those `[`s not after a `!` (a picture) with a title
         // left between it and the end.
-        let start = (i..end.saturating_sub(1)).find(|&j| chars[j] == '[' && (j == 0 || chars[j - 1] != '!'));
+        let start = (i..end.saturating_sub(1))
+            .find(|&j| chars[j] == '[' && (j == 0 || chars[j - 1] != '!'));
         match (start, destination(&chars, end + 1, &stop)) {
             (Some(start), Some((url, after))) => {
-                let title: String = chars[start + 1..end].iter().collect::<String>().replace("\\[", "[").replace("\\]", "]");
+                let title: String = chars[start + 1..end]
+                    .iter()
+                    .collect::<String>()
+                    .replace("\\[", "[")
+                    .replace("\\]", "]");
                 let url: String = chars[url].iter().collect();
-                let kind = if url.starts_with("thread:") { MentionKind::Thread } else { MentionKind::Card };
-                found.push(Mention { range: offsets[start]..offsets[after], title, url, kind });
+                let kind = if url.starts_with("thread:") {
+                    MentionKind::Thread
+                } else {
+                    MentionKind::Card
+                };
+                found.push(Mention {
+                    range: offsets[start]..offsets[after],
+                    title,
+                    url,
+                    kind,
+                });
                 i = after;
             }
             _ => i = end + 1,
@@ -152,7 +183,11 @@ fn destination(u: &[char], at: usize, stop: &[usize]) -> Option<(Range<usize>, u
         return None;
     }
     let begin = at + 1;
-    let has = |word: &str, index: usize| word.chars().enumerate().all(|(o, c)| u.get(index + o) == Some(&c));
+    let has = |word: &str, index: usize| {
+        word.chars()
+            .enumerate()
+            .all(|(o, c)| u.get(index + o) == Some(&c))
+    };
     let mut k;
     if has("thread:", begin) {
         k = begin + "thread:".len();
@@ -185,12 +220,16 @@ fn destination(u: &[char], at: usize, stop: &[usize]) -> Option<(Range<usize>, u
 
 /// `(?:[A-Za-z0-9-]+\.)*notion\.(?:so|site|com)`, exactly.
 fn is_notion_host(host: &str) -> bool {
-    ["notion.so", "notion.site", "notion.com"].iter().any(|top| match host.strip_suffix(top) {
-        Some("") => true,
-        // Each label before it has a character at least.
-        Some(labels) => labels.strip_suffix('.').is_some_and(|l| l.split('.').all(|part| !part.is_empty())),
-        None => false,
-    })
+    ["notion.so", "notion.site", "notion.com"]
+        .iter()
+        .any(|top| match host.strip_suffix(top) {
+            Some("") => true,
+            // Each label before it has a character at least.
+            Some(labels) => labels
+                .strip_suffix('.')
+                .is_some_and(|l| l.split('.').all(|part| !part.is_empty())),
+            None => false,
+        })
 }
 
 fn is_id_char(c: char) -> bool {
@@ -209,7 +248,10 @@ fn is_space(c: char) -> bool {
 
 /// What `.` doesn't match after a backslash.
 fn is_line_break(c: char) -> bool {
-    matches!(c, '\u{0A}' | '\u{0B}' | '\u{0C}' | '\u{0D}' | '\u{85}' | '\u{2028}' | '\u{2029}')
+    matches!(
+        c,
+        '\u{0A}' | '\u{0B}' | '\u{0C}' | '\u{0D}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 // ---------------------------------------------------------------- thread ids
@@ -226,9 +268,18 @@ pub fn thread_ref_candidates(text: &str) -> Vec<Range<usize>> {
         return found;
     }
     let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
-    let before_ok = |i: usize| i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'_' | b'-' | b'/' | b'.'));
-    let after_ok = |i: usize| i >= bytes.len() || !(bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'/'));
-    let run = |from: usize, len: usize| from + len <= bytes.len() && bytes[from..from + len].iter().all(|&b| hex(b));
+    let before_ok = |i: usize| {
+        i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || matches!(bytes[i - 1], b'_' | b'-' | b'/' | b'.'))
+    };
+    let after_ok = |i: usize| {
+        i >= bytes.len()
+            || !(bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-' | b'/'))
+    };
+    let run = |from: usize, len: usize| {
+        from + len <= bytes.len() && bytes[from..from + len].iter().all(|&b| hex(b))
+    };
     let mut i = 0;
     while i + 8 <= bytes.len() {
         if !hex(bytes[i]) || !before_ok(i) {
@@ -236,7 +287,9 @@ pub fn thread_ref_candidates(text: &str) -> Vec<Range<usize>> {
             continue;
         }
         let whole = run(i, 8)
-            && [(8, 4), (13, 4), (18, 4), (23, 12)].iter().all(|&(at, len)| bytes.get(i + at) == Some(&b'-') && run(i + at + 1, len))
+            && [(8, 4), (13, 4), (18, 4), (23, 12)]
+                .iter()
+                .all(|&(at, len)| bytes.get(i + at) == Some(&b'-') && run(i + at + 1, len))
             && after_ok(i + 36);
         if whole {
             found.push(i..i + 36);
@@ -265,10 +318,16 @@ impl ThreadIndex {
         let mut prefixes: HashMap<String, Option<String>> = HashMap::new();
         // Only ids of a thread id's shape: a chip's link is written with the
         // whole id in it, and another runner's ids are its own word.
-        for id in thread_ids.into_iter().filter(|id| crate::thread_link::is_thread_id(id)) {
+        for id in thread_ids
+            .into_iter()
+            .filter(|id| crate::thread_link::is_thread_id(id))
+        {
             ids.insert(id.to_owned(), id.to_owned());
             let prefix: String = id.chars().take(8).collect();
-            prefixes.entry(prefix).and_modify(|seen| *seen = None).or_insert_with(|| Some(id.to_owned()));
+            prefixes
+                .entry(prefix)
+                .and_modify(|seen| *seen = None)
+                .or_insert_with(|| Some(id.to_owned()));
         }
         for (prefix, id) in prefixes {
             if let Some(id) = id {
@@ -296,7 +355,182 @@ pub fn thread_detail(folder: &str, account: Option<&str>, status: &str) -> Strin
         parts.push(account.to_owned());
     }
     parts.push(status.to_owned());
-    parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ")
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+// ---------------------------------------------------------------- web addresses
+
+/// The web addresses typed or pasted bare into a message, as byte ranges,
+/// so Mike's bubble draws them as links (16 Nov: a GitHub issue's address
+/// sat in his bubble as plain words). One starts with `http://` or
+/// `https://` where a word starts and runs to the next space. Punctuation
+/// ending a sentence is left off its end, and so is a `)` or `]` it didn't
+/// open, so "(see https://x.com/a)." links just the address, as macOS's link
+/// detector does.
+pub fn web_links(text: &str) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("http") {
+        let start = from + at;
+        from = start + 4;
+        let rest = &text[start..];
+        let scheme = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            continue;
+        };
+        // Not the middle of a word ("xhttps://"), or of another address.
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '/' | '.' | '-' | '@'))
+        {
+            continue;
+        }
+        let len = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`'))
+            .unwrap_or(rest.len());
+        let mut end = start + len;
+        while let Some(last) = text[start..end].chars().next_back() {
+            let unopened = |open: char| {
+                text[start..end].matches(open).count() < text[start..end].matches(last).count()
+            };
+            let trim = match last {
+                '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_' => true,
+                ')' => unopened('('),
+                ']' => unopened('['),
+                '}' => unopened('{'),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            end -= last.len_utf8();
+        }
+        // An address with somewhere to go: more than the scheme.
+        if text[start + scheme..end]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric())
+        {
+            found.push(start..end);
+            from = end;
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------- files
+
+/// Where a path a file dropped or pasted into the box can start. The
+/// composer writes such a file as its full path in backticks
+/// (`composer::path_text`), and only those read back as a chip: a code span
+/// that merely starts with `/` (`/api/users`, `/help`) is words, so a path
+/// has to start in one of the folders local files live in, or a drive.
+const FILE_ROOTS: &[&str] = &[
+    "~/",
+    "/Users/",
+    "/Volumes/",
+    "/home/",
+    "/root/",
+    "/private/",
+    "/tmp/",
+    "/var/",
+    "/mnt/",
+    "/media/",
+    "/opt/",
+    "/srv/",
+    "/Applications/",
+    "/Library/",
+    "/System/",
+];
+
+/// The file's name if `path` reads as a local file's full path: one of
+/// `FILE_ROOTS`, or a Windows drive (`C:\`) or share (`\\host\`), with no
+/// space either end and a name after its last separator.
+fn local_file_name(path: &str) -> Option<String> {
+    if path.trim() != path || path.contains('\n') {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let drive = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let rest = if drive {
+        &path[3..]
+    } else if let Some(share) = path.strip_prefix("\\\\") {
+        share
+    } else {
+        let root = FILE_ROOTS.iter().find(|root| path.starts_with(*root))?;
+        &path[root.len()..]
+    };
+    // A root on its own (`/Users/`) is no file.
+    if rest.trim_matches(['/', '\\']).is_empty() {
+        return None;
+    }
+    let name = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Files among `text`: each local path in backticks, as the composer writes
+/// a dropped or pasted file that isn't a picture, a chip with the file's
+/// name (its `url` is the path). The words stay the path, so the agent, the
+/// phone and the archive read just what they did before.
+pub fn find_files(text: &str) -> Vec<Mention> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(open) = text[at..].find('`').map(|i| at + i) {
+        let Some(len) = text[open + 1..].find(['`', '\n']) else {
+            break;
+        };
+        let close = open + 1 + len;
+        if text.as_bytes()[close] == b'\n' {
+            at = close + 1;
+            continue;
+        }
+        let path = &text[open + 1..close];
+        if let Some(title) = local_file_name(path) {
+            found.push(Mention {
+                range: open..close + 1,
+                title,
+                url: path.to_owned(),
+                kind: MentionKind::File,
+            });
+        }
+        at = close + 1;
+    }
+    found
+}
+
+/// Cards, threads and files in `text`, in order. A file inside a link's
+/// words is left to the link.
+pub fn find_chips(text: &str) -> Vec<Mention> {
+    let mut all = find_mentions(text);
+    let files = find_files(text);
+    if files.is_empty() {
+        return all;
+    }
+    let links = all.len();
+    for file in files {
+        if !all[..links]
+            .iter()
+            .any(|m| m.range.start < file.range.end && file.range.start < m.range.end)
+        {
+            all.push(file);
+        }
+    }
+    all.sort_by_key(|m| m.range.start);
+    all
 }
 
 // ---------------------------------------------------------------- a message's pieces
@@ -321,7 +555,7 @@ pub fn message_pieces(text: &str, image_count: usize) -> Vec<Piece> {
             return;
         }
         let mut at = 0;
-        for mention in find_mentions(piece) {
+        for mention in find_chips(piece) {
             if mention.range.start > at {
                 pieces.push(Piece::Words(piece[at..mention.range.start].to_owned()));
             }
@@ -344,21 +578,70 @@ pub fn message_pieces(text: &str, image_count: usize) -> Vec<Piece> {
 
 /// Whether a message has anything to draw as a chip.
 pub fn has_chips(text: &str, image_count: usize) -> bool {
-    message_pieces(text, image_count).iter().any(|p| !matches!(p, Piece::Words(_)))
+    message_pieces(text, image_count)
+        .iter()
+        .any(|p| !matches!(p, Piece::Words(_)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn links(text: &str) -> Vec<&str> {
+        web_links(text).into_iter().map(|r| &text[r]).collect()
+    }
+
+    #[test]
+    fn finds_bare_web_addresses() {
+        assert_eq!(
+            links("https://github.com/mikecann/fluent-convex/issues/8"),
+            ["https://github.com/mikecann/fluent-convex/issues/8"]
+        );
+        assert_eq!(
+            links("see http://a.io/x and https://b.dev/y?z=1#top"),
+            ["http://a.io/x", "https://b.dev/y?z=1#top"]
+        );
+        assert_eq!(links("one\nhttps://c.com\ntwo"), ["https://c.com"]);
+    }
+
+    #[test]
+    fn leaves_sentence_punctuation_off_an_address() {
+        assert_eq!(links("Look at https://x.com/a."), ["https://x.com/a"]);
+        assert_eq!(links("(see https://x.com/a), then"), ["https://x.com/a"]);
+        assert_eq!(
+            links("https://en.wikipedia.org/wiki/Rust_(language)!"),
+            ["https://en.wikipedia.org/wiki/Rust_(language)"]
+        );
+        assert_eq!(links("[title](https://x.com/a)"), ["https://x.com/a"]);
+        assert_eq!(links("<https://x.com/a>"), ["https://x.com/a"]);
+        assert_eq!(links("'https://x.com/a'"), ["https://x.com/a"]);
+    }
+
+    #[test]
+    fn needs_a_word_start_and_somewhere_to_go() {
+        assert!(links("xhttps://x.com http https:// https://. httpsfoo").is_empty());
+        assert!(links("ftp://x.com mailto:me@x.com").is_empty());
+        // Not a byte-boundary panic on words round it.
+        assert_eq!(links("café→https://ü.example/ä ✓"), ["https://ü.example/ä"]);
+    }
+
     fn words(text: &str) -> Vec<&str> {
-        thread_ref_candidates(text).into_iter().map(|r| &text[r]).collect()
+        thread_ref_candidates(text)
+            .into_iter()
+            .map(|r| &text[r])
+            .collect()
     }
 
     #[test]
     fn finds_prefixes_and_whole_ids() {
-        assert_eq!(words("`85735a8f` (subagents) and 1d827b8c."), ["85735a8f", "1d827b8c"]);
-        assert_eq!(words("thread 52594bb9-e49d-4ec7-8ed8-bbc61b48ef77 is this one"), ["52594bb9-e49d-4ec7-8ed8-bbc61b48ef77"]);
+        assert_eq!(
+            words("`85735a8f` (subagents) and 1d827b8c."),
+            ["85735a8f", "1d827b8c"]
+        );
+        assert_eq!(
+            words("thread 52594bb9-e49d-4ec7-8ed8-bbc61b48ef77 is this one"),
+            ["52594bb9-e49d-4ec7-8ed8-bbc61b48ef77"]
+        );
         assert_eq!(words("(85735a8f)"), ["85735a8f"]);
         assert_eq!(words("é85735a8f"), ["85735a8f"]);
     }
@@ -370,7 +653,7 @@ mod tests {
         assert!(words("merged d1ecf9c as baa45b6").is_empty());
         assert!(words("sha 1e66c6d4f2a8b9c0").is_empty());
         assert!(words("releases/20261027T055446Z-d1ecf9c").is_empty());
-        assert!(words("app/.fixtures/threads/85735a8f").is_empty());
+        assert!(words(".fixtures/threads/85735a8f").is_empty());
         assert!(words("x85735a8f 85735a8fx 85735A8F").is_empty());
         assert!(words("52594bb9-e49d-4ec7-8ed8-bbc61b48ef77x").is_empty());
     }
@@ -383,18 +666,36 @@ mod tests {
             "aaaaaaaa-0000-4000-8000-000000000001",
             "aaaaaaaa-0000-4000-8000-000000000002",
         ]);
-        assert_eq!(index.resolve("52594bb9"), Some("52594bb9-e49d-4ec7-8ed8-bbc61b48ef77"));
-        assert_eq!(index.resolve("52594bb9-e49d-4ec7-8ed8-bbc61b48ef77"), Some("52594bb9-e49d-4ec7-8ed8-bbc61b48ef77"));
-        assert_eq!(index.resolve("85735a8f"), Some("85735a8f-0000-4000-8000-000000000001"));
+        assert_eq!(
+            index.resolve("52594bb9"),
+            Some("52594bb9-e49d-4ec7-8ed8-bbc61b48ef77")
+        );
+        assert_eq!(
+            index.resolve("52594bb9-e49d-4ec7-8ed8-bbc61b48ef77"),
+            Some("52594bb9-e49d-4ec7-8ed8-bbc61b48ef77")
+        );
+        assert_eq!(
+            index.resolve("85735a8f"),
+            Some("85735a8f-0000-4000-8000-000000000001")
+        );
         assert_eq!(index.resolve("aaaaaaaa"), None, "two threads share it");
-        assert_eq!(index.resolve("aaaaaaaa-0000-4000-8000-000000000002"), Some("aaaaaaaa-0000-4000-8000-000000000002"));
+        assert_eq!(
+            index.resolve("aaaaaaaa-0000-4000-8000-000000000002"),
+            Some("aaaaaaaa-0000-4000-8000-000000000002")
+        );
         assert_eq!(index.resolve("1d827b8c"), None);
     }
 
     #[test]
     fn the_detail_line() {
-        assert_eq!(thread_detail("threadbear", Some("claude-2"), "Working 4m"), "threadbear · claude-2 · Working 4m");
-        assert_eq!(thread_detail("threadbear", None, "Needs you"), "threadbear · Needs you");
+        assert_eq!(
+            thread_detail("threadbear", Some("claude-2"), "Working 4m"),
+            "threadbear · claude-2 · Working 4m"
+        );
+        assert_eq!(
+            thread_detail("threadbear", None, "Needs you"),
+            "threadbear · Needs you"
+        );
         assert_eq!(thread_detail("", Some(""), "Archived"), "Archived");
     }
 
@@ -403,7 +704,13 @@ mod tests {
         let text = "[Picture 2] then [Picture 1], [Picture 2] again, [Picture 9] and [picture 1] [Picture 1234]";
         let found = picture_markers(text, 2);
         assert_eq!(found.iter().map(|(_, i)| *i).collect::<Vec<_>>(), [1, 0]);
-        assert_eq!(found.iter().map(|(r, _)| &text[r.clone()]).collect::<Vec<_>>(), ["[Picture 2]", "[Picture 1]"]);
+        assert_eq!(
+            found
+                .iter()
+                .map(|(r, _)| &text[r.clone()])
+                .collect::<Vec<_>>(),
+            ["[Picture 2]", "[Picture 1]"]
+        );
         assert!(picture_markers(text, 0).is_empty());
         assert!(picture_markers("[Picture 0]", 1).is_empty());
     }
@@ -412,12 +719,30 @@ mod tests {
     fn card_mentions_are_notion_links_in_a_message() {
         let text = "Look at [Fix \\[the\\] button](https://app.notion.com/p/abc123) and [Docs](https://example.com/x) please";
         let found = find_mentions(text);
-        assert_eq!(found.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(), ["Fix [the] button"], "only Notion links, with the brackets back");
+        assert_eq!(
+            found.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+            ["Fix [the] button"],
+            "only Notion links, with the brackets back"
+        );
         assert_eq!(found[0].url, "https://app.notion.com/p/abc123");
-        assert_eq!(&text[found[0].range.clone()], "[Fix \\[the\\] button](https://app.notion.com/p/abc123)");
-        let titles = |t: &str| find_mentions(t).into_iter().map(|m| m.title).collect::<Vec<_>>();
-        assert_eq!(titles("[a](https://www.notion.so/t3) [b](https://x.notion.site/y)"), ["a", "b"]);
-        assert!(find_mentions("![a picture](https://www.notion.so/t3)").is_empty(), "a picture isn't a card");
+        assert_eq!(
+            &text[found[0].range.clone()],
+            "[Fix \\[the\\] button](https://app.notion.com/p/abc123)"
+        );
+        let titles = |t: &str| {
+            find_mentions(t)
+                .into_iter()
+                .map(|m| m.title)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            titles("[a](https://www.notion.so/t3) [b](https://x.notion.site/y)"),
+            ["a", "b"]
+        );
+        assert!(
+            find_mentions("![a picture](https://www.notion.so/t3)").is_empty(),
+            "a picture isn't a card"
+        );
         assert!(find_mentions("[a](https://notnotion.so/t3) [b](http://www.notion.so/t3) [c](https://notion.so.evil.com/t3)").is_empty(), "only real Notion addresses");
         assert!(find_mentions("no links here").is_empty());
         assert!(find_mentions("[a](https://.notion.so/x) [b](https://a..notion.so/x)").is_empty());
@@ -425,8 +750,13 @@ mod tests {
 
     #[test]
     fn thread_links_are_mentions_too() {
-        let found = find_mentions("See [Fix \\[the\\] chip](thread:0cf430ac-f429) and [card](https://notion.so/a)");
-        assert_eq!(found.iter().map(|m| m.kind).collect::<Vec<_>>(), [MentionKind::Thread, MentionKind::Card]);
+        let found = find_mentions(
+            "See [Fix \\[the\\] chip](thread:0cf430ac-f429) and [card](https://notion.so/a)",
+        );
+        assert_eq!(
+            found.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            [MentionKind::Thread, MentionKind::Card]
+        );
         assert_eq!(found[0].title, "Fix [the] chip");
         assert_eq!(found[0].url, "thread:0cf430ac-f429");
         assert_eq!(found[0].thread_id(), Some("0cf430ac-f429"));
@@ -438,7 +768,11 @@ mod tests {
         let started = std::time::Instant::now();
         find_mentions(&format!("{}](thread:", "[".repeat(32_000)));
         find_mentions(&format!("[a]({}notion.so/", "https://".repeat(4_000)));
-        assert!(started.elapsed().as_secs_f64() < 2., "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed().as_secs_f64() < 2.,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -447,11 +781,56 @@ mod tests {
         assert_eq!(pieces.len(), 7);
         assert_eq!(pieces[0], Piece::Words("Here ".into()));
         assert_eq!(pieces[1], Piece::Picture(0));
-        assert!(matches!(&pieces[3], Piece::Mention(m) if m.kind == MentionKind::Card && m.title == "Card"));
-        assert!(matches!(&pieces[5], Piece::Mention(m) if m.kind == MentionKind::Thread && m.thread_id() == Some("abc")));
-        assert_eq!(pieces[6], Piece::Words(" [Picture 3]".into()), "a marker naming no picture is words");
+        assert!(
+            matches!(&pieces[3], Piece::Mention(m) if m.kind == MentionKind::Card && m.title == "Card")
+        );
+        assert!(
+            matches!(&pieces[5], Piece::Mention(m) if m.kind == MentionKind::Thread && m.thread_id() == Some("abc"))
+        );
+        assert_eq!(
+            pieces[6],
+            Piece::Words(" [Picture 3]".into()),
+            "a marker naming no picture is words"
+        );
         assert!(has_chips("see [Picture 1]", 1));
         assert!(!has_chips("see [Picture 1]", 0));
         assert!(!has_chips("plain words", 0));
+    }
+
+    #[test]
+    fn a_local_path_in_backticks_is_a_file() {
+        let text = "watch `/Users/mike/Screen Recording 2026.mp4` and `C:\\Users\\m\\clip.mov` then `~/dev/notes/`";
+        let found = find_files(text);
+        assert_eq!(
+            found.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+            ["Screen Recording 2026.mp4", "clip.mov", "notes"]
+        );
+        assert_eq!(found[0].url, "/Users/mike/Screen Recording 2026.mp4");
+        assert_eq!(
+            &text[found[0].range.clone()],
+            "`/Users/mike/Screen Recording 2026.mp4`"
+        );
+        assert!(found.iter().all(|m| m.kind == MentionKind::File));
+        // Code that isn't a local file stays words.
+        assert!(find_files(
+            "`/api/users` `/help` `npm test` `/Users/` ` /Users/a/b` `/Users/a\nb`"
+        )
+        .is_empty());
+        assert!(find_files("an odd ` then /Users/a/b.mp4").is_empty());
+    }
+
+    #[test]
+    fn a_message_draws_its_files_as_chips() {
+        let pieces = message_pieces(
+            "see `/Users/m/a.mp4` and [Card](https://www.notion.so/a)",
+            0,
+        );
+        assert_eq!(pieces.len(), 4);
+        assert!(
+            matches!(&pieces[1], Piece::Mention(m) if m.kind == MentionKind::File && m.title == "a.mp4")
+        );
+        assert!(matches!(&pieces[3], Piece::Mention(m) if m.kind == MentionKind::Card));
+        // A path in a link's words is the link's.
+        assert_eq!(find_chips("[`/Users/m/a.mp4`](thread:abc)").len(), 1);
     }
 }

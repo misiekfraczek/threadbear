@@ -75,9 +75,14 @@ changes clash with it and how you'd settle each, and anything they'd need
 to do themselves (a change to `runner/launcher/` only takes effect after
 `runner/scripts/install-runner.sh`, which they run from a terminal). If
 the release looks halfway through something (a feature half there, a
-commit that says it's temporary, tests skipped), say so. Then ask whether
-to go ahead. Nothing from it has run, and nothing has changed but git's
-objects.
+commit that says it's temporary, tests skipped), say so. A release often
+adds checks that read the code (a security fix's source tests), and their
+own changes can fail one even where the merge is clean. Say that if a
+check the release added or changed (it's in `git diff main...<commit>`)
+fails on their code, you'll change their code the way it asks, never the
+check, and show them the diff when you land, so one go covers it. Then
+ask whether to go ahead. Nothing from it has run, and nothing has changed
+but git's objects.
 
 ## 4. Once they say go: merge, settle clashes, check
 
@@ -92,6 +97,36 @@ Always a merge, never a rebase or a cherry-pick: Mike's commits have to
 keep their ids, or the runner never sees this copy as up to date with his
 release again. `tb land` knows not to rebase a branch with a merge on it.
 
+If the release has a format commit this copy doesn't (one listed in its
+`.git-blame-ignore-revs` under `# format-subject:`, like "Format desktop/'s
+Rust with cargo fmt --all, nothing else"), merge with this instead of the
+`git merge` above:
+
+```sh
+scripts/replay-over-format.sh --merge <commit> -m "Bring in Mike's release <date>"
+```
+
+It merges the commit before the format commit first (an ordinary merge, so
+any clash there is a real one), then the format commit itself with this
+copy's tree run through the same formatter as the result, then the release:
+none of the formatting clashes, and Mike's commits keep their ids. A clash
+it stops at is sorted out as below, then `git commit` and run it again. It
+needs the formatter the list names (`cargo fmt` from rustup for the Rust
+one; rustup fetches the pinned toolchain itself). The split of
+docs/protocol.md into docs/protocol/ is one too (`# format-tool:`, run by
+node): your edits to the single file land in the file their section went
+to. A copy of the script older than the split doesn't know that kind
+and would leave the split as a conflict, so run the release's own copy. If
+this checkout doesn't have the script yet, the same:
+
+```sh
+git show <commit>:runner/src/format-replay.ts > "${TMPDIR:-/tmp}/format-replay.ts"
+node "${TMPDIR:-/tmp}/format-replay.ts" --merge <commit> -m "Bring in Mike's release <date>"
+```
+
+Your own branches made before it then land across it by themselves:
+`tb land` formats their commits the same way on the way.
+
 Where git can't merge, or where the merge is clean but the result doesn't
 make sense, work out what each side was for, from both sides' commit
 messages and diffs, and write code that does both:
@@ -105,7 +140,7 @@ messages and diffs, and write code that does both:
 
 Their patches (`.threadbear/patches/`, `~/.threadbear/patches/`) and
 settings (`runner.json`) aren't part of the merge. Check they still work
-against Mike's changes (docs/protocol.md, "Patches", says what a patch can
+against Mike's changes (docs/protocol/patches.md, "Patches", says what a patch can
 use), and fix them if not.
 
 Then `./check.sh --all` runs every check (several minutes; up to ten for
@@ -115,8 +150,12 @@ you land.
 ## 5. Land
 
 If the checks passed and every clash went the way you told them, `tb land`.
-If a check failed, or you had to rework something you hadn't told them
-about, say what and ask again first. The runner, the backend and the app
+A change to their code for a check the release added or changed, as
+section 3 said, needs no second ask: show them its diff once it's landed.
+Ask again first, saying what and why, if a check that was there before
+the release failed, if the fix would mean changing a check rather than
+their code, if anything else failed, or if you had to rework something
+you hadn't told them about. The runner, the backend and the app
 then update themselves from main, as they do for any change.
 
 If something goes wrong afterwards, `git revert -m 1 <merge commit>` on
@@ -124,9 +163,42 @@ main takes the whole release back out in one go.
 
 ## 6. Offer to push it
 
-`tb land` never pushes, so their own copy on GitHub (`origin`) is still on
+`tb land` doesn't push (unless they've listed the repo in runner.json's
+`pushAfterLanding`), so their own copy on GitHub (`origin`) is still on
 the old main: if this Mac went, the merge and anything of theirs not yet
 pushed would go with it. Once it's landed, if `git log origin/main..main`
 lists anything, say so and ask whether to push it. Run `git push origin
-main` only when they say yes. If `origin` isn't on GitHub, or they'd rather
-keep main to this Mac, leave it.
+main` only when they say yes. GitHub refuses a push that changes
+`.github/workflows/` (most releases do) from an HTTPS login without the
+`workflow` scope, which the GitHub CLI doesn't ask for by default. If
+`origin` pushes over HTTPS, look at `gh auth status` before you ask, and if
+its scopes lack `workflow`, ask them to run `gh auth refresh -h github.com
+-s workflow` in a Terminal (or push over SSH, where scopes don't apply).
+If `origin` isn't on GitHub, or they'd rather keep main to this Mac, leave
+it.
+
+## 7. Offer Mike a check-up
+
+Once it's landed (or once they've said not to land it), run `tb checkup`,
+with `--text "..."` for one or two plain sentences of your own on what went
+wrong, if anything: a clash with their changes and how it settled, a check
+that failed, a patch you had to fix. Leave out anything about their own
+work (project names, what their changes are for, file paths of theirs). It
+drafts a short report for Mike from facts the code picks: which release
+came in and how far behind main was, how often each of Threadbear's own
+runner errors came up since the last check-up, whether the runner's build
+of main is failing, and which of Mike's patches won't load. It names only
+what's in Mike's code; anything of theirs is just a count, and the draft is
+scrubbed of secrets and their home folder.
+
+Put the draft in your reply as it is, and ask with a card whether to send
+it: it goes as a comment on a public Discussion on Mike's GitHub repo,
+under their own GitHub login, so Mike can see what's going wrong in other
+people's copies and fix it. Answers: Send (`tb checkup --post`), Skip
+(`tb checkup --skip`), and Never ask (set `"releases": { "checkup": false }`
+in `runner.json`, then `tb checkup --skip`). If they want it worded
+differently, run `tb checkup` again with a new `--text` and show it again:
+`--post` sends exactly the last draft they saw. If `--post` says gh isn't
+signed in, give them the draft to paste and the link it prints. If it says
+Mike hasn't opened the Discussion yet, or `tb checkup` says check-ups are
+off here, skip this section and say nothing about it.

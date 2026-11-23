@@ -1,6 +1,6 @@
 // What each provider is called and what it can do. The runner's checks read
 // this rather than comparing provider names, and hello hands it to the apps
-// (docs/protocol.md, "Providers"), so adding a provider is a row here and
+// (docs/protocol/types.md, `ProviderInfo`), so adding a provider is a row here and
 // not a hunt through every `=== 'codex'`.
 //
 // What's left comparing names is really about one CLI's own files or
@@ -15,7 +15,6 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     loginCommand: 'claude auth login',
     effort: 'claude',
     autoMode: 'classifier',
-    sandbox: true,
     rewind: true,
     smallJobs: true,
     usageReadings: true,
@@ -27,12 +26,11 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     loginCommand: 'codex login',
     effort: 'codex',
     autoMode: 'asks',
-    sandbox: false,
     rewind: true,
     smallJobs: false,
     usageReadings: true,
   },
-  // Over ACP (adapters/acp/): Auto behaves like Ask, and neither sandbox,
+  // Over ACP (adapters/acp/): Auto behaves like Ask, and neither
   // rewind nor usage readings exist for them.
   cursor: {
     id: 'cursor',
@@ -41,7 +39,6 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     loginCommand: 'agent login',
     effort: 'none',
     autoMode: 'asks',
-    sandbox: false,
     rewind: false,
     // Its read tools work in any mode and nothing turns them off, and a small
     // job's text can come from anywhere.
@@ -55,7 +52,6 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     loginCommand: 'opencode auth login',
     effort: 'none',
     autoMode: 'asks',
-    sandbox: false,
     rewind: false,
     smallJobs: true,
     usageReadings: false,
@@ -69,24 +65,21 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     // (AcpSession sets them as the session's thought_level option).
     effort: 'codex',
     autoMode: 'asks',
-    sandbox: false,
     rewind: false,
     // Threadbear's hook denies every tool for a small job, reads included
     // (adapters/acp/grok-guard.ts).
     smallJobs: true,
     usageReadings: false,
   },
-  // This fork's subscription login (adapters/subscription-acp/): Full access
-  // only, effort levels as Codex's, and no sandbox, rewind, small jobs or
-  // usage readings. Runs only with the subscriptionFallback experiment on.
+  // Gemini on a Google plan, through Google's antigravity-acp. It has no
+  // sign-in command of its own (it signs in over ACP's authenticate).
   antigravity: {
     id: 'antigravity',
-    name: 'Google (Antigravity)',
-    cliName: 'Google (Antigravity)',
-    loginCommand: 'agy acp --login',
-    effort: 'codex',
+    name: 'Gemini',
+    cliName: 'Antigravity',
+    loginCommand: '',
+    effort: 'none',
     autoMode: 'asks',
-    sandbox: false,
     rewind: false,
     smallJobs: false,
     usageReadings: false,
@@ -97,7 +90,7 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
 // build that has more): it can do nothing, so no check takes it for Claude
 // and lets it into something only Claude can do.
 function unknownProvider(id: string): ProviderInfo {
-  return { id, name: id, cliName: id, loginCommand: '', effort: 'none', autoMode: 'asks', sandbox: false, rewind: false, smallJobs: false, usageReadings: false };
+  return { id, name: id, cliName: id, loginCommand: '', effort: 'none', autoMode: 'asks', rewind: false, smallJobs: false, usageReadings: false };
 }
 
 // No provider at all is a Claude one, as a record from before Codex is

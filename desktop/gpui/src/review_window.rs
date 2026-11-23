@@ -1,4 +1,4 @@
-// The window that answers an agent's `show_options` (docs/protocol.md, "Design
+// The window that answers an agent's `show_options` (docs/protocol/events.md, "Design
 // reviews"), a port of the Swift app's ReviewWindow.swift: the option on show
 // big on the stage with a mark for every shot of every option under it, then
 // all of them side by side; down the right, the options with their reasons,
@@ -8,17 +8,18 @@
 // The rules (what can be sent, the draft's saves and their races, where the
 // stage goes next, the zoom) are threadbear_core::review, with their tests;
 // this draws them, makes the calls and does the waiting. The stage is
-// review_window/stage.rs and the column down the right review_window/rail.rs.
+// review_window/stage.rs and the band under it, with the options' tabs, the
+// words and the answer, review_window/band.rs.
 //
 // Its ways in: the review card's button (rows/cards.rs), a `review:` link in a
 // reply or on an ask (rows/markdown.rs), and the bar over a thread with
 // reviews waiting (header.rs, `pending_reviews_bar` here).
 use crate::app::Threadbear;
-use crate::style::{self, px};
 use crate::call;
+use crate::spinner::Spinner;
+use crate::style::{self, px};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Enter, InputEvent, Paste, TextareaState};
-use crate::spinner::Spinner;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -29,9 +30,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use threadbear_client::runner::{Client, RpcError};
 use threadbear_core::reducer::DesignReview;
-use threadbear_core::review::{self as rules, DraftCache, ReviewMode, ReviewSession, SharedDraftCache, ZoomStep};
+use threadbear_core::review::{
+    self as rules, DraftCache, ReviewMode, ReviewSession, SharedDraftCache, ZoomStep,
+};
 
-mod rail;
+mod band;
+pub(crate) use band::inline_note;
+mod reply_pictures;
 mod stage;
 
 /// The title bar's height: the Swift window's, a native one with its buttons
@@ -68,9 +73,20 @@ struct PendingList {
 fn reviews(cx: &mut App) -> &mut Reviews {
     if !cx.has_global::<Reviews>() {
         // Beside the composer's drafts (drafts.rs), this app's own file.
-        let path = threadbear_client::config::RunnerConfig::from_env().home.join("desktop-review-drafts.json");
-        let cache = std::fs::read(&path).ok().and_then(|data| serde_json::from_slice::<Value>(&data).ok()).map(|v| DraftCache::decode(&v)).unwrap_or_default();
-        cx.set_global(Reviews { windows: HashMap::new(), drafts: std::rc::Rc::new(std::cell::RefCell::new(cache)), drafts_path: Some(path), pending: None });
+        let path = threadbear_client::config::RunnerConfig::from_env()
+            .home
+            .join("desktop-review-drafts.json");
+        let cache = std::fs::read(&path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<Value>(&data).ok())
+            .map(|v| DraftCache::decode(&v))
+            .unwrap_or_default();
+        cx.set_global(Reviews {
+            windows: HashMap::new(),
+            drafts: std::rc::Rc::new(std::cell::RefCell::new(cache)),
+            drafts_path: Some(path),
+            pending: None,
+        });
     }
     cx.global_mut::<Reviews>()
 }
@@ -87,7 +103,9 @@ fn write_drafts(cx: &mut App) {
     if !reviews.drafts.borrow_mut().take_changed() {
         return;
     }
-    let Some(path) = reviews.drafts_path.clone() else { return };
+    let Some(path) = reviews.drafts_path.clone() else {
+        return;
+    };
     let cache = reviews.drafts.borrow();
     let result = if cache.is_empty() {
         match std::fs::remove_file(&path) {
@@ -96,7 +114,10 @@ fn write_drafts(cx: &mut App) {
         }
     } else {
         // Only this user's, the temp file too (`private_file`).
-        threadbear_core::private_file::write(&path, &serde_json::to_vec(&cache.encode()).unwrap_or_default())
+        threadbear_core::private_file::write(
+            &path,
+            &serde_json::to_vec(&cache.encode()).unwrap_or_default(),
+        )
     };
     if let Err(e) = result {
         eprintln!("threadbear: couldn't save the review drafts: {e}");
@@ -111,11 +132,19 @@ pub(crate) fn receive_event(params: &Value, cx: &mut App) {
     if event["type"].as_str() != Some("review.updated") {
         return;
     }
-    let (Some(thread_id), Some(review)) = (params["threadId"].as_str(), DesignReview::decode(&event["review"])) else { return };
+    let (Some(thread_id), Some(review)) = (
+        params["threadId"].as_str(),
+        DesignReview::decode(&event["review"]),
+    ) else {
+        return;
+    };
     if !cx.has_global::<Reviews>() {
         return;
     }
-    let open = reviews(cx).windows.get(&window_key(thread_id, &review.id)).map(|(_, view)| view.clone());
+    let open = reviews(cx)
+        .windows
+        .get(&window_key(thread_id, &review.id))
+        .map(|(_, view)| view.clone());
     if let Some(view) = open {
         view.update(cx, |v, cx| v.receive(review, cx));
     }
@@ -125,11 +154,20 @@ pub(crate) fn receive_event(params: &Value, cx: &mut App) {
 /// it updates itself several times a day and is gone a few seconds each time,
 /// which isn't worth an error or a second press of Send. Trying again is safe:
 /// an identical answer to a review already answered returns the first one.
-async fn riding_out(client: Arc<Client>, method: &'static str, params: Value, cx: &mut AsyncApp) -> Result<Value, RpcError> {
+async fn riding_out(
+    client: Arc<Client>,
+    method: &'static str,
+    params: Value,
+    cx: &mut AsyncApp,
+) -> Result<Value, RpcError> {
     let deadline = Instant::now() + Duration::from_millis(rules::RECONNECT_WAIT_MS);
     loop {
         match call(client.clone(), method, params.clone()).await {
-            Err(e) if rules::runner_away(e.code) && Instant::now() < deadline => cx.background_executor().timer(Duration::from_millis(250)).await,
+            Err(e) if rules::runner_away(e.code) && Instant::now() < deadline => {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await
+            }
             other => return other,
         }
     }
@@ -147,21 +185,53 @@ fn scripted() -> bool {
 /// Bound once, for every review window.
 fn bind_keys(cx: &mut App) {
     static BOUND: std::sync::Once = std::sync::Once::new();
-    let chord = if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" };
+    let chord = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
     BOUND.call_once(|| cx.bind_keys([KeyBinding::new(chord, Paste, Some("ReviewWindow"))]));
 }
 
 impl Threadbear {
-    /// `openReview`: the review in a window of its own, most of the screen
-    /// (Mike, 30 Oct: beside the thread as a tab the images were too small to
-    /// compare), or the one already open on it brought forward with this copy.
-    pub(crate) fn open_review(&mut self, thread_id: &str, review: DesignReview, window: &mut Window, cx: &mut Context<Self>) {
+    /// `openReview`: the review's card, a `review:` link, or the bar over a
+    /// thread with reviews waiting.
+    pub(crate) fn open_review(
+        &mut self,
+        thread_id: &str,
+        review: DesignReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_review_window(thread_id, review, None, window, cx);
+    }
+
+    /// The review in a window of its own, most of the screen (Mike, 30 Oct:
+    /// beside the thread as a tab the images were too small to compare), or
+    /// the one already open on it brought forward with this copy. `at`: the
+    /// option and shot to open on, for a picture clicked on the review's
+    /// card.
+    pub(crate) fn open_review_window(
+        &mut self,
+        thread_id: &str,
+        review: DesignReview,
+        at: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Another Mac's review: its pictures and pages are files on that Mac,
         // read here they'd be whatever this Mac has at those paths, and its
         // answers would go to this Mac's runner, which hasn't got it.
-        if let Some(runner) = self.threads.get(thread_id).and_then(|t| t.runner_id.clone()) {
+        if let Some(runner) = self
+            .threads
+            .get(thread_id)
+            .and_then(|t| t.runner_id.clone())
+        {
             let name = self.runner_name_of(&runner);
-            self.show_error(format!("This review is on {name}. Open it there for now."), cx);
+            self.show_error(
+                format!("This review is on {name}. Open it there for now."),
+                cx,
+            );
             return;
         }
         let key = window_key(thread_id, &review.id);
@@ -169,7 +239,12 @@ impl Threadbear {
             let fresh = review.clone();
             let alive = handle
                 .update(cx, |_, window, cx| {
-                    view.update(cx, |v, cx| v.receive(fresh, cx));
+                    view.update(cx, |v, cx| {
+                        v.receive(fresh, cx);
+                        if let Some((option, shot)) = at {
+                            v.enlarge(option, shot, cx);
+                        }
+                    });
                     if !scripted() {
                         window.activate_window();
                     }
@@ -182,14 +257,26 @@ impl Threadbear {
         }
         // On the screen Threadbear's in, not wherever the pointer is.
         let display = window.display(cx);
-        let visible = display.as_ref().map(|d| d.visible_bounds()).unwrap_or(Bounds { origin: point(gpui_kit::px(0.), gpui_kit::px(0.)), size: size(gpui_kit::px(1240. / 0.9), gpui_kit::px(860. / 0.9)) });
+        let visible = display
+            .as_ref()
+            .map(|d| d.visible_bounds())
+            .unwrap_or(Bounds {
+                origin: point(gpui_kit::px(0.), gpui_kit::px(0.)),
+                size: size(gpui_kit::px(1240. / 0.9), gpui_kit::px(860. / 0.9)),
+            });
         let frame = rules::window_frame(threadbear_core::zoom::Rect {
             x: f64::from(visible.origin.x),
             y: f64::from(visible.origin.y),
             width: f64::from(visible.size.width),
             height: f64::from(visible.size.height),
         });
-        let bounds = Bounds { origin: point(gpui_kit::px(frame.x as f32), gpui_kit::px(frame.y as f32)), size: size(gpui_kit::px(frame.width as f32), gpui_kit::px(frame.height as f32)) };
+        let bounds = Bounds {
+            origin: point(gpui_kit::px(frame.x as f32), gpui_kit::px(frame.y as f32)),
+            size: size(
+                gpui_kit::px(frame.width as f32),
+                gpui_kit::px(frame.height as f32),
+            ),
+        };
         let thread = self.threads.get(thread_id).cloned();
         let parts = Parts {
             app: cx.entity().downgrade(),
@@ -209,22 +296,39 @@ impl Threadbear {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     // The window's own strip is its title bar, with the
                     // buttons up in it as the Swift window has them.
-                    titlebar: Some(TitlebarOptions { title: Some(title), appears_transparent: true, traffic_light_position: Some(point(gpui_kit::px(9.), gpui_kit::px(9.))) }),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(title),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(gpui_kit::px(9.), gpui_kit::px(9.))),
+                    }),
                     app_owns_titlebar_drag: true,
                     focus: !scripted(),
                     display_id: display.map(|d| d.id()),
-                    window_min_size: Some(size(gpui_kit::px(rules::REVIEW_WINDOW_LEAST.0 as f32), gpui_kit::px(rules::REVIEW_WINDOW_LEAST.1 as f32))),
+                    window_min_size: Some(size(
+                        gpui_kit::px(rules::REVIEW_WINDOW_LEAST.0 as f32),
+                        gpui_kit::px(rules::REVIEW_WINDOW_LEAST.1 as f32),
+                    )),
                     app_id: Some("threadbear".into()),
                     ..Default::default()
                 },
                 cx,
-                move |window, cx| cx.new(|cx| ReviewWindow::new(parts, review, window, cx)),
+                move |window, cx| {
+                    cx.new(|cx| {
+                        let mut opened = ReviewWindow::new(parts, review, window, cx);
+                        if let Some((option, shot)) = at {
+                            opened.enlarge(option, shot, cx);
+                        }
+                        opened
+                    })
+                },
             );
             match opened {
                 Ok((handle, view)) => {
                     reviews(cx).windows.insert(key, (handle, view));
                 }
-                Err(e) => app.update(cx, |app, cx| app.show_error(format!("The review didn't open: {e}"), cx)),
+                Err(e) => app.update(cx, |app, cx| {
+                    app.show_error(format!("The review didn't open: {e}"), cx)
+                }),
             }
         });
     }
@@ -234,24 +338,55 @@ impl crate::thread::ThreadPane {
     /// The review card's button (rows/cards.rs). Once this update is over,
     /// as a link can be followed from inside the app's own update (an ask's
     /// link, a script's `link`), when the app can't be updated again.
-    pub(crate) fn open_review(&mut self, review: DesignReview, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(app) = self.composer.read(cx).app.upgrade() else { return };
+    pub(crate) fn open_review(
+        &mut self,
+        review: DesignReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_review_at(review, None, window, cx);
+    }
+
+    /// The same on one option, for its picture on the card.
+    pub(crate) fn open_review_at(
+        &mut self,
+        review: DesignReview,
+        option: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(app) = self.composer.read(cx).app.upgrade() else {
+            return;
+        };
         let id = self.summary.id.clone();
-        window.defer(cx, move |window, cx| app.update(cx, |t, cx| t.open_review(&id, review, window, cx)));
+        window.defer(cx, move |window, cx| {
+            app.update(cx, |t, cx| {
+                t.open_review_window(&id, review, option.map(|o| (o, 0)), window, cx)
+            })
+        });
     }
 
     /// A `review:` link in a reply or on an ask (`openReviewLink`): the
     /// thread's review with that id, or the only one it's the start of. One
     /// that isn't among the loaded rows says so, rather than the Swift app's
     /// beep, which left Mike wondering what happened.
-    pub(crate) fn open_review_link(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = rules::link_review_id(rest) else { return };
+    pub(crate) fn open_review_link(
+        &mut self,
+        rest: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = rules::link_review_id(rest) else {
+            return;
+        };
         match rules::find_review(&id, self.feed.model().rows()).cloned() {
             Some(review) => self.open_review(review, window, cx),
             None => {
                 if let Some(app) = self.composer.read(cx).app.upgrade() {
                     let said = format!("That review isn't in this thread's loaded messages ({id}). Its card further up opens it, or Review design options over the thread.");
-                    window.defer(cx, move |_, cx| app.update(cx, |t, cx| t.show_error(said, cx)));
+                    window.defer(cx, move |_, cx| {
+                        app.update(cx, |t, cx| t.show_error(said, cx))
+                    });
                 }
             }
         }
@@ -284,6 +419,18 @@ pub(crate) struct ReviewWindow {
     /// The draft last put in the box. A render can run before the box's
     /// Change event, so compare drafts before replacing text being edited.
     reply_synced: String,
+    /// The pictures in the reply box (reply_pictures.rs).
+    reply_pictures: reply_pictures::ReplyPictures,
+    /// A picture that couldn't be read, to take out of the box at the next draw.
+    pending_chip_removal: Vec<SharedString>,
+    /// A picture came in: the draft takes the box at the next draw.
+    reply_changed: bool,
+    /// How many pictures the draft had when the box and it last agreed, as
+    /// `reply_synced` is its words: a change to it is from elsewhere.
+    pictures_synced: usize,
+    /// The picture viewer over this window: a click on a picture's chip in
+    /// the reply opens it full size (viewer.rs), as one in the thread's box does.
+    viewer: crate::viewer::ViewerState,
     /// Holds the keys when the reply box hasn't got them: the arrows step,
     /// Space flicks to today's version, Return and Esc go in and out.
     focus: FocusHandle,
@@ -296,30 +443,43 @@ pub(crate) struct ReviewWindow {
     pub(crate) stage: stage::StageState,
     /// The ... menu in the title bar is open.
     more_open: bool,
-    rail_scroll: ScrollHandle,
-    /// The option the rail last scrolled to, so it follows the stage.
-    rail_follows: Option<usize>,
+    tabs_scroll: ScrollHandle,
+    /// The option whose tab was last scrolled to, so the tabs follow the stage.
+    tabs_follow: Option<usize>,
     closed: bool,
     _poll: Task<()>,
     _subs: Vec<Subscription>,
 }
 
 impl ReviewWindow {
-    fn new(parts: Parts, review: DesignReview, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        parts: Parts,
+        review: DesignReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let session = ReviewSession::new(&parts.thread_id, review, parts.cache);
         let typed = session.draft().reply.clone().unwrap_or_default();
-        let reply = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a reply").auto_grow(1, 13).default_value(typed.clone()));
-        let mut subs = vec![cx.subscribe_in(&reply, window, |this, state, ev: &InputEvent, _, cx| match ev {
-            InputEvent::Change => {
-                let text = state.read(cx).value().to_string();
-                this.reply_synced = text.clone();
-                if this.session.set_reply(&text) {
-                    this.edited(cx);
-                }
-            }
-            InputEvent::Focus | InputEvent::Blur => cx.notify(),
-            _ => {}
-        })];
+        // Its pictures as chips where their markers are.
+        let mut reply_pictures = reply_pictures::ReplyPictures::default();
+        let content = reply_pictures.content_for(&typed, &session.draft().images);
+        let session_pictures = session.draft().images.len();
+        let reply = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx)
+                .placeholder("Add a reply")
+                .auto_grow(1, 8);
+            state.set_value(content, window, cx);
+            state
+        });
+        let mut subs = vec![cx.subscribe_in(
+            &reply,
+            window,
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Change => this.reply_to_draft(window, cx),
+                InputEvent::Focus | InputEvent::Blur => cx.notify(),
+                _ => {}
+            },
+        )];
         // In front, the app is: the main window's thread still reads as Mike
         // looks at it, as with Settings (`Threadbear::looking_changed`).
         let looking_app = parts.app.clone();
@@ -355,7 +515,9 @@ impl ReviewWindow {
             if !matches!(waiting, Ok(true)) {
                 return;
             }
-            cx.background_executor().timer(Duration::from_millis(rules::REFRESH_EVERY_MS)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(rules::REFRESH_EVERY_MS))
+                .await;
         });
         ReviewWindow {
             app: parts.app,
@@ -366,14 +528,19 @@ impl ReviewWindow {
             cwd: parts.cwd,
             reply,
             reply_synced: typed,
+            reply_pictures,
+            pending_chip_removal: Vec::new(),
+            reply_changed: false,
+            pictures_synced: session_pictures,
+            viewer: crate::viewer::ViewerState::new(cx),
             focus,
             save_timer: None,
             call_task: None,
             save_task: None,
             stage: stage::StageState::default(),
             more_open: false,
-            rail_scroll: ScrollHandle::new(),
-            rail_follows: None,
+            tabs_scroll: ScrollHandle::new(),
+            tabs_follow: None,
             closed: false,
             _poll: poll,
             _subs: subs,
@@ -381,7 +548,10 @@ impl ReviewWindow {
     }
 
     fn ids(&self) -> (String, String) {
-        (self.session.thread_id.clone(), self.session.review().id.clone())
+        (
+            self.session.thread_id.clone(),
+            self.session.review().id.clone(),
+        )
     }
 
     // ------------------------------------------------------------ the draft
@@ -392,7 +562,9 @@ impl ReviewWindow {
         write_drafts(cx);
         if self.session.autosaves() {
             self.save_timer = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_millis(rules::SAVE_AFTER_MS)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(rules::SAVE_AFTER_MS))
+                    .await;
                 this.update(cx, |this, cx| this.save_now(cx)).ok();
             }));
         }
@@ -422,13 +594,30 @@ impl ReviewWindow {
     /// The box shows the draft's reply when something other than typing
     /// changed it: the runner's copy from another window, or an answer.
     fn sync_reply_box(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let wanted = self.session.shown_draft().reply.clone().unwrap_or_default();
-        // A changed runner draft or answer still wins over an unreported local edit.
-        if self.reply_synced != wanted {
-            if self.reply.read(cx).value().as_ref() != wanted.as_str() {
-                self.reply.update(cx, |s, cx| s.set_value(wanted.clone(), window, cx));
+        let shown = self.session.shown_draft();
+        let wanted = shown.reply.clone().unwrap_or_default();
+        let images = shown.images.clone();
+        // A changed runner draft or answer still wins over an unreported local
+        // edit; a picture added or taken away elsewhere with the same words (a
+        // reply of pictures alone) does too.
+        // Against what was last agreed, not the box now, which a chip being
+        // typed over (IME composing) has already lost (Codex's review).
+        let pictures_changed = self.pictures_synced != images.len();
+        if self.reply_synced != wanted || pictures_changed {
+            let same = self
+                .reply_pictures
+                .draft_of(self.reply.read(cx))
+                .is_some_and(|(reply, now)| reply == wanted && now == images);
+            if !same {
+                let content = self.reply_pictures.content_for(&wanted, &images);
+                self.reply
+                    .update(cx, |s, cx| s.set_value(content, window, cx));
             }
             self.reply_synced = wanted;
+            self.pictures_synced = images.len();
+        } else {
+            // A save's answer names the runner's own copies of the same pictures.
+            self.reply_pictures.adopt(self.reply.read(cx), &images);
         }
         let editable = self.session.editable();
         self.reply.update(cx, |s, cx| s.set_disabled(!editable, cx));
@@ -436,7 +625,9 @@ impl ReviewWindow {
 
     /// `saveNow`: what's here to the runner, if a save is due.
     pub(crate) fn save_now(&mut self, cx: &mut Context<Self>) {
-        let Some(sent) = self.session.begin_save() else { return };
+        let Some(sent) = self.session.begin_save() else {
+            return;
+        };
         self.save_timer = None;
         let (thread_id, review_id) = self.ids();
         let client = self.client.clone();
@@ -486,7 +677,12 @@ impl ReviewWindow {
         let (thread_id, review_id) = self.ids();
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let res = call(client, "reviews.get", json!({ "threadId": thread_id, "reviewId": review_id })).await;
+            let res = call(
+                client,
+                "reviews.get",
+                json!({ "threadId": thread_id, "reviewId": review_id }),
+            )
+            .await;
             this.update(cx, |this, cx| {
                 match res {
                     Ok(v) => {
@@ -516,7 +712,8 @@ impl ReviewWindow {
     /// sent the window gets out of the way (Mike, 28 Oct). A failed send stays
     /// open with its error and the draft kept.
     pub(crate) fn submit(&mut self, cx: &mut Context<Self>) {
-        if !self.session.begin_submit() {
+        // A picture still on its way in would be left out.
+        if self.reply_loading(cx) || !self.session.begin_submit() {
             return;
         }
         self.save_timer = None;
@@ -576,15 +773,30 @@ impl ReviewWindow {
         let client = self.client.clone();
         cx.notify();
         self.call_task = Some(cx.spawn(async move |this, cx| {
-            while this.read_with(cx, |this, _| this.session.saving()).unwrap_or(false) {
-                cx.background_executor().timer(Duration::from_millis(10)).await;
+            while this
+                .read_with(cx, |this, _| this.session.saving())
+                .unwrap_or(false)
+            {
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
             }
-            let Ok(revision) = this.read_with(cx, |this, _| this.session.cancel_revision()) else { return };
-            let res = riding_out(client, "reviews.cancel", json!({ "threadId": thread_id, "reviewId": review_id, "revision": revision }), cx).await;
+            let Ok(revision) = this.read_with(cx, |this, _| this.session.cancel_revision()) else {
+                return;
+            };
+            let res = riding_out(
+                client,
+                "reviews.cancel",
+                json!({ "threadId": thread_id, "reviewId": review_id, "revision": revision }),
+                cx,
+            )
+            .await;
             this.update(cx, |this, cx| {
                 match res.map(|v| DesignReview::decode(&v["review"])) {
                     Ok(Some(cancelled)) => this.session.cancel_done(cancelled),
-                    Ok(None) => this.session.cancel_failed("The runner's answer didn't make sense."),
+                    Ok(None) => this
+                        .session
+                        .cancel_failed("The runner's answer didn't make sense."),
                     Err(e) => this.session.cancel_failed(&e.message),
                 }
                 write_drafts(cx);
@@ -597,8 +809,17 @@ impl ReviewWindow {
     /// Asks first, as the Swift window's confirmation does.
     fn confirm_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.more_open = false;
-        let answers = [PromptButton::cancel("Keep it"), PromptButton::new("Cancel review")];
-        let answer = window.prompt(PromptLevel::Warning, "Cancel this review?", Some("The agent won\u{2019}t get a reply. You can still look at the images."), &answers, cx);
+        let answers = [
+            PromptButton::cancel("Keep it"),
+            PromptButton::new("Cancel review"),
+        ];
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Cancel this review?",
+            Some("The agent won\u{2019}t get a reply. You can still look at the images."),
+            &answers,
+            cx,
+        );
         cx.spawn(async move |this, cx| {
             if let Ok(1) = answer.await {
                 this.update(cx, |this, cx| this.cancel_review(cx)).ok();
@@ -626,7 +847,9 @@ impl ReviewWindow {
         let keep = cx.entity();
         cx.spawn(async move |_, cx| {
             while keep.read_with(cx, |this, _| this.session.saving()) {
-                cx.background_executor().timer(Duration::from_millis(50)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
             }
             drop(keep);
         })
@@ -650,7 +873,9 @@ impl ReviewWindow {
     /// Show the thread this came from: picked in the main window, which comes
     /// to the front.
     fn show_thread(&mut self, cx: &mut Context<Self>) {
-        let (Some(app), id) = (self.app.upgrade(), self.session.thread_id.clone()) else { return };
+        let (Some(app), id) = (self.app.upgrade(), self.session.thread_id.clone()) else {
+            return;
+        };
         let main = self.main;
         cx.defer(move |cx| {
             main.update(cx, |_, window, cx| {
@@ -788,18 +1013,21 @@ impl ReviewWindow {
         if !self.session.editable() || self.reply_focused(window, cx) {
             return;
         }
-        let Some(words) = cx.read_from_clipboard().and_then(|c| c.text()).filter(|w| !w.is_empty()) else { return };
+        let clipboard = cx.read_from_clipboard();
         let handle = self.reply.read(cx).focus_handle(cx);
+        // A picture goes in as its chip, as it would pasted in the box.
+        if self.take_reply_clipboard(clipboard.as_ref(), window, cx) {
+            return;
+        }
+        let Some(words) = clipboard.and_then(|c| c.text()).filter(|w| !w.is_empty()) else {
+            return;
+        };
         window.focus(&handle, cx);
         crate::web_panels::keyboard_to_app(window);
         // Replace its selection, or insert at its cursor, as its own Paste does.
         self.reply.update(cx, |s, cx| s.replace(words, window, cx));
         // Save and Send must see the paste before the box's Change arrives.
-        let text = self.reply.read(cx).value().to_string();
-        self.reply_synced = text.clone();
-        if self.session.set_reply(&text) {
-            self.edited(cx);
-        }
+        self.reply_to_draft(window, cx);
     }
 
     fn reply_focused(&self, window: &Window, cx: &App) -> bool {
@@ -820,28 +1048,72 @@ impl ReviewWindow {
     fn render_titlebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let active = window.is_window_active();
         let secondary = style::secondary_text(cx);
-        let title_color = if active { style::label_text(cx) } else { secondary };
+        let title_color = if active {
+            style::label_text(cx)
+        } else {
+            secondary
+        };
         let single = self.session.mode == ReviewMode::Single;
-        let mut buttons = h_flex().flex_none().gap(gpui_kit::px(4.)).pr(gpui_kit::px(10.)).items_center();
+        let mut buttons = h_flex()
+            .flex_none()
+            .gap(gpui_kit::px(4.))
+            .pr(gpui_kit::px(10.))
+            .items_center();
         if single {
-            buttons = buttons.child(titlebar_button("review-see-all", Icon::new(IconName::LayoutGrid), "See them all (Esc)", secondary, cx.listener(|this, _: &ClickEvent, _, cx| this.show_all(cx))));
+            buttons = buttons.child(titlebar_button(
+                "review-see-all",
+                Icon::new(IconName::LayoutGrid),
+                "See them all (Esc)",
+                secondary,
+                cx.listener(|this, _: &ClickEvent, _, cx| this.show_all(cx)),
+            ));
             // A video or a page has its own ways of moving round; zoom is for pictures.
             if self.session.shown_shot().is_some_and(|s| s.media.is_none()) {
                 let zoomed = self.session.zoomed;
                 let (icon, tip) = if zoomed {
                     (IconName::ZoomOut, "Fit the image in its space (\u{2318}0)")
                 } else {
-                    (IconName::ZoomIn, "Show at full size. Scroll or pinch to zoom, drag to move around")
+                    (
+                        IconName::ZoomIn,
+                        "Show at full size. Scroll or pinch to zoom, drag to move around",
+                    )
                 };
-                buttons = buttons.child(titlebar_button("review-zoom", Icon::new(icon), tip, secondary, cx.listener(move |this, _: &ClickEvent, _, cx| this.zoom(if zoomed { ZoomStep::Fit } else { ZoomStep::Actual }, cx))));
+                buttons = buttons.child(titlebar_button(
+                    "review-zoom",
+                    Icon::new(icon),
+                    tip,
+                    secondary,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.zoom(
+                            if zoomed {
+                                ZoomStep::Fit
+                            } else {
+                                ZoomStep::Actual
+                            },
+                            cx,
+                        )
+                    }),
+                ));
             }
         }
-        buttons = buttons.child(titlebar_button("review-back", Icon::new(IconName::ArrowUpLeft), "Show the thread this came from", secondary, cx.listener(|this, _: &ClickEvent, _, cx| this.show_thread(cx))));
+        buttons = buttons.child(titlebar_button(
+            "review-back",
+            Icon::new(IconName::ArrowUpLeft),
+            "Show the thread this came from",
+            secondary,
+            cx.listener(|this, _: &ClickEvent, _, cx| this.show_thread(cx)),
+        ));
         if self.session.review().is_pending() {
-            buttons = buttons.child(titlebar_button("review-more", Icon::new(IconName::Ellipsis), "More", secondary, cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.more_open = !this.more_open;
-                cx.notify();
-            })));
+            buttons = buttons.child(titlebar_button(
+                "review-more",
+                Icon::new(IconName::Ellipsis),
+                "More",
+                secondary,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.more_open = !this.more_open;
+                    cx.notify();
+                }),
+            ));
         }
         h_flex()
             .id("review-titlebar")
@@ -860,9 +1132,20 @@ impl ReviewWindow {
                 }
             })
             .child(div().flex_none().w(gpui_kit::px(TITLE_X)))
-            .child(div().flex_1().min_w_0().truncate().text_size(gpui_kit::px(13.)).font_weight(FontWeight::BOLD).text_color(title_color).child(self.session.review().title.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(gpui_kit::px(13.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(title_color)
+                    .child(self.session.review().title.clone()),
+            )
             .child(buttons)
-            .when(self.more_open, |s| s.child(self.render_more_menu(window, cx)))
+            .when(self.more_open, |s| {
+                s.child(self.render_more_menu(window, cx))
+            })
             .into_any_element()
     }
 
@@ -872,7 +1155,10 @@ impl ReviewWindow {
         let hover = style::hover_fill(cx);
         let red = style::failed(cx);
         // Under the ... button, its right edge on the window's 10 in.
-        let at = point(window.viewport_size().width - gpui_kit::px(10.), gpui_kit::px(TITLEBAR_HEIGHT - 2.));
+        let at = point(
+            window.viewport_size().width - gpui_kit::px(10.),
+            gpui_kit::px(TITLEBAR_HEIGHT - 2.),
+        );
         deferred(
             anchored().anchor(Anchor::TopRight).position(at).child(
                 div().child(
@@ -890,10 +1176,32 @@ impl ReviewWindow {
                             cx.notify();
                         }))
                         .child(
-                            crate::highlights::tipped(h_flex().id("review-cancel").gap(gpui_kit::px(7.)).px(gpui_kit::px(9.)).h(gpui_kit::px(24.)).items_center().rounded(gpui_kit::px(5.)).cursor_pointer().hover(move |s| s.bg(hover)), "Close the review without a reply to the agent")
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.confirm_cancel(window, cx)))
-                                .child(Icon::new(IconName::CircleX).with_size(gpui_kit::px(13.)).text_color(red))
-                                .child(div().text_size(gpui_kit::px(13.)).text_color(red).child("Cancel review")),
+                            crate::highlights::tipped(
+                                h_flex()
+                                    .id("review-cancel")
+                                    .gap(gpui_kit::px(7.))
+                                    .px(gpui_kit::px(9.))
+                                    .h(gpui_kit::px(24.))
+                                    .items_center()
+                                    .rounded(gpui_kit::px(5.))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(hover)),
+                                "Close the review without a reply to the agent",
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.confirm_cancel(window, cx)
+                            }))
+                            .child(
+                                Icon::new(IconName::CircleX)
+                                    .with_size(gpui_kit::px(13.))
+                                    .text_color(red),
+                            )
+                            .child(
+                                div()
+                                    .text_size(gpui_kit::px(13.))
+                                    .text_color(red)
+                                    .child("Cancel review"),
+                            ),
                         ),
                 ),
             ),
@@ -908,9 +1216,19 @@ impl ReviewWindow {
         let pending = self.session.review().is_pending();
         let saving = self.session.saving();
         let button = if self.session.conflict() && pending {
-            Some(("review-keep-mine", "Save my draft", "Keep what you have here, over the copy that changed elsewhere", true))
+            Some((
+                "review-keep-mine",
+                "Save my draft",
+                "Keep what you have here, over the copy that changed elsewhere",
+                true,
+            ))
         } else if pending {
-            Some(("review-save-again", "Try saving again", "Save the draft to the runner again", false))
+            Some((
+                "review-save-again",
+                "Try saving again",
+                "Save the draft to the runner again",
+                false,
+            ))
         } else {
             None
         };
@@ -920,15 +1238,26 @@ impl ReviewWindow {
             .gap(px(8.))
             .items_center()
             .bg(style::needs_you(cx).opacity(0.1))
-            .child(div().flex_1().min_w_0().text_size(px(style::size::DETAIL)).line_height(px(style::natural_line(style::size::DETAIL))).child(error))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(style::size::DETAIL))
+                    .line_height(px(style::natural_line(style::size::DETAIL)))
+                    .child(error),
+            )
             .when_some(button, |s, (id, title, tip, mine)| {
-                s.child(plain_button(id, title, tip, saving, cx).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    if mine {
-                        this.keep_my_draft(cx);
-                    } else {
-                        this.save_now(cx);
-                    }
-                })))
+                s.child(
+                    plain_button(id, title, tip, saving, cx).on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            if mine {
+                                this.keep_my_draft(cx);
+                            } else {
+                                this.save_now(cx);
+                            }
+                        },
+                    )),
+                )
             })
             .into_any_element()
     }
@@ -941,25 +1270,56 @@ impl ReviewWindow {
             .items_center()
             .justify_center()
             .gap(px(10.))
-            .child(Icon::new(IconName::Image).with_size(px(36.)).text_color(secondary))
-            .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child("No images to compare"))
+            .child(
+                Icon::new(IconName::Image)
+                    .with_size(px(36.))
+                    .text_color(secondary),
+            )
+            .child(
+                div()
+                    .text_size(px(17.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("No images to compare"),
+            )
             .into_any_element()
     }
 }
 
 /// One of the title bar's buttons: a grey symbol in a 26 by 24 frame.
-fn titlebar_button(id: &'static str, icon: Icon, tip: &'static str, color: Hsla, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> AnyElement {
-    crate::highlights::tipped(div().id(id).w(gpui_kit::px(26.)).h(gpui_kit::px(24.)).flex().items_center().justify_center().cursor_pointer(), tip)
-        // Not the strip's window move.
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(on_click)
-        .child(icon.with_size(gpui_kit::px(15.)).text_color(color))
-        .into_any_element()
+fn titlebar_button(
+    id: &'static str,
+    icon: Icon,
+    tip: &'static str,
+    color: Hsla,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    crate::highlights::tipped(
+        div()
+            .id(id)
+            .w(gpui_kit::px(26.))
+            .h(gpui_kit::px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer(),
+        tip,
+    )
+    // Not the strip's window move.
+    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    .on_click(on_click)
+    .child(icon.with_size(gpui_kit::px(15.)).text_color(color))
+    .into_any_element()
 }
 
 /// A standard push button (`Button` with no style): a rounded fill, and a
 /// spinner while what it started is on its way, when it takes no clicks.
-pub(crate) fn plain_button(id: &'static str, title: &str, tip: &'static str, busy: bool, cx: &App) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
+pub(crate) fn plain_button(
+    id: &'static str,
+    title: &str,
+    tip: &'static str,
+    busy: bool,
+    cx: &App,
+) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
     let secondary = style::secondary_text(cx);
     let fill = style::primary_opacity(cx, 0.1);
     crate::highlights::tipped(
@@ -974,42 +1334,82 @@ pub(crate) fn plain_button(id: &'static str, title: &str, tip: &'static str, bus
             .bg(fill)
             .text_size(px(style::size::LABEL))
             .when(!busy, |s| s.cursor_pointer())
-            .when(busy, |s| s.opacity(0.6).child(Spinner::new().color(secondary).with_size(px(11.)))),
+            .when(busy, |s| {
+                s.opacity(0.6)
+                    .child(Spinner::new().color(secondary).with_size(px(11.)))
+            }),
         tip,
     )
     .child(title.to_owned())
+}
+
+impl crate::viewer::HostsViewer for ReviewWindow {
+    fn viewer_state(&mut self) -> &mut crate::viewer::ViewerState {
+        &mut self.viewer
+    }
+    fn viewer_client(&self) -> Arc<Client> {
+        self.client.clone()
+    }
 }
 
 impl Render for ReviewWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // First, as it counts the frame the stage's clips are drawn in
         // (media_view.rs); they hide while the title bar's menu is up.
-        let clips = crate::media_view::sweeper(window, crate::media_view::Cover { everything: self.more_open, menus: Vec::new() });
+        // A clip on the stage is a view of its own over the window, so it
+        // hides under the picture viewer as it does under the menu.
+        let viewing = self.viewer.is_open();
+        let clips = crate::media_view::sweeper(
+            window,
+            crate::media_view::Cover {
+                everything: self.more_open || viewing,
+                menus: Vec::new(),
+            },
+        );
+        if std::mem::take(&mut self.reply_changed) {
+            self.reply_to_draft(window, cx);
+        }
         self.sync_reply_box(window, cx);
         // A page's view goes once its shot isn't the one on show.
-        let page_shown = self.session.mode == ReviewMode::Single && self.session.shown_shot().is_some_and(|s| s.page().is_some());
+        let page_shown = self.session.mode == ReviewMode::Single
+            && self
+                .session
+                .shown_shot()
+                .is_some_and(|s| s.page().is_some());
         if !page_shown {
             self.stage.page = None;
         }
-        // The rail keeps the option on show in view as the stage moves.
-        if self.session.mode == ReviewMode::Single && self.rail_follows != Some(self.session.focused()) {
-            self.rail_follows = Some(self.session.focused());
-            let first = usize::from(self.session.review().note.as_deref().is_some_and(|n| !n.is_empty()));
-            self.rail_scroll.scroll_to_item(first + self.session.focused());
+        // The tab of the option on show stays in view as the stage moves:
+        // the first of them is the one for all of them.
+        if self.session.mode == ReviewMode::Single
+            && self.tabs_follow != Some(self.session.focused())
+        {
+            self.tabs_follow = Some(self.session.focused());
+            self.tabs_scroll.scroll_to_item(1 + self.session.focused());
         } else if self.session.mode == ReviewMode::All {
-            self.rail_follows = None;
+            self.tabs_follow = None;
         }
         let error = self.session.error.clone();
+        // The stage across the whole window and the words under it: a wide
+        // mockup is as tall as the window lets it be, so a column beside it
+        // took a quarter of its size and left room over and under (Mike
+        // picked this over the column and an all-at-once board, 21 Nov).
         let body = if self.session.review().options.is_empty() {
             self.render_empty(cx)
         } else {
-            h_flex()
+            v_flex()
                 .flex_1()
                 .min_h_0()
                 .w_full()
                 .child(self.render_stage(window, cx))
-                .child(div().flex_none().w(gpui_kit::px(1.)).h_full().bg(style::hairline(cx)))
-                .child(self.render_rail(window, cx))
+                .child(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .h(gpui_kit::px(1.))
+                        .bg(style::hairline(cx)),
+                )
+                .child(self.render_band(window, cx))
                 .into_any_element()
         };
         let titlebar = self.render_titlebar(window, cx);
@@ -1054,12 +1454,18 @@ impl Render for ReviewWindow {
             .on_action(|_: &crate::shell::MinimizeWindow, window, _| window.minimize_window())
             // A drag that started on the stage follows the pointer anywhere
             // in the window.
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| this.stage_dragged(ev, window, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| this.stage_released(cx)))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                this.stage_dragged(ev, window, cx)
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.stage_released(cx)),
+            )
             .child(titlebar)
             .when_some(error, |s, e| s.child(self.render_error_bar(e, cx)))
             .child(body)
             .child(clips)
+            .children(crate::viewer::overlay(self, window, cx))
     }
 }
 
@@ -1069,19 +1475,44 @@ impl Threadbear {
     /// `PendingReviewsButton`: a review can be older than the loaded page of
     /// the transcript, so the runner's list keeps it one click away without
     /// scrolling back through earlier turns.
-    pub(crate) fn pending_reviews_bar(&mut self, thread: &threadbear_core::inbox::ThreadSummary, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn pending_reviews_bar(
+        &mut self,
+        thread: &threadbear_core::inbox::ThreadSummary,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let count = thread.pending_reviews.unwrap_or(0);
         if count == 0 {
             return None;
         }
         let secondary = style::secondary_text(cx);
         let id = thread.id.clone();
-        let open = reviews(cx).pending.as_ref().is_some_and(|p| p.thread_id == id);
-        let button = crate::highlights::tipped(h_flex().id("pending-reviews").relative().gap(px(6.)).items_center().cursor_pointer(), "Compare the images the agent made side by side, and reply")
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_pending_reviews(&id, cx)))
-            .child(Icon::new(IconName::Images).with_size(px(13.)).text_color(secondary))
-            .child(div().text_color(secondary).child(rules::pending_button_title(count)))
-            .when(open, |s| s.child(self.render_pending_list(cx)));
+        let open = reviews(cx)
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.thread_id == id);
+        let button = crate::highlights::tipped(
+            h_flex()
+                .id("pending-reviews")
+                .relative()
+                .gap(px(6.))
+                .items_center()
+                .cursor_pointer(),
+            "Compare the images the agent made side by side, and reply",
+        )
+        .on_click(
+            cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_pending_reviews(&id, cx)),
+        )
+        .child(
+            Icon::new(IconName::Images)
+                .with_size(px(13.))
+                .text_color(secondary),
+        )
+        .child(
+            div()
+                .text_color(secondary)
+                .child(rules::pending_button_title(count)),
+        )
+        .when(open, |s| s.child(self.render_pending_list(cx)));
         Some(
             h_flex()
                 .flex_none()
@@ -1097,12 +1528,21 @@ impl Threadbear {
     }
 
     fn toggle_pending_reviews(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if reviews(cx).pending.as_ref().is_some_and(|p| p.thread_id == thread_id) {
+        if reviews(cx)
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.thread_id == thread_id)
+        {
             reviews(cx).pending = None;
             cx.notify();
             return;
         }
-        reviews(cx).pending = Some(PendingList { thread_id: thread_id.to_owned(), loading: true, reviews: vec![], error: None });
+        reviews(cx).pending = Some(PendingList {
+            thread_id: thread_id.to_owned(),
+            loading: true,
+            reviews: vec![],
+            error: None,
+        });
         cx.notify();
         let (client, id) = (self.client.clone(), thread_id.to_owned());
         cx.spawn(async move |this, cx| {
@@ -1111,7 +1551,14 @@ impl Threadbear {
                 if let Some(list) = reviews(cx).pending.as_mut().filter(|p| p.thread_id == id) {
                     list.loading = false;
                     match res {
-                        Ok(v) => list.reviews = v["reviews"].as_array().into_iter().flatten().filter_map(DesignReview::decode).collect(),
+                        Ok(v) => {
+                            list.reviews = v["reviews"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(DesignReview::decode)
+                                .collect()
+                        }
                         Err(e) => list.error = Some(e.message),
                     }
                 }
@@ -1123,10 +1570,21 @@ impl Threadbear {
     }
 
     fn render_pending_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let (bg, border, secondary) = (cx.theme().popover, cx.theme().border, style::secondary_text(cx));
+        let (bg, border, secondary) = (
+            cx.theme().popover,
+            cx.theme().border,
+            style::secondary_text(cx),
+        );
         let hover = style::hover_fill(cx);
-        let Some(list) = cx.try_global::<Reviews>().and_then(|r| r.pending.as_ref()) else { return div().into_any_element() };
-        let (thread_id, loading, error, shown) = (list.thread_id.clone(), list.loading, list.error.clone(), list.reviews.clone());
+        let Some(list) = cx.try_global::<Reviews>().and_then(|r| r.pending.as_ref()) else {
+            return div().into_any_element();
+        };
+        let (thread_id, loading, error, shown) = (
+            list.thread_id.clone(),
+            list.loading,
+            list.error.clone(),
+            list.reviews.clone(),
+        );
         let mut column = v_flex().gap(px(12.)).text_size(px(style::size::WORK));
         if loading {
             column = column.child(Spinner::new().color(secondary).with_size(px(13.)));
@@ -1137,14 +1595,34 @@ impl Threadbear {
         for (i, review) in shown.iter().enumerate() {
             let (open, id) = (review.clone(), thread_id.clone());
             column = column.child(
-                crate::highlights::tipped(h_flex().id(("pending-review", i)).gap(px(18.)).items_center().rounded(px(5.)).cursor_pointer().hover(move |s| s.bg(hover)), "Open this review")
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        reviews(cx).pending = None;
-                        this.open_review(&id, open.clone(), window, cx);
-                        cx.notify();
-                    }))
-                    .child(div().flex_1().min_w_0().truncate().child(review.title.clone()))
-                    .child(div().flex_none().text_color(secondary).child(format!("{} images", review.options.len()))),
+                crate::highlights::tipped(
+                    h_flex()
+                        .id(("pending-review", i))
+                        .gap(px(18.))
+                        .items_center()
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover)),
+                    "Open this review",
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    reviews(cx).pending = None;
+                    this.open_review(&id, open.clone(), window, cx);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(review.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(secondary)
+                        .child(format!("{} images", review.options.len())),
+                ),
             );
         }
         if !loading && shown.is_empty() && error.is_none() {
@@ -1184,8 +1662,12 @@ pub(crate) fn window_for(review_id: &str, cx: &mut App) -> Option<AnyWindowHandl
     if !cx.has_global::<Reviews>() {
         return None;
     }
-    let windows: Vec<(AnyWindowHandle, Entity<ReviewWindow>)> = reviews(cx).windows.values().cloned().collect();
-    windows.into_iter().find(|(_, view)| view.read(cx).session.review().id == review_id).map(|(handle, _)| handle)
+    let windows: Vec<(AnyWindowHandle, Entity<ReviewWindow>)> =
+        reviews(cx).windows.values().cloned().collect();
+    windows
+        .into_iter()
+        .find(|(_, view)| view.read(cx).session.review().id == review_id)
+        .map(|(handle, _)| handle)
 }
 
 /// The Swift app's `review` command (Automation+Waiting.swift, `designReview`):
@@ -1194,24 +1676,40 @@ pub(crate) fn window_for(review_id: &str, cx: &mut App) -> Option<AnyWindowHandl
 /// the window has got to. `close` closes it; `open: false` only reads one
 /// that's open.
 #[cfg(feature = "automation")]
-pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHandle, cmd: &Value, cx: &mut AsyncApp) -> Result<Value, String> {
+pub(crate) async fn automation(
+    app: &WeakEntity<Threadbear>,
+    main: AnyWindowHandle,
+    cmd: &Value,
+    cx: &mut AsyncApp,
+) -> Result<Value, String> {
     use gpui_kit::test::TestWindowExt as _;
     let wanted = cmd["id"].as_str().map(str::to_owned);
     let found = app
         .read_with(cx, |t, cx| {
             let thread_id = t.selected.clone()?;
             let pane = t.pane.as_ref()?.read(cx);
-            let review = pane.feed.model().rows().iter().filter_map(|row| match &row.content {
-                threadbear_core::reducer::RowContent::Review(review) => Some(review.clone()),
-                _ => None,
-            });
-            let review = review.filter(|r| wanted.as_ref().is_none_or(|w| &r.id == w)).next()?;
+            let review = pane
+                .feed
+                .model()
+                .rows()
+                .iter()
+                .filter_map(|row| match &row.content {
+                    threadbear_core::reducer::RowContent::Review(review) => Some(review.clone()),
+                    _ => None,
+                });
+            let review = review
+                .filter(|r| wanted.as_ref().is_none_or(|w| &r.id == w))
+                .next()?;
             Some((thread_id, review))
         })
         .map_err(|e| e.to_string())?;
-    let Some((thread_id, snapshot)) = found else { return Err("no review in this thread".into()) };
+    let Some((thread_id, snapshot)) = found else {
+        return Err("no review in this thread".into());
+    };
     let key = window_key(&thread_id, &snapshot.id);
-    let open = |cx: &mut AsyncApp| cx.update(|cx| reviews(cx).windows.get(&key).map(|(_, view)| view.clone()));
+    let open = |cx: &mut AsyncApp| {
+        cx.update(|cx| reviews(cx).windows.get(&key).map(|(_, view)| view.clone()))
+    };
     if cmd["close"].as_bool() == Some(true) {
         if let Some(view) = open(cx) {
             view.update(cx, |v, cx| v.close(cx));
@@ -1221,7 +1719,12 @@ pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHand
     let opening = cmd["open"].as_bool() != Some(false);
     if opening {
         let app = app.upgrade().ok_or("the app has gone")?;
-        cx.update_window(main, |_, window, cx| app.update(cx, |t, cx| t.open_review(&thread_id, snapshot.clone(), window, cx))).map_err(|e| e.to_string())?;
+        cx.update_window(main, |_, window, cx| {
+            app.update(cx, |t, cx| {
+                t.open_review(&thread_id, snapshot.clone(), window, cx)
+            })
+        })
+        .map_err(|e| e.to_string())?;
     }
     // The window opens once the update that asked is over.
     let mut view = open(cx);
@@ -1229,13 +1732,33 @@ pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHand
         if view.is_some() || !opening {
             break;
         }
-        cx.background_executor().timer(Duration::from_millis(20)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(20))
+            .await;
         view = open(cx);
     }
-    let Some(view) = view else { return Err(if opening { "couldn't open the review".into() } else { "that review isn't open".into() }) };
+    let Some(view) = view else {
+        return Err(if opening {
+            "couldn't open the review".into()
+        } else {
+            "that review isn't open".into()
+        });
+    };
     // `refresh`, as the Swift command awaits it.
-    let (thread, review, client) = view.read_with(cx, |v, _| (v.session.thread_id.clone(), v.session.review().id.clone(), v.client.clone()));
-    if let Ok(v) = call(client, "reviews.get", json!({ "threadId": thread, "reviewId": review })).await {
+    let (thread, review, client) = view.read_with(cx, |v, _| {
+        (
+            v.session.thread_id.clone(),
+            v.session.review().id.clone(),
+            v.client.clone(),
+        )
+    });
+    if let Ok(v) = call(
+        client,
+        "reviews.get",
+        json!({ "threadId": thread, "reviewId": review }),
+    )
+    .await
+    {
         if let Some(latest) = DesignReview::decode(&v["review"]) {
             view.update(cx, |v, cx| v.receive(latest, cx));
         }
@@ -1250,10 +1773,21 @@ pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHand
                     _ => {}
                 }
                 if let Some(show) = cmd["show"].as_u64() {
-                    v.enlarge(show as usize, cmd["shot"].as_u64().unwrap_or(0) as usize, cx);
+                    v.enlarge(
+                        show as usize,
+                        cmd["shot"].as_u64().unwrap_or(0) as usize,
+                        cx,
+                    );
                 }
                 if let Some(actual) = cmd["actual"].as_bool() {
-                    v.zoom(if actual { ZoomStep::Actual } else { ZoomStep::Fit }, cx);
+                    v.zoom(
+                        if actual {
+                            ZoomStep::Actual
+                        } else {
+                            ZoomStep::Fit
+                        },
+                        cx,
+                    );
                 }
                 if let Some(peek) = cmd["peek"].as_bool() {
                     v.set_peeking(peek, cx);
@@ -1267,7 +1801,10 @@ pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHand
                 }
                 match &cmd["pick"] {
                     Value::String(id) => v.pick(id, cx),
-                    Value::Array(ids) => ids.iter().filter_map(Value::as_str).for_each(|id| v.pick(id, cx)),
+                    Value::Array(ids) => ids
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .for_each(|id| v.pick(id, cx)),
                     _ => {}
                 }
                 if cmd["none"].as_bool() == Some(true) {
@@ -1290,7 +1827,39 @@ pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHand
         })
     })
     .map_err(|e| e.to_string())?;
-    let busy = |view: &Entity<ReviewWindow>, cx: &mut AsyncApp| view.read_with(cx, |v, _| v.session.saving() || v.session.submitting());
+    // A real click (pointer events through hit testing) on picture chip N in
+    // the reply, as `composer-peek` with `press` does in the thread's box.
+    if let Some(number) = cmd["pressPicture"].as_u64() {
+        let clicked = cx.update_window(handle, |_, window, cx| -> Result<(), String> {
+            use gpui_kit::test::TestEventExt as _;
+            window.render_frame(cx);
+            let reply = view.read(cx).reply.clone();
+            let range = reply
+                .read(cx)
+                .tokens()
+                .get((number as usize).saturating_sub(1))
+                .map(|span| span.range())
+                .ok_or_else(|| format!("no picture chip {number} in the reply"))?;
+            let at = reply
+                .read(cx)
+                .range_to_bounds(&range)
+                .ok_or("the chip isn't on screen")?
+                .center();
+            window.pointer_move(at, None, cx);
+            window.render_frame(cx);
+            window.pointer_down(at, MouseButton::Left, cx);
+            window.pointer_up(at, MouseButton::Left, cx);
+            window.render_frame(cx);
+            Ok(())
+        });
+        clicked.map_err(|e| e.to_string())??;
+    }
+    if cmd["closeViewer"].as_bool() == Some(true) {
+        view.update(cx, crate::viewer::close);
+    }
+    let busy = |view: &Entity<ReviewWindow>, cx: &mut AsyncApp| {
+        view.read_with(cx, |v, _| v.session.saving() || v.session.submitting())
+    };
     if cmd["save"].as_bool() == Some(true) {
         view.update(cx, |v, cx| v.save_now(cx));
     }
@@ -1304,19 +1873,24 @@ pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHand
         if !busy(&view, cx) {
             break;
         }
-        cx.background_executor().timer(Duration::from_millis(10)).await;
+        cx.background_executor()
+            .timer(Duration::from_millis(10))
+            .await;
     }
     // A frame, so a screenshot straight after shows what this did.
-    cx.update_window(handle, |_, window, cx| window.render_frame(cx)).ok();
-    cx.background_executor().timer(Duration::from_millis(250)).await;
-    let state = view.read_with(cx, |v, _| v.state());
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+        .ok();
+    cx.background_executor()
+        .timer(Duration::from_millis(250))
+        .await;
+    let state = view.read_with(cx, |v, cx| v.state(cx));
     Ok(json!(format!("ok {state}")))
 }
 
 #[cfg(feature = "automation")]
 impl ReviewWindow {
     /// What the Swift command answers, and a little more for the specs.
-    fn state(&self) -> Value {
+    fn state(&self, cx: &App) -> Value {
         let s = &self.session;
         let draft = s.draft();
         json!({
@@ -1325,11 +1899,23 @@ impl ReviewWindow {
             "status": s.review().status,
             "revision": s.review().revision,
             "mode": s.mode.name(),
+            // The words under the stage: the option on show's name and
+            // reasons, or the agent's lead with all of them side by side.
+            "words": match (s.mode, s.focused_option()) {
+                (ReviewMode::Single, Some(o)) => format!("{}\n{}", o.label(), o.note.clone().unwrap_or_default()),
+                _ => s.review().note.clone().unwrap_or_default(),
+            },
             "actual": s.zoomed,
             "pickedId": draft.picked_id().unwrap_or(""),
             "pickedIds": draft.picked_ids,
             "notes": draft.notes,
             "reply": draft.reply.clone().unwrap_or_default(),
+            // The reply's pictures: in the draft, and chips in the box.
+            "images": draft.images.len(),
+            "chips": self.reply.read(cx).tokens().len(),
+            // The picture viewer over the window: "" when it's closed, else
+            // "<n> of <total> <file>", with " (loading)" until it's drawn.
+            "viewer": self.viewer.describe(),
             "none": draft.none,
             "shot": s.shot(),
             "peeking": s.peeking,
@@ -1359,6 +1945,12 @@ impl ReviewWindow {
 /// The open review windows in the dump: each one's review and where it's got to.
 #[cfg(feature = "automation")]
 pub(crate) fn dump(cx: &App) -> Value {
-    let Some(reviews) = cx.try_global::<Reviews>() else { return json!([]) };
-    json!(reviews.windows.values().map(|(_, view)| view.read(cx).state()).collect::<Vec<_>>())
+    let Some(reviews) = cx.try_global::<Reviews>() else {
+        return json!([]);
+    };
+    json!(reviews
+        .windows
+        .values()
+        .map(|(_, view)| view.read(cx).state(cx))
+        .collect::<Vec<_>>())
 }

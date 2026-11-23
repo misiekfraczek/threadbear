@@ -21,6 +21,7 @@ import type {
   SubagentStatus,
   TurnErrorKind,
   TurnOutcome,
+  UsageResets,
   UsageWindow,
 } from '../protocol.ts';
 
@@ -31,9 +32,6 @@ export type StartSessionOptions = {
   model?: string;
   effort?: EffortLevel; // undefined: the model's own level
   permissionMode: PermissionMode;
-  // Its CLI must run in a sandbox (sandbox.ts, ThreadRecord.confined): an
-  // adapter that can't put it in one refuses to start it.
-  confined?: boolean;
   // Native session id. With resume=false it's pre-assigned to a brand new
   // session; with resume=true the CLI loads that session's transcript.
   // Codex assigns its own ids, so it ignores this when resume=false and
@@ -42,7 +40,7 @@ export type StartSessionOptions = {
   resume: boolean;
   // With resume, Claude picks the session up at this transcript entry
   // rather than at its end: an edit cut the conversation back to it
-  // (docs/protocol.md, "Editing a message"). Codex cuts its own history
+  // (docs/protocol/threads.md, "Editing a message"). Codex cuts its own history
   // in rewind(), so it never gets one.
   resumeAt?: string;
   mediaDir: string; // images from tool results are saved here
@@ -119,7 +117,7 @@ export type AdapterOutput =
   | { kind: 'context'; contextTokens: number; contextWindow?: number }
   // A rate-limit reading for the session's account (D's UsageStore keeps
   // it). email and plan come with it when the CLI reports them.
-  | { kind: 'limits'; windows: UsageWindow[]; blocked?: boolean; email?: string; plan?: string }
+  | { kind: 'limits'; windows: UsageWindow[]; blocked?: boolean; email?: string; plan?: string; resets?: UsageResets }
   // The version of the CLI process actually running this session (not the
   // one that created it).
   | { kind: 'cliVersion'; version: string }
@@ -130,7 +128,10 @@ export type AdapterOutput =
   // With `reopen`, the turn had its end_turn and reply, and is sent back for
   // a card the reply asked for (needs.ts, REPLY_ASKS): the next end_turn is
   // taken, not refused as a repeat, and the reply written stands.
-  | { kind: 'endTurnNudge'; reopen?: true }
+  // With `rewrite` too, it was sent back because its reply links files that
+  // aren't there (needs.ts, missingLinksNudge): the next end_turn asks for a
+  // whole new reply rather than saying the one written stands.
+  | { kind: 'endTurnNudge'; reopen?: true; rewrite?: true }
   // Background work the CLI is running (shells, async subagents). Replaces
   // the previous list.
   | { kind: 'tasks'; tasks: BackgroundTask[] }
@@ -139,7 +140,7 @@ export type AdapterOutput =
   | { kind: 'subagent'; update: SubagentUpdate }
   // "Always allow" rules to keep for this thread.
   | { kind: 'allowRules'; rules: string[] }
-  // The calls waiting behind the card for toolUseId, now (docs/protocol.md,
+  // The calls waiting behind the card for toolUseId, now (docs/protocol/threads.md,
   // "Queued calls").
   | { kind: 'approvalQueue'; toolUseId: string; calls: QueuedCall[] }
   // "Plan first": the agent put its plan to Mike (Claude's ExitPlanMode,
@@ -195,7 +196,7 @@ export type ToolApprovalRequest = {
   wholeInput?: Record<string, unknown>;
   canAlwaysAllow: boolean;
   signal: AbortSignal;
-  // The agent's other calls waiting behind this one (docs/protocol.md,
+  // The agent's other calls waiting behind this one (docs/protocol/threads.md,
   // "Queued calls"); more can join while it waits (an approvalQueue output).
   queued?: QueuedCall[];
   // Why the CLI is asking, in a sentence for the card (askReason in the Claude adapter).
@@ -211,9 +212,13 @@ export type ToolApprovalRequest = {
 // a "Plan first" plan takes the thread out of plan mode).
 // stopped: an expired card that Mike pressed Stop on (the Mac app or the
 // phone), as opposed to one that closed unanswered for any other reason. Only then may an agent be told
-// the user stopped it (docs/protocol.md, "Who stopped it").
+// the user stopped it (docs/protocol/needs-you.md, "Who stopped it").
 // queued: Mike's answers to the queued calls, answered in the same click.
-export type ToolApprovalAnswer = { decision: 'allow' | 'allowAlways' | 'deny' | 'expired'; message?: string; mode?: PermissionMode; stopped?: boolean; queued?: QueuedAnswers };
+// noApp: no card was put up, as only an app of this runner's own could allow
+// it and it has none (app-seen.ts); `message` says what to do instead.
+// `reviewer`: on a deny of a card the card reviewer left for Mike, why it did
+// (runner/card-review.ts), for the agent alongside the denial.
+export type ToolApprovalAnswer = { decision: 'allow' | 'allowAlways' | 'deny' | 'expired'; message?: string; reviewer?: string; mode?: PermissionMode; stopped?: boolean; queued?: QueuedAnswers; noApp?: true };
 
 export type QuestionRequest = {
   toolUseId?: string;
@@ -286,7 +291,7 @@ export interface AgentSession {
 }
 
 // Cutting a native session back to just before one of the runner's
-// messages (docs/protocol.md, "Editing a message"). The thread's CLI is
+// messages (docs/protocol/threads.md, "Editing a message"). The thread's CLI is
 // never live while this runs.
 export type RewindRequest = {
   threadId: string;
@@ -316,6 +321,13 @@ export class RewindRefusedError extends Error {
   }
 }
 
+// What spending a reset came to (accounts.useReset), in Codex's words:
+// "reset", "nothingToReset" (no window is at a point a reset helps),
+// "noCredit" (none left) or "alreadyRedeemed". `limits` is the login's
+// reading taken straight after, when there was one.
+export type UseResetOutcome = 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed';
+export type UseResetResult = { outcome: UseResetOutcome; limits?: Extract<AdapterOutput, { kind: 'limits' }> };
+
 export interface AgentAdapter {
   readonly provider: Provider;
   // false: later messages stay in the runner queue until the active turn ends.
@@ -325,10 +337,12 @@ export interface AgentAdapter {
   // What the account's CLI offers as models, without starting a turn.
   // Optional: a provider without a picker leaves it out.
   models?(account: Account): Promise<ModelChoice[]>;
-  // The login's limits as a usage reading, without starting a turn (Codex:
-  // account/rateLimits/read). The runner asks it of a login its readings
-  // call blocked or out of room, so an early reset is noticed. Null: none.
-  usage?(account: Account): Promise<Omit<Extract<AdapterOutput, { kind: 'limits' }>, 'kind'> | null>;
+  // Codex: spends one of the login's usage-limit resets (Mike's click on
+  // the limit box, never by itself) and reads its limits after.
+  useReset?(account: Account): Promise<UseResetResult>;
+  // Codex: reads the login's limits without a turn (limit-recheck.ts), for
+  // a login whose last reading says it's out. null if Codex said nothing.
+  readLimits?(account: Account): Promise<Extract<AdapterOutput, { kind: 'limits' }> | null>;
   // The slash commands the account's CLI offers in a folder (skills
   // included), without starting a turn, for the composer's picker.
   commands?(account: Account, cwd: string, untrusted?: Record<string, unknown>): Promise<SlashCommand[]>;

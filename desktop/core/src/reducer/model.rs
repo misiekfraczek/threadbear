@@ -117,6 +117,13 @@ pub struct TranscriptModel {
     /// before it gets a divider.
     last_turn_end: Option<f64>,
     messaged_turns: HashSet<String>,
+    /// Turns the runner's own message started (it told the thread the app
+    /// restarted, say), with what it said woke it: no one wrote, so they
+    /// get the divider too, saying that instead of what finished.
+    runner_turns: HashMap<String, String>,
+    /// A "Woke up" note since the last turn ended: that already says the
+    /// thread woke and why, so the turn it starts gets no divider as well.
+    woke_note_since_turn: bool,
     /// Turns whose `turn.started` has been seen: a message after it went
     /// into that turn, so it can't be edited on its own.
     started_turns: HashSet<String>,
@@ -166,7 +173,10 @@ pub struct TranscriptModel {
 
 impl TranscriptModel {
     pub fn new(root: Option<String>) -> TranscriptModel {
-        TranscriptModel { root, ..TranscriptModel::default() }
+        TranscriptModel {
+            root,
+            ..TranscriptModel::default()
+        }
     }
 
     pub fn from_events(events: Vec<Event>, root: Option<String>) -> TranscriptModel {
@@ -280,14 +290,21 @@ impl TranscriptModel {
     /// Approval cards (not questions) still waiting on Mike, oldest first.
     /// Return in an empty composer allows the one there is.
     pub fn pending_approval_ids(&self) -> Vec<String> {
-        let mut ids: Vec<&String> = self.pending_cards.keys().filter(|k| k.starts_with("ap:")).collect();
+        let mut ids: Vec<&String> = self
+            .pending_cards
+            .keys()
+            .filter(|k| k.starts_with("ap:"))
+            .collect();
         ids.sort_by_key(|k| self.item_index.get(k.as_str()).copied().unwrap_or(0));
         ids.into_iter().map(|k| k[3..].to_owned()).collect()
     }
 
     /// Replaces everything with this page of events (oldest first).
     pub fn load(&mut self, new_events: Vec<Event>, in_progress: &[InProgress]) {
-        let mut events: Vec<Event> = new_events.into_iter().filter(|e| !e.is_transient()).collect();
+        let mut events: Vec<Event> = new_events
+            .into_iter()
+            .filter(|e| !e.is_transient())
+            .collect();
         events.sort_by_key(|e| e.seq);
         self.first_seq = events.first().map(|e| e.seq).unwrap_or(0);
         self.last_seq = events.last().map(|e| e.seq).unwrap_or(0);
@@ -295,8 +312,13 @@ impl TranscriptModel {
         PendingMessage::remove_landed(self.events.iter(), &mut self.pending);
         self.streaming.clear();
         for item in in_progress {
-            let kind = if item.type_ == "reasoning" { StreamKind::Reasoning } else { StreamKind::Assistant };
-            self.streaming.insert(item.item_id.clone(), (kind, item.text.clone()));
+            let kind = if item.type_ == "reasoning" {
+                StreamKind::Reasoning
+            } else {
+                StreamKind::Assistant
+            };
+            self.streaming
+                .insert(item.item_id.clone(), (kind, item.text.clone()));
         }
         self.rebuild();
     }
@@ -305,9 +327,16 @@ impl TranscriptModel {
     /// previous first row, so the view can keep its scroll anchor.
     pub fn prepend(&mut self, older_events: Vec<Event>) -> PrependResult {
         let first_seq = self.first_seq;
-        let mut older: Vec<Event> = older_events.into_iter().filter(|e| !e.is_transient() && (first_seq == 0 || e.seq < first_seq)).collect();
+        let mut older: Vec<Event> = older_events
+            .into_iter()
+            .filter(|e| !e.is_transient() && (first_seq == 0 || e.seq < first_seq))
+            .collect();
         if older.is_empty() {
-            return PrependResult { added: 0, changed_ids: Vec::new(), keeps_order: true };
+            return PrependResult {
+                added: 0,
+                changed_ids: Vec::new(),
+                keeps_order: true,
+            };
         }
         let previous_ids: Vec<String> = self.rows.iter().map(|r| r.id.clone()).collect();
         let mut previous: HashMap<String, u64> = HashMap::new();
@@ -319,20 +348,43 @@ impl TranscriptModel {
         self.events = older;
         self.first_seq = self.events.first().map(|e| e.seq).unwrap_or(0);
         self.rebuild();
-        let changed: Vec<String> = self.rows.iter().filter(|row| previous.get(&row.id).is_some_and(|v| *v != row.version)).map(|row| row.id.clone()).collect();
+        let changed: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|row| previous.get(&row.id).is_some_and(|v| *v != row.version))
+            .map(|row| row.id.clone())
+            .collect();
         let Some(previous_first) = previous_ids.first() else {
-            return PrependResult { added: 0, changed_ids: changed, keeps_order: true };
+            return PrependResult {
+                added: 0,
+                changed_ids: changed,
+                keeps_order: true,
+            };
         };
         let Some(&new_index) = self.index.get(previous_first) else {
             // The old first row is gone: a group grew backwards over the page
             // boundary and took a new id, or swallowed a lone item. Anchor on
             // the first old row that's still there; the view reloads.
-            let survivor = previous_ids.iter().find_map(|id| self.index.get(id).copied()).unwrap_or(0);
-            return PrependResult { added: survivor, changed_ids: changed, keeps_order: false };
+            let survivor = previous_ids
+                .iter()
+                .find_map(|id| self.index.get(id).copied())
+                .unwrap_or(0);
+            return PrependResult {
+                added: survivor,
+                changed_ids: changed,
+                keeps_order: false,
+            };
         };
-        let keeps_order =
-            self.rows.len() - new_index == previous_ids.len() && self.rows[new_index..].iter().zip(&previous_ids).all(|(row, id)| row.id == *id);
-        PrependResult { added: new_index, changed_ids: changed, keeps_order }
+        let keeps_order = self.rows.len() - new_index == previous_ids.len()
+            && self.rows[new_index..]
+                .iter()
+                .zip(&previous_ids)
+                .all(|(row, id)| row.id == *id);
+        PrependResult {
+            added: new_index,
+            changed_ids: changed,
+            keeps_order,
+        }
     }
 
     /// Drops all but the newest `count` persisted events (and their rows),
@@ -358,7 +410,10 @@ impl TranscriptModel {
         for event in incoming {
             if !event.is_transient() {
                 if event.seq <= self.last_seq && self.last_seq != 0 {
-                    if self.sparse && event.seq >= self.first_seq && !self.events.iter().any(|e| e.seq == event.seq) {
+                    if self.sparse
+                        && event.seq >= self.first_seq
+                        && !self.events.iter().any(|e| e.seq == event.seq)
+                    {
                         late.push(event);
                     }
                     continue;
@@ -388,15 +443,25 @@ impl TranscriptModel {
             self.events.sort_by_key(|e| e.seq);
             let before = self.rows.len();
             self.rebuild();
-            return TranscriptChange { removed: (0..before).collect(), inserted: (0..self.rows.len()).collect(), updated: BTreeSet::new(), gap_detected: false };
+            return TranscriptChange {
+                removed: (0..before).collect(),
+                inserted: (0..self.rows.len()).collect(),
+                updated: BTreeSet::new(),
+                gap_detected: false,
+            };
         }
         if rewound {
             // The runner drops messages queued behind an edited one
-            // (docs/protocol.md, "Editing a message").
+            // (docs/protocol/threads.md, "Editing a message").
             self.pending.retain(|m| !m.queued);
             let before = self.rows.len();
             self.rebuild();
-            return TranscriptChange { removed: (0..before).collect(), inserted: (0..self.rows.len()).collect(), updated: BTreeSet::new(), gap_detected: gap };
+            return TranscriptChange {
+                removed: (0..before).collect(),
+                inserted: (0..self.rows.len()).collect(),
+                updated: BTreeSet::new(),
+                gap_detected: gap,
+            };
         }
         let mut change = self.refresh_rows();
         change.gap_detected = gap;
@@ -441,7 +506,12 @@ impl TranscriptModel {
     pub fn set_pending(&mut self, mut list: Vec<PendingMessage>) -> TranscriptChange {
         if let Some(earliest) = list.iter().map(|m| m.after_seq).min() {
             // Only the events after `earliest`, in order.
-            let start = self.events.iter().rposition(|e| e.seq <= earliest).map(|p| p + 1).unwrap_or(0);
+            let start = self
+                .events
+                .iter()
+                .rposition(|e| e.seq <= earliest)
+                .map(|p| p + 1)
+                .unwrap_or(0);
             PendingMessage::remove_landed(self.events[start..].iter(), &mut list);
         }
         if list == self.pending {
@@ -457,7 +527,11 @@ impl TranscriptModel {
     /// but while it runs it should read like one, with its last group live
     /// and the working line after it. `turn` "" matches events with no
     /// turn id. None ends it.
-    pub fn set_live_turn(&mut self, turn: Option<&str>, started_at: Option<f64>) -> TranscriptChange {
+    pub fn set_live_turn(
+        &mut self,
+        turn: Option<&str>,
+        started_at: Option<f64>,
+    ) -> TranscriptChange {
         if turn == self.open_turn.as_deref() {
             return TranscriptChange::default();
         }
@@ -474,7 +548,9 @@ impl TranscriptModel {
     }
 
     fn close_open_asks(&mut self) {
-        let Some(open) = self.open_asks_row.take() else { return };
+        let Some(open) = self.open_asks_row.take() else {
+            return;
+        };
         self.update(&open, |content| {
             if let RowContent::Asks(card) = content {
                 card.is_open = false;
@@ -492,7 +568,9 @@ impl TranscriptModel {
         } else {
             self.ask_picks.insert(seq, picks.clone());
         }
-        let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else { return TranscriptChange::default() };
+        let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else {
+            return TranscriptChange::default();
+        };
         self.update(&card_id, |content| {
             if let RowContent::Asks(card) = content {
                 card.picks = picks;
@@ -502,11 +580,16 @@ impl TranscriptModel {
     }
 
     /// Another runner's request was read for the card `approval_id`.
-    pub fn set_start_request(&mut self, approval_id: &str, request: StartRequest) -> TranscriptChange {
+    pub fn set_start_request(
+        &mut self,
+        approval_id: &str,
+        request: StartRequest,
+    ) -> TranscriptChange {
         if self.start_requests.get(approval_id) == Some(&request) {
             return TranscriptChange::default();
         }
-        self.start_requests.insert(approval_id.to_owned(), request.clone());
+        self.start_requests
+            .insert(approval_id.to_owned(), request.clone());
         let id = format!("ap:{approval_id}");
         if !self.item_index.contains_key(&id) {
             return TranscriptChange::default();
@@ -529,7 +612,9 @@ impl TranscriptModel {
         } else {
             self.ask_notes.insert(seq, notes.clone());
         }
-        let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else { return TranscriptChange::default() };
+        let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else {
+            return TranscriptChange::default();
+        };
         self.update(&card_id, |content| {
             if let RowContent::Asks(card) = content {
                 card.notes = notes;
@@ -551,7 +636,9 @@ impl TranscriptModel {
         seqs.sort_unstable();
         seqs.dedup();
         for seq in seqs {
-            let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else { continue };
+            let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else {
+                continue;
+            };
             let check = check.clone();
             self.update(&card_id, |content| {
                 if let RowContent::Asks(card) = content {
@@ -570,8 +657,15 @@ impl TranscriptModel {
     }
 
     /// Mike ticked (or unticked) follow-ups on the done card from `seq`.
-    pub fn set_next_picks(&mut self, seq: i64, picks: BTreeSet<i64>, explain: BTreeSet<i64>) -> TranscriptChange {
-        if self.next_picks.get(&seq).cloned().unwrap_or_default() == picks && self.next_explains.get(&seq).cloned().unwrap_or_default() == explain {
+    pub fn set_next_picks(
+        &mut self,
+        seq: i64,
+        picks: BTreeSet<i64>,
+        explain: BTreeSet<i64>,
+    ) -> TranscriptChange {
+        if self.next_picks.get(&seq).cloned().unwrap_or_default() == picks
+            && self.next_explains.get(&seq).cloned().unwrap_or_default() == explain
+        {
             return TranscriptChange::default();
         }
         if picks.is_empty() {
@@ -584,7 +678,9 @@ impl TranscriptModel {
         } else {
             self.next_explains.insert(seq, explain.clone());
         }
-        let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else { return TranscriptChange::default() };
+        let Some(card_id) = self.asks_row_for_seq.get(&seq).cloned() else {
+            return TranscriptChange::default();
+        };
         self.update(&card_id, |content| {
             if let RowContent::Asks(card) = content {
                 card.picked_next = picks;
@@ -603,8 +699,14 @@ impl TranscriptModel {
             return TranscriptChange::default();
         }
         DiffPreview::set(key, open, &mut self.expanded);
-        let row_id = if key.starts_with("cf:") { key.split('|').next().unwrap_or(key) } else { key };
-        let Some(&position) = self.index.get(row_id) else { return TranscriptChange::default() };
+        let row_id = if key.starts_with("cf:") {
+            key.split('|').next().unwrap_or(key)
+        } else {
+            key
+        };
+        let Some(&position) = self.index.get(row_id) else {
+            return TranscriptChange::default();
+        };
         self.mark_updated(self.row_starts[position]);
         self.refresh_rows()
     }
@@ -633,6 +735,8 @@ impl TranscriptModel {
         self.turn_starts.clear();
         self.last_turn_end = None;
         self.messaged_turns.clear();
+        self.runner_turns.clear();
+        self.woke_note_since_turn = false;
         self.started_turns.clear();
         self.hidden = Self::hidden_ranges(&self.events);
         self.completed_turns.clear();
@@ -655,13 +759,37 @@ impl TranscriptModel {
             }
         }
         self.events = events;
+        // A turn whose start is on an older page (a long run of more than a
+        // page of events) still counts as running if nothing in this page
+        // finished it. A page that has the turn's message would have its
+        // start too. Worked out before what's still streaming is put back
+        // below, as that's this turn's.
+        if self.open_turn.is_none() && self.has_older_events() {
+            if let Some(first) = self.events.first().and_then(|e| e.turn_id.clone()) {
+                let last_with_turn = self.events.iter().rev().find_map(|e| e.turn_id.as_deref());
+                let has_user_message = self.events.iter().any(|e| {
+                    matches!(e.payload, EventPayload::UserMessage { .. })
+                        && e.turn_id.as_deref() == Some(first.as_str())
+                });
+                if last_with_turn == Some(first.as_str())
+                    && !self.completed_turns.contains(&first)
+                    && !has_user_message
+                {
+                    self.open_turn = Some(first);
+                }
+            }
+        }
         self.streaming.clear();
         // Re-add anything still streaming, unless the history now has its
         // persisted text. Reducing a delta puts it back in `streaming`.
         let mut sorted: Vec<(String, (StreamKind, String))> = streaming_now.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         for (item_id, (kind, text)) in sorted {
-            let prefix = if kind == StreamKind::Reasoning { "r:" } else { "a:" };
+            let prefix = if kind == StreamKind::Reasoning {
+                "r:"
+            } else {
+                "a:"
+            };
             if self.item_index.contains_key(&format!("{prefix}{item_id}")) {
                 continue;
             }
@@ -670,26 +798,21 @@ impl TranscriptModel {
             } else {
                 EventPayload::AssistantTextDelta { item_id, text }
             };
-            let event = Event::new(self.last_seq, "", "", None, "", payload);
+            // Still streaming, so the open turn's (`inProgress` has no turn).
+            let event = Event::new(
+                self.last_seq,
+                "",
+                "",
+                self.open_turn.clone().as_deref(),
+                "",
+                payload,
+            );
             self.reduce(&event);
         }
         for item in &mut self.items {
             if let Some(old) = previous.get(&item.id) {
                 if old.content == item.content {
                     item.version = old.version;
-                }
-            }
-        }
-        // A turn whose start is on an older page (a long run of more than a
-        // page of events) still counts as running if nothing in this page
-        // finished it. A page that has the turn's message would have its
-        // start too.
-        if self.open_turn.is_none() && self.has_older_events() {
-            if let Some(first) = self.events.first().and_then(|e| e.turn_id.clone()) {
-                let last_with_turn = self.events.iter().rev().find_map(|e| e.turn_id.as_deref());
-                let has_user_message = self.events.iter().any(|e| matches!(e.payload, EventPayload::UserMessage { .. }) && e.turn_id.as_deref() == Some(first.as_str()));
-                if last_with_turn == Some(first.as_str()) && !self.completed_turns.contains(&first) && !has_user_message {
-                    self.open_turn = Some(first);
                 }
             }
         }
@@ -715,7 +838,13 @@ impl TranscriptModel {
         self.dirty_update_end = self.dirty_update_end.max(self.run_end(item_index as isize));
         // An edit in a finished turn changes its changes card too.
         if let RowContent::Tool(tool) = &self.items[item_index].content {
-            if !tool.diffs.is_empty() || tool.call.as_ref().map(DiffBuilder::is_edit_tool).unwrap_or(false) {
+            if !tool.diffs.is_empty()
+                || tool
+                    .call
+                    .as_ref()
+                    .map(DiffBuilder::is_edit_tool)
+                    .unwrap_or(false)
+            {
                 let turn = self.items[item_index].turn_id.clone().unwrap_or_default();
                 if let Some(&footer) = self.item_index.get(&format!("f:{turn}")) {
                     self.dirty_update_end = self.dirty_update_end.max(footer + 1);
@@ -752,8 +881,26 @@ impl TranscriptModel {
         self.mark_inserted(anchor + 1);
     }
 
+    /// A row made before its turn was known (from a subscribe's
+    /// `inProgress`, which has none) takes the turn of the first event for
+    /// it that says one. Its version moves with the `update` that follows.
+    fn adopt_turn(&mut self, id: &str, turn_id: Option<&str>) {
+        let (Some(&i), Some(turn)) = (self.item_index.get(id), turn_id) else {
+            return;
+        };
+        if self.items[i].turn_id.is_none() {
+            // The run it was in is drawn again too: it may have been grouped
+            // with other turnless rows before it, a group it leaves now.
+            let was_in = self.run_start(i as isize);
+            self.items[i].turn_id = Some(turn.to_owned());
+            self.mark_inserted(was_in);
+        }
+    }
+
     fn update(&mut self, id: &str, body: impl FnOnce(&mut RowContent)) {
-        let Some(&i) = self.item_index.get(id) else { return };
+        let Some(&i) = self.item_index.get(id) else {
+            return;
+        };
         body(&mut self.items[i].content);
         self.items[i].version = next_row_version();
         self.mark_updated(i);
@@ -764,7 +911,9 @@ impl TranscriptModel {
     /// sends the call first, but an older page can bring the approval after
     /// it.
     fn note_tool_row(&mut self, id: &str) {
-        let Some(approval) = self.approval_for_tool.get(id).cloned() else { return };
+        let Some(approval) = self.approval_for_tool.get(id).cloned() else {
+            return;
+        };
         match self.item(&approval).map(|row| &row.content) {
             Some(RowContent::Approval(existing)) if !existing.tool_shown => {}
             _ => return,
@@ -777,17 +926,32 @@ impl TranscriptModel {
     }
 
     fn note_edit(&mut self, item_id: &str, turn_id: Option<&str>) {
-        let edits = self.edits_by_turn.entry(turn_id.unwrap_or("").to_owned()).or_default();
+        let edits = self
+            .edits_by_turn
+            .entry(turn_id.unwrap_or("").to_owned())
+            .or_default();
         if !edits.iter().any(|e| e == item_id) {
             edits.push(item_id.to_owned());
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "baselined at 729 lines when the lint was turned on (20 Nov 2026); split it when it's next worked on"
+    )]
     fn reduce(&mut self, event: &Event) {
         let seq = event.seq;
         let turn_id = event.turn_id.clone();
         match &event.payload {
-            EventPayload::UserMessage { text, images, origin, answers, edit_of, review } => {
+            EventPayload::UserMessage {
+                text,
+                images,
+                origin,
+                wake_reason,
+                answers,
+                edit_of,
+                review,
+            } => {
                 // Mike's reply answers the open card, so it goes, picked or not.
                 if origin.as_deref() != Some("runner") {
                     self.close_open_asks();
@@ -796,6 +960,7 @@ impl TranscriptModel {
                     text: text.clone(),
                     images: images.clone(),
                     origin: origin.clone(),
+                    wake_reason: wake_reason.clone(),
                     answers: answers.clone(),
                     edit_of: *edit_of,
                     review: review.clone(),
@@ -803,20 +968,45 @@ impl TranscriptModel {
                 };
                 // Only one that started its own turn can be cut back to; one
                 // sent into a running turn went into that turn.
-                message.editable = message.is_mike() && turn_id.as_ref().is_some_and(|t| !self.started_turns.contains(t));
+                message.editable = message.is_mike()
+                    && turn_id
+                        .as_ref()
+                        .is_some_and(|t| !self.started_turns.contains(t));
                 if let Some(turn) = &turn_id {
-                    self.messaged_turns.insert(turn.clone());
+                    if message.is_from_runner() {
+                        self.runner_turns
+                            .entry(turn.clone())
+                            .or_insert_with(|| wake_reason.clone().unwrap_or_default());
+                    } else {
+                        self.messaged_turns.insert(turn.clone());
+                    }
                 }
-                self.append(Row::new(&format!("u:{seq}"), seq, turn_id, RowContent::User(message)));
+                self.append(Row::new(
+                    &format!("u:{seq}"),
+                    seq,
+                    turn_id,
+                    RowContent::User(message),
+                ));
             }
 
             EventPayload::ThreadRewound(rewind) => {
                 // Mike's edit closes the card the cut turns left, as his reply would.
                 self.close_open_asks();
-                self.append(Row::new(&format!("rw:{seq}"), seq, turn_id, RowContent::Note(rewind.summary())));
+                self.append(Row::new(
+                    &format!("rw:{seq}"),
+                    seq,
+                    turn_id,
+                    RowContent::Note(rewind.summary()),
+                ));
             }
 
-            EventPayload::AssistantText { item_id, text, summary: true, gives_way, .. } => {
+            EventPayload::AssistantText {
+                item_id,
+                text,
+                summary: true,
+                gives_way,
+                ..
+            } => {
                 // The turn's summary is its reply: what the agent wrote
                 // before it folds into the work, so the turn reads as one
                 // line of work, the bullets, then the card.
@@ -827,16 +1017,32 @@ impl TranscriptModel {
                 if let Some(turn) = &turn_id {
                     if !self.summarized_turns.contains(turn) {
                         self.summarized_turns.insert(turn.clone());
-                        if let Some(first) = self.items.iter().position(|i| i.turn_id.as_ref() == Some(turn)) {
+                        if let Some(first) = self
+                            .items
+                            .iter()
+                            .position(|i| i.turn_id.as_ref() == Some(turn))
+                        {
                             self.mark_inserted(first);
                         }
                     }
                 }
-                let item = TextItem { item_id: item_id.clone(), text: text.clone(), is_summary: true, gives_way: *gives_way, ..TextItem::default() };
+                let item = TextItem {
+                    item_id: item_id.clone(),
+                    text: text.clone(),
+                    is_summary: true,
+                    gives_way: *gives_way,
+                    ..TextItem::default()
+                };
                 self.append(Row::new(&id, seq, turn_id, RowContent::Assistant(item)));
             }
 
-            EventPayload::AssistantText { item_id, text, narration, final_reply, .. } => {
+            EventPayload::AssistantText {
+                item_id,
+                text,
+                narration,
+                final_reply,
+                ..
+            } => {
                 self.streaming.remove(item_id);
                 if *final_reply {
                     if let Some(turn) = &turn_id {
@@ -845,22 +1051,39 @@ impl TranscriptModel {
                 }
                 let id = format!("a:{item_id}");
                 let thought = format!("r:{item_id}");
-                let make = |item_id: &str, text: &str| TextItem { item_id: item_id.to_owned(), text: text.to_owned(), is_narration: *narration, is_final: *final_reply, ..TextItem::default() };
+                let make = |item_id: &str, text: &str| TextItem {
+                    item_id: item_id.to_owned(),
+                    text: text.to_owned(),
+                    is_narration: *narration,
+                    is_final: *final_reply,
+                    ..TextItem::default()
+                };
                 let live_thought = match self.item_index.get(&thought) {
-                    Some(&i) if !self.item_index.contains_key(&id) && matches!(&self.items[i].content, RowContent::Reasoning(live) if live.is_streaming) => Some(i),
+                    Some(&i)
+                        if !self.item_index.contains_key(&id)
+                            && matches!(&self.items[i].content, RowContent::Reasoning(live) if live.is_streaming) =>
+                    {
+                        Some(i)
+                    }
                     _ => None,
                 };
                 if let Some(i) = live_thought {
                     // A reply the CLI sent as a thinking block signed as
                     // narration (runner: isNarration in normalize.ts) streams
                     // as reasoning and lands as text: it takes that row's place.
-                    let mut row = Row::new(&id, self.items[i].seq, self.items[i].turn_id.clone(), RowContent::Assistant(make(item_id, text)));
+                    let mut row = Row::new(
+                        &id,
+                        self.items[i].seq,
+                        self.items[i].turn_id.clone().or_else(|| turn_id.clone()),
+                        RowContent::Assistant(make(item_id, text)),
+                    );
                     row.version = next_row_version();
                     self.items[i] = row;
                     self.item_index.remove(&thought);
                     self.item_index.insert(id, i);
                     self.mark_inserted(i);
                 } else if self.item_index.contains_key(&id) {
+                    self.adopt_turn(&id, turn_id.as_deref());
                     let item = make(item_id, text);
                     self.update(&id, move |content| *content = RowContent::Assistant(item));
                 } else if !text.is_empty() {
@@ -874,6 +1097,7 @@ impl TranscriptModel {
                 let id = format!("r:{item_id}");
                 let item = TextItem::new(item_id, text);
                 if self.item_index.contains_key(&id) {
+                    self.adopt_turn(&id, turn_id.as_deref());
                     self.update(&id, move |content| *content = RowContent::Reasoning(item));
                 } else if !super::text::trim_ws_nl(text).is_empty() {
                     self.append(Row::new(&id, seq, turn_id, RowContent::Reasoning(item)));
@@ -885,10 +1109,12 @@ impl TranscriptModel {
                 // A row with persisted text is final: a delta that comes after
                 // it (held while a subscribe was in flight, ThreadFeed) would
                 // add its words again and set it streaming.
-                if matches!(self.item(&id).map(|r| &r.content), Some(RowContent::Assistant(item)) if !item.is_streaming) {
+                if matches!(self.item(&id).map(|r| &r.content), Some(RowContent::Assistant(item)) if !item.is_streaming)
+                {
                     return;
                 }
                 if self.item_index.contains_key(&id) {
+                    self.adopt_turn(&id, turn_id.as_deref());
                     let delta = text.clone();
                     self.update(&id, move |content| {
                         if let RowContent::Assistant(item) = content {
@@ -897,12 +1123,16 @@ impl TranscriptModel {
                         }
                     });
                 } else {
-                    let item = TextItem { is_streaming: true, ..TextItem::new(item_id, text) };
+                    let item = TextItem {
+                        is_streaming: true,
+                        ..TextItem::new(item_id, text)
+                    };
                     self.append(Row::new(&id, seq, turn_id, RowContent::Assistant(item)));
                 }
                 if let Some(RowContent::Assistant(item)) = self.item(&id).map(|r| &r.content) {
                     let so_far = item.text.clone();
-                    self.streaming.insert(item_id.clone(), (StreamKind::Assistant, so_far));
+                    self.streaming
+                        .insert(item_id.clone(), (StreamKind::Assistant, so_far));
                 }
             }
 
@@ -911,15 +1141,18 @@ impl TranscriptModel {
                 // A row with persisted text is final: a delta that comes after
                 // it (held while a subscribe was in flight, ThreadFeed) would
                 // add its words again and set it streaming.
-                if matches!(self.item(&id).map(|r| &r.content), Some(RowContent::Reasoning(item)) if !item.is_streaming) {
+                if matches!(self.item(&id).map(|r| &r.content), Some(RowContent::Reasoning(item)) if !item.is_streaming)
+                {
                     return;
                 }
                 // Narration streams as reasoning and lands as the reply's
                 // text (`a:` the same item): finished, it takes no more.
-                if matches!(self.item(&format!("a:{item_id}")).map(|r| &r.content), Some(RowContent::Assistant(item)) if !item.is_streaming) {
+                if matches!(self.item(&format!("a:{item_id}")).map(|r| &r.content), Some(RowContent::Assistant(item)) if !item.is_streaming)
+                {
                     return;
                 }
                 if self.item_index.contains_key(&id) {
+                    self.adopt_turn(&id, turn_id.as_deref());
                     let delta = text.clone();
                     self.update(&id, move |content| {
                         if let RowContent::Reasoning(item) = content {
@@ -928,29 +1161,53 @@ impl TranscriptModel {
                         }
                     });
                 } else {
-                    let item = TextItem { is_streaming: true, ..TextItem::new(item_id, text) };
+                    let item = TextItem {
+                        is_streaming: true,
+                        ..TextItem::new(item_id, text)
+                    };
                     self.append(Row::new(&id, seq, turn_id, RowContent::Reasoning(item)));
                 }
                 if let Some(RowContent::Reasoning(item)) = self.item(&id).map(|r| &r.content) {
                     let so_far = item.text.clone();
-                    self.streaming.insert(item_id.clone(), (StreamKind::Reasoning, so_far));
+                    self.streaming
+                        .insert(item_id.clone(), (StreamKind::Reasoning, so_far));
                 }
             }
 
-            EventPayload::StreamingText { item_id, is_reasoning, text } => {
-                let kind = if *is_reasoning { StreamKind::Reasoning } else { StreamKind::Assistant };
+            EventPayload::StreamingText {
+                item_id,
+                is_reasoning,
+                text,
+            } => {
+                let kind = if *is_reasoning {
+                    StreamKind::Reasoning
+                } else {
+                    StreamKind::Assistant
+                };
                 let id = format!("{}{item_id}", if *is_reasoning { "r:" } else { "a:" });
-                let streaming_item = TextItem { is_streaming: true, ..TextItem::new(item_id, text) };
-                let content = if *is_reasoning { RowContent::Reasoning(streaming_item) } else { RowContent::Assistant(streaming_item) };
+                let streaming_item = TextItem {
+                    is_streaming: true,
+                    ..TextItem::new(item_id, text)
+                };
+                let content = if *is_reasoning {
+                    RowContent::Reasoning(streaming_item)
+                } else {
+                    RowContent::Assistant(streaming_item)
+                };
                 if let Some(&i) = self.item_index.get(&id) {
                     // A row with persisted text is final; leave it alone.
                     let still_streaming = matches!(&self.items[i].content, RowContent::Assistant(item) | RowContent::Reasoning(item) if item.is_streaming);
                     if still_streaming {
+                        let turn = turn_id.or_else(|| self.open_turn.clone());
+                        self.adopt_turn(&id, turn.as_deref());
                         self.update(&id, move |c| *c = content);
                         self.streaming.insert(item_id.clone(), (kind, text.clone()));
                     }
                 } else if !text.is_empty() {
-                    self.append(Row::new(&id, seq, turn_id, content));
+                    // The runner's `inProgress` says no turn: what's still
+                    // streaming is the open turn's.
+                    let turn = turn_id.or_else(|| self.open_turn.clone());
+                    self.append(Row::new(&id, seq, turn, content));
                     self.streaming.insert(item_id.clone(), (kind, text.clone()));
                 }
             }
@@ -966,7 +1223,12 @@ impl TranscriptModel {
                         }
                     });
                 } else {
-                    let tool = ToolItem { item_id: call.item_id.clone(), call: Some(call.clone()), root: self.root.clone(), ..ToolItem::default() };
+                    let tool = ToolItem {
+                        item_id: call.item_id.clone(),
+                        call: Some(call.clone()),
+                        root: self.root.clone(),
+                        ..ToolItem::default()
+                    };
                     self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Tool(tool)));
                     self.note_tool_row(&id);
                 }
@@ -987,14 +1249,23 @@ impl TranscriptModel {
                         }
                     });
                 } else {
-                    let tool = ToolItem { item_id: result.item_id.clone(), result: Some(result.clone()), root: self.root.clone(), ..ToolItem::default() };
+                    let tool = ToolItem {
+                        item_id: result.item_id.clone(),
+                        result: Some(result.clone()),
+                        root: self.root.clone(),
+                        ..ToolItem::default()
+                    };
                     self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Tool(tool)));
                     self.note_tool_row(&id);
                 }
                 if !result.images.is_empty() {
                     let images_id = format!("i:{}", result.item_id);
                     let generated = matches!(self.item(&id).map(|r| &r.content), Some(RowContent::Tool(tool)) if tool.tool_kind() == ToolKind::Image);
-                    let content = RowContent::Images { item_id: result.item_id.clone(), images: result.images.clone(), generated };
+                    let content = RowContent::Images {
+                        item_id: result.item_id.clone(),
+                        images: result.images.clone(),
+                        generated,
+                    };
                     if self.item_index.contains_key(&images_id) {
                         self.update(&images_id, move |c| *c = content);
                     } else {
@@ -1012,7 +1283,8 @@ impl TranscriptModel {
                             // Keep only the tail; it's a live peek, not the record.
                             if tool.live_output.len() > 32_768 {
                                 let count = tool.live_output.chars().count();
-                                tool.live_output = tool.live_output.chars().skip(count - 16_384).collect();
+                                tool.live_output =
+                                    tool.live_output.chars().skip(count - 16_384).collect();
                             }
                         }
                     }
@@ -1034,7 +1306,12 @@ impl TranscriptModel {
                         }
                     });
                 } else {
-                    let tool = ToolItem { item_id: diff.item_id.clone(), diffs: vec![diff.clone()], root: self.root.clone(), ..ToolItem::default() };
+                    let tool = ToolItem {
+                        item_id: diff.item_id.clone(),
+                        diffs: vec![diff.clone()],
+                        root: self.root.clone(),
+                        ..ToolItem::default()
+                    };
                     self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Tool(tool)));
                     self.note_tool_row(&id);
                 }
@@ -1042,12 +1319,19 @@ impl TranscriptModel {
             }
 
             EventPayload::ApprovalRequested(request)
-                if request.name == "ExitPlanMode" && self.item_index.contains_key(&format!("pl:{}", request.item_id.as_deref().unwrap_or(""))) =>
+                if request.name == "ExitPlanMode"
+                    && self.item_index.contains_key(&format!(
+                        "pl:{}",
+                        request.item_id.as_deref().unwrap_or("")
+                    )) =>
             {
                 // Claude's plan waiting on its ExitPlanMode call: the plan
                 // card is its card. Still pending, so Return in an empty
                 // composer approves it and the turn reads as waiting on Mike.
-                self.pending_cards.insert(format!("ap:{}", request.approval_id), turn_id.unwrap_or_default());
+                self.pending_cards.insert(
+                    format!("ap:{}", request.approval_id),
+                    turn_id.unwrap_or_default(),
+                );
                 self.plan_approvals.insert(request.approval_id.clone());
                 self.tail_dirty = true;
             }
@@ -1055,11 +1339,17 @@ impl TranscriptModel {
             EventPayload::ApprovalRequested(request) => {
                 let id = format!("ap:{}", request.approval_id);
                 // A subagent's tools have no item id, and no row of their own.
-                let tool_id = request.item_id.as_deref().filter(|i| !i.is_empty()).map(|i| format!("t:{i}"));
+                let tool_id = request
+                    .item_id
+                    .as_deref()
+                    .filter(|i| !i.is_empty())
+                    .map(|i| format!("t:{i}"));
                 if let Some(tool_id) = &tool_id {
                     self.approval_for_tool.insert(tool_id.clone(), id.clone());
                 }
-                let shown = tool_id.as_ref().is_some_and(|t| self.item_index.contains_key(t));
+                let shown = tool_id
+                    .as_ref()
+                    .is_some_and(|t| self.item_index.contains_key(t));
                 let start_request = self.start_requests.get(&request.approval_id).cloned();
                 // One card per approval id. The runner never asks twice under
                 // one id, but another runner can: a harmless card, then a
@@ -1073,18 +1363,33 @@ impl TranscriptModel {
                 // its place (Codex, round two).
                 if let Some(&index) = self.item_index.get(&id) {
                     let settled = match &self.items[index].content {
-                        RowContent::Approval(old) => old.resolution.is_some() || old.is_start_request(),
+                        RowContent::Approval(old) => {
+                            old.resolution.is_some() || old.is_start_request()
+                        }
                         _ => true,
                     };
                     if !settled {
-                        let replacement = ApprovalItem::new(request.clone(), self.root.clone(), shown, start_request);
-                        self.update(&id, move |content| *content = RowContent::Approval(replacement));
+                        let replacement = ApprovalItem::new(
+                            request.clone(),
+                            self.root.clone(),
+                            shown,
+                            start_request,
+                        );
+                        self.update(&id, move |content| {
+                            *content = RowContent::Approval(replacement)
+                        });
                         self.tail_dirty = true;
                     }
                     return;
                 }
-                let item = ApprovalItem::new(request.clone(), self.root.clone(), shown, start_request);
-                self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Approval(item)));
+                let item =
+                    ApprovalItem::new(request.clone(), self.root.clone(), shown, start_request);
+                self.append(Row::new(
+                    &id,
+                    seq,
+                    turn_id.clone(),
+                    RowContent::Approval(item),
+                ));
                 self.pending_cards.insert(id, turn_id.unwrap_or_default());
                 self.tail_dirty = true;
             }
@@ -1104,8 +1409,16 @@ impl TranscriptModel {
 
             EventPayload::QuestionRequested(request) => {
                 let id = format!("q:{}", request.approval_id);
-                let item = QuestionItem { request: request.clone(), resolution: None };
-                self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Question(item)));
+                let item = QuestionItem {
+                    request: request.clone(),
+                    resolution: None,
+                };
+                self.append(Row::new(
+                    &id,
+                    seq,
+                    turn_id.clone(),
+                    RowContent::Question(item),
+                ));
                 self.pending_cards.insert(id, turn_id.unwrap_or_default());
                 self.tail_dirty = true;
             }
@@ -1114,8 +1427,16 @@ impl TranscriptModel {
                 // `s:` keeps it out of pending_approval_ids: Return in an
                 // empty composer must never answer a secret card.
                 let id = format!("s:{}", request.approval_id);
-                let item = SecretItem { request: request.clone(), resolution: None };
-                self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Secret(item)));
+                let item = SecretItem {
+                    request: request.clone(),
+                    resolution: None,
+                };
+                self.append(Row::new(
+                    &id,
+                    seq,
+                    turn_id.clone(),
+                    RowContent::Secret(item),
+                ));
                 self.pending_cards.insert(id, turn_id.unwrap_or_default());
                 self.tail_dirty = true;
             }
@@ -1133,7 +1454,12 @@ impl TranscriptModel {
                         self.update(&id, move |content| *content = RowContent::Review(update));
                     }
                 } else {
-                    self.append(Row::new(&id, seq, turn_id, RowContent::Review(review.clone())));
+                    self.append(Row::new(
+                        &id,
+                        seq,
+                        turn_id,
+                        RowContent::Review(review.clone()),
+                    ));
                 }
             }
 
@@ -1167,7 +1493,12 @@ impl TranscriptModel {
                     let card = PlanCard::new(item_id, text);
                     self.update(&id, move |content| *content = RowContent::PlanCard(card));
                 } else {
-                    self.append(Row::new(&id, seq, turn_id, RowContent::PlanCard(PlanCard::new(item_id, text))));
+                    self.append(Row::new(
+                        &id,
+                        seq,
+                        turn_id,
+                        RowContent::PlanCard(PlanCard::new(item_id, text)),
+                    ));
                 }
             }
 
@@ -1176,7 +1507,11 @@ impl TranscriptModel {
                 let go = *go;
                 self.update(&id, move |content| {
                     if let RowContent::PlanCard(card) = content {
-                        card.state = if go { PlanCardState::Approved } else { PlanCardState::SentBack };
+                        card.state = if go {
+                            PlanCardState::Approved
+                        } else {
+                            PlanCardState::SentBack
+                        };
                     }
                 });
                 if go && self.item_index.contains_key(&id) {
@@ -1187,8 +1522,15 @@ impl TranscriptModel {
 
             EventPayload::PlanUpdated(entries) => {
                 let key = turn_id.clone().unwrap_or_else(|| format!("seq{seq}"));
-                let taking = self.plan_taking_steps.clone().filter(|id| self.item_index.contains_key(id));
-                let existing = self.plan_row_for_turn.get(&key).cloned().filter(|id| self.item_index.contains_key(id));
+                let taking = self
+                    .plan_taking_steps
+                    .clone()
+                    .filter(|id| self.item_index.contains_key(id));
+                let existing = self
+                    .plan_row_for_turn
+                    .get(&key)
+                    .cloned()
+                    .filter(|id| self.item_index.contains_key(id));
                 if let Some(id) = taking {
                     // The approved plan's own steps: its card becomes the checklist.
                     self.plan_row_for_turn.insert(key, id.clone());
@@ -1204,7 +1546,12 @@ impl TranscriptModel {
                 } else {
                     let id = format!("p:{seq}");
                     self.plan_row_for_turn.insert(key, id.clone());
-                    self.append(Row::new(&id, seq, turn_id, RowContent::Plan(entries.clone())));
+                    self.append(Row::new(
+                        &id,
+                        seq,
+                        turn_id,
+                        RowContent::Plan(entries.clone()),
+                    ));
                 }
             }
 
@@ -1219,11 +1566,25 @@ impl TranscriptModel {
                     self.turn_starts.insert(key.clone(), date);
                 }
                 // A turn nobody's message started: the agent picked up again
-                // as background work finished. Mark how long it was away.
+                // as background work finished, or the runner told it
+                // something it was waiting for. Mark how long it was away,
+                // unless a "Woke up" note just said so.
                 let gap_id = format!("gap:{key}");
-                if !self.messaged_turns.contains(&key) && !self.item_index.contains_key(&gap_id) {
-                    if let (Some(from), Some(to)) = (self.last_turn_end, self.turn_starts.get(&key).copied()) {
-                        let gap = TurnGap { from, to, woke_by: woke_by.clone() };
+                let runner_wake = self.runner_turns.get(&key).cloned();
+                let noted = runner_wake.is_some() && self.woke_note_since_turn;
+                if !self.messaged_turns.contains(&key)
+                    && !noted
+                    && !self.item_index.contains_key(&gap_id)
+                {
+                    if let (Some(from), Some(to)) =
+                        (self.last_turn_end, self.turn_starts.get(&key).copied())
+                    {
+                        let gap = TurnGap {
+                            from,
+                            to,
+                            woke_by: woke_by.clone(),
+                            runner_wake,
+                        };
                         self.append(Row::new(&gap_id, seq, turn_id, RowContent::Gap(gap)));
                     }
                 }
@@ -1240,26 +1601,38 @@ impl TranscriptModel {
                     completion.turn_id.clone()
                 };
                 self.completed_turns.insert(key.clone());
-                if self.plan_taking_steps.is_some() && self.plan_steps_turn.as_deref() == Some(key.as_str()) {
+                if self.plan_taking_steps.is_some()
+                    && self.plan_steps_turn.as_deref() == Some(key.as_str())
+                {
                     self.plan_taking_steps = None;
                     self.plan_steps_turn = None;
                 }
                 if let Some(date) = parse_iso8601(&event.ts) {
                     self.last_turn_end = Some(date);
                 }
+                self.woke_note_since_turn = false;
                 if let Some(turn) = &turn_id {
                     self.completed_turns.insert(turn.clone());
                 }
-                if self.open_turn.as_deref().is_some_and(|open| open == key || Some(open) == turn_id.as_deref() || completion.turn_id.is_empty()) {
+                if self.open_turn.as_deref().is_some_and(|open| {
+                    open == key || Some(open) == turn_id.as_deref() || completion.turn_id.is_empty()
+                }) {
                     self.open_turn = None;
                 }
                 // The error row just before says why, once the runner knows.
                 if let Some(kind) = completion.error_kind {
-                    let error_id = self.error_row_for_turn.get(&key).cloned().or_else(|| turn_id.as_ref().and_then(|t| self.error_row_for_turn.get(t).cloned()));
+                    let error_id = self.error_row_for_turn.get(&key).cloned().or_else(|| {
+                        turn_id
+                            .as_ref()
+                            .and_then(|t| self.error_row_for_turn.get(t).cloned())
+                    });
                     if let Some(error_id) = error_id {
                         self.update(&error_id, move |content| {
                             if let RowContent::Error { message, .. } = content {
-                                *content = RowContent::Error { message: std::mem::take(message), kind: Some(kind) };
+                                *content = RowContent::Error {
+                                    message: std::mem::take(message),
+                                    kind: Some(kind),
+                                };
                             }
                         });
                     }
@@ -1270,30 +1643,51 @@ impl TranscriptModel {
                     self.update(&id, move |content| *content = RowContent::Footer(footer));
                 } else {
                     let row_turn = turn_id.clone().or_else(|| Some(completion.turn_id.clone()));
-                    self.append(Row::new(&id, seq, row_turn.clone(), RowContent::Footer(completion.clone())));
+                    self.append(Row::new(
+                        &id,
+                        seq,
+                        row_turn.clone(),
+                        RowContent::Footer(completion.clone()),
+                    ));
                     // Any finished turn closes the last card; one that needs
                     // Mike opens the next, under its footer.
                     self.close_open_asks();
                     // The card sits under the turn's footer, its answers
                     // picked there and sent from the composer (Mike, 28 Oct).
-                    if completion.outcome == TurnOutcome::Completed && completion.needs.as_deref() == Some("you") && !completion.asks.is_empty() {
+                    if completion.outcome == TurnOutcome::Completed
+                        && completion.needs.as_deref() == Some("you")
+                        && !completion.asks.is_empty()
+                    {
                         let card_id = format!("ak:{seq}");
                         let mut card = AsksCard::new(seq, completion.asks.clone());
-                        card.ticked = completion.asks.iter().enumerate().filter(|(_, ask)| ask.ticked).map(|(i, _)| i as i64).collect();
+                        card.ticked = completion
+                            .asks
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, ask)| ask.ticked)
+                            .map(|(i, _)| i as i64)
+                            .collect();
                         card.picks = self.ask_picks.get(&seq).cloned().unwrap_or_default();
                         card.notes = self.ask_notes.get(&seq).cloned().unwrap_or_default();
                         self.append(Row::new(&card_id, seq, row_turn, RowContent::Asks(card)));
                         self.asks_row_for_seq.insert(seq, card_id.clone());
                         self.open_asks_row = Some(card_id);
-                    } else if completion.outcome == TurnOutcome::Completed && completion.needs.as_deref() == Some("nothing") {
+                    } else if completion.outcome == TurnOutcome::Completed
+                        && completion.needs.as_deref() == Some("nothing")
+                    {
                         // The done card: goes, as an asks card does, once
                         // Mike replies or the next turn ends.
                         let card_id = format!("ak:{seq}");
                         let mut card = AsksCard::new(seq, Vec::new());
                         card.next = completion.next.clone();
                         card.picked_next = self.next_picks.get(&seq).cloned().unwrap_or_default();
-                        card.explain_next = self.next_explains.get(&seq).cloned().unwrap_or_default();
-                        card.loose_ends = self.loose_ends.as_ref().filter(|l| l.seq == seq).map(|l| l.ends.clone());
+                        card.explain_next =
+                            self.next_explains.get(&seq).cloned().unwrap_or_default();
+                        card.loose_ends = self
+                            .loose_ends
+                            .as_ref()
+                            .filter(|l| l.seq == seq)
+                            .map(|l| l.ends.clone());
                         self.append(Row::new(&card_id, seq, row_turn, RowContent::Asks(card)));
                         self.asks_row_for_seq.insert(seq, card_id.clone());
                         self.open_asks_row = Some(card_id);
@@ -1313,12 +1707,28 @@ impl TranscriptModel {
             }
 
             EventPayload::SystemNote(text) => {
-                self.append(Row::new(&format!("n:{seq}"), seq, turn_id, RowContent::Note(text.clone())));
+                if text.starts_with("Woke up") {
+                    self.woke_note_since_turn = true;
+                }
+                self.append(Row::new(
+                    &format!("n:{seq}"),
+                    seq,
+                    turn_id,
+                    RowContent::Note(text.clone()),
+                ));
             }
 
             EventPayload::Error(message) => {
                 let id = format!("e:{seq}");
-                self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Error { message: message.clone(), kind: None }));
+                self.append(Row::new(
+                    &id,
+                    seq,
+                    turn_id.clone(),
+                    RowContent::Error {
+                        message: message.clone(),
+                        kind: None,
+                    },
+                ));
                 if let Some(turn) = turn_id {
                     self.error_row_for_turn.insert(turn, id);
                 }
@@ -1334,7 +1744,13 @@ impl TranscriptModel {
                 if run.trigger.is_none() {
                     self.pressed_runs.insert(row_id.clone());
                 }
-                let tool = ToolItem { item_id, call: Some(call), result: Some(result), root: self.root.clone(), ..ToolItem::default() };
+                let tool = ToolItem {
+                    item_id,
+                    call: Some(call),
+                    result: Some(result),
+                    root: self.root.clone(),
+                    ..ToolItem::default()
+                };
                 self.append(Row::new(&row_id, seq, turn_id, RowContent::Tool(tool)));
             }
 
@@ -1349,9 +1765,18 @@ impl TranscriptModel {
         }
         let streaming = std::mem::take(&mut self.streaming);
         for (item_id, (kind, _)) in streaming {
-            let id = format!("{}{item_id}", if kind == StreamKind::Reasoning { "r:" } else { "a:" });
+            let id = format!(
+                "{}{item_id}",
+                if kind == StreamKind::Reasoning {
+                    "r:"
+                } else {
+                    "a:"
+                }
+            );
             self.update(&id, |content| match content {
-                RowContent::Assistant(item) | RowContent::Reasoning(item) => item.is_streaming = false,
+                RowContent::Assistant(item) | RowContent::Reasoning(item) => {
+                    item.is_streaming = false
+                }
                 _ => {}
             });
         }
@@ -1366,7 +1791,13 @@ impl TranscriptModel {
     pub(crate) fn is_work_row(row: &Row) -> bool {
         match &row.content {
             RowContent::Tool(tool) => !Self::is_taken_end_turn(tool),
-            RowContent::Note(_) if row.content.is_wake_note() || row.content.is_login_note() || row.content.is_saved_message_note() => false,
+            RowContent::Note(_)
+                if row.content.is_wake_note()
+                    || row.content.is_login_note()
+                    || row.content.is_saved_message_note() =>
+            {
+                false
+            }
             RowContent::Reasoning(_) | RowContent::Note(_) => true,
             RowContent::Approval(item) => item.is_allowed(),
             _ => false,
@@ -1377,7 +1808,9 @@ impl TranscriptModel {
     /// shown: the card under the turn's footer says what it said. A refused
     /// one stays, as work, since the turn carried on because of it.
     pub fn is_taken_end_turn(tool: &ToolItem) -> bool {
-        let Some(name) = tool.call.as_ref().map(|c| c.name.as_str()) else { return false };
+        let Some(name) = tool.call.as_ref().map(|c| c.name.as_str()) else {
+            return false;
+        };
         if !name.starts_with("mcp__threadbear") || !name.ends_with("__end_turn") {
             return false;
         }
@@ -1435,7 +1868,9 @@ impl TranscriptModel {
             RowContent::User(message) if !message.is_from_runner() => {}
             _ => return false,
         }
-        let Some(turn) = &self.items[k].turn_id else { return true };
+        let Some(turn) = &self.items[k].turn_id else {
+            return true;
+        };
         let mut j = k as isize - 1;
         while j >= 0 && self.items[j as usize].turn_id.is_none() {
             j -= 1;
@@ -1482,7 +1917,11 @@ impl TranscriptModel {
             }
             high += 1;
         }
-        if i < high && self.items[low..high].iter().any(|item| item.turn_id.is_some()) {
+        if i < high
+            && self.items[low..high]
+                .iter()
+                .any(|item| item.turn_id.is_some())
+        {
             Some(low..high)
         } else {
             None
@@ -1509,9 +1948,17 @@ impl TranscriptModel {
                 turns.push(id);
             }
         }
-        let messaged: HashSet<String> = turn.clone().filter(|&k| matches!(self.items[k].content, RowContent::User(_))).map(key).collect();
-        let summary = turn.clone().rev().find(|&k| self.text_item(k).is_some_and(|t| t.is_summary) && messaged.contains(&key(k)));
-        let from = summary.and_then(|k| turns.iter().position(|id| *id == key(k))).unwrap_or(0);
+        let messaged: HashSet<String> = turn
+            .clone()
+            .filter(|&k| matches!(self.items[k].content, RowContent::User(_)))
+            .map(key)
+            .collect();
+        let summary = turn.clone().rev().find(|&k| {
+            self.text_item(k).is_some_and(|t| t.is_summary) && messaged.contains(&key(k))
+        });
+        let from = summary
+            .and_then(|k| turns.iter().position(|id| *id == key(k)))
+            .unwrap_or(0);
         let mut out = HashSet::new();
         for id in &turns[from..] {
             // Without the error's own words over again (`is_error_echo`),
@@ -1519,7 +1966,10 @@ impl TranscriptModel {
             // turn wrote just before its login ran out, and taking them out
             // afterwards left that turn with no reply at all (Codex's
             // review, 13 Nov).
-            let items: Vec<usize> = turn.clone().filter(|&k| key(k) == *id && !self.is_error_echo(k)).collect();
+            let items: Vec<usize> = turn
+                .clone()
+                .filter(|&k| key(k) == *id && !self.is_error_echo(k))
+                .collect();
             out.extend(self.reply_of(&items));
         }
         out
@@ -1532,15 +1982,23 @@ impl TranscriptModel {
     /// finished turn draws only the error.
     fn is_error_echo(&self, k: usize) -> bool {
         let item = &self.items[k];
-        let RowContent::Assistant(said) = &item.content else { return false };
+        let RowContent::Assistant(said) = &item.content else {
+            return false;
+        };
         // Its turn's error; for a message that never got its turn (one that
         // was streaming as the app reconnected keeps none), the error right
         // after it.
         let error = match &item.turn_id {
-            Some(turn) => self.error_row_for_turn.get(turn).and_then(|id| self.item_index.get(id)).and_then(|&i| self.items.get(i)),
+            Some(turn) => self
+                .error_row_for_turn
+                .get(turn)
+                .and_then(|id| self.item_index.get(id))
+                .and_then(|&i| self.items.get(i)),
             None => self.items.get(k + 1),
         };
-        let Some(RowContent::Error { message, .. }) = error.map(|row| &row.content) else { return false };
+        let Some(RowContent::Error { message, .. }) = error.map(|row| &row.content) else {
+            return false;
+        };
         let message = message.trim();
         !message.is_empty() && message == said.text.trim()
     }
@@ -1555,11 +2013,21 @@ impl TranscriptModel {
     /// stopped.
     fn limit_was_handled(&self, k: usize) -> bool {
         let item = &self.items[k];
-        if !matches!(item.content, RowContent::Error { kind: Some(TurnErrorKind::UsageLimit), .. }) {
+        if !matches!(
+            item.content,
+            RowContent::Error {
+                kind: Some(TurnErrorKind::UsageLimit),
+                ..
+            }
+        ) {
             return false;
         }
         // The notes between this turn and the next one.
-        self.items[k + 1..].iter().filter(|later| later.turn_id != item.turn_id).take_while(|later| later.turn_id.is_none()).any(|later| later.content.is_login_note())
+        self.items[k + 1..]
+            .iter()
+            .filter(|later| later.turn_id != item.turn_id)
+            .take_while(|later| later.turn_id.is_none())
+            .any(|later| later.content.is_login_note())
     }
 
     /// What a finished turn doesn't draw at all, in its line of work or out
@@ -1577,24 +2045,41 @@ impl TranscriptModel {
         let text = |k: usize| self.text_item(k);
         // A message sent into the turn (the runner's "the app restarted")
         // starts a fresh answer, so only an end_turn after it ends this one.
-        let fresh = turn.iter().rposition(|&k| matches!(self.items[k].content, RowContent::User(_))).map_or(0, |p| p + 1);
+        let fresh = turn
+            .iter()
+            .rposition(|&k| matches!(self.items[k].content, RowContent::User(_)))
+            .map_or(0, |p| p + 1);
         // The last end_turn that gave a card, not one that only added archive
         // or snooze ("Added: ...").
         let is_taken = |k: usize| matches!(&self.items[k].content, RowContent::Tool(tool) if Self::is_taken_end_turn(tool));
         let end = turn[fresh..]
             .iter()
             .rposition(|&k| match &self.items[k].content {
-                RowContent::Tool(tool) => Self::is_taken_end_turn(tool) && !tool.result.as_ref().is_some_and(|r| r.text.starts_with("Added:")),
+                RowContent::Tool(tool) => {
+                    Self::is_taken_end_turn(tool)
+                        && !tool
+                            .result
+                            .as_ref()
+                            .is_some_and(|r| r.text.starts_with("Added:"))
+                }
                 _ => false,
             })
             .map(|p| p + fresh)
-            .or_else(|| turn[fresh..].iter().position(|&k| is_taken(k)).map(|p| p + fresh))
+            .or_else(|| {
+                turn[fresh..]
+                    .iter()
+                    .position(|&k| is_taken(k))
+                    .map(|p| p + fresh)
+            })
             .unwrap_or(turn.len());
         // One reply: the agent's message after end_turn is the reply, and
         // nothing else the turn wrote competes with it. One between the
         // fresh answer's start and its last card belongs to a card that was
         // replaced after a wake.
-        let finals: Vec<usize> = (0..turn.len()).filter(|&p| text(turn[p]).is_some_and(|t| t.is_final) && !(fresh..end).contains(&p)).map(|p| turn[p]).collect();
+        let finals: Vec<usize> = (0..turn.len())
+            .filter(|&p| text(turn[p]).is_some_and(|t| t.is_final) && !(fresh..end).contains(&p))
+            .map(|p| turn[p])
+            .collect();
         if !finals.is_empty() {
             return finals.into_iter().collect();
         }
@@ -1603,31 +2088,77 @@ impl TranscriptModel {
         // land between a call and its result. A message sent into the
         // running turn starts a new answer too; it counts by place, as live
         // text carries the seq of the event before it.
-        let steps: Vec<usize> = before_end.iter().copied().filter(|&k| matches!(self.items[k].content, RowContent::User(_)) || Self::is_real_step(&self.items[k])).collect();
-        let last_result = steps.iter().filter_map(|&k| self.result_seqs.get(&self.items[k].id).copied()).max().unwrap_or(i64::MIN);
+        let steps: Vec<usize> = before_end
+            .iter()
+            .copied()
+            .filter(|&k| {
+                matches!(self.items[k].content, RowContent::User(_))
+                    || Self::is_real_step(&self.items[k])
+            })
+            .collect();
+        let last_result = steps
+            .iter()
+            .filter_map(|&k| self.result_seqs.get(&self.items[k].id).copied())
+            .max()
+            .unwrap_or(i64::MIN);
         let last_step = steps.last().copied();
         let final_words: Vec<usize> = before_end
             .iter()
             .copied()
-            .filter(|&k| text(k).is_some_and(|t| !t.is_summary) && last_step.map_or(true, |last| k > last) && self.items[k].seq > last_result)
+            .filter(|&k| {
+                text(k).is_some_and(|t| !t.is_summary)
+                    && last_step.is_none_or(|last| k > last)
+                    && self.items[k].seq > last_result
+            })
             .collect();
         // The last card's own summary: one a wake replaced says what was true
         // before it (from Codex's review).
         let summary_scope = if end < turn.len() { &turn[end..] } else { turn };
-        if let Some(&summary) = summary_scope.iter().rev().find(|&&k| text(k).is_some_and(|t| t.is_summary)) {
+        if let Some(&summary) = summary_scope
+            .iter()
+            .rev()
+            .find(|&&k| text(k).is_some_and(|t| t.is_summary))
+        {
             // A narration block is only a paraphrase, so it never beats the bullets.
-            let mut words: Vec<usize> = final_words.iter().copied().filter(|&k| text(k).is_some_and(|t| !t.is_narration)).collect();
+            let mut words: Vec<usize> = final_words
+                .iter()
+                .copied()
+                .filter(|&k| text(k).is_some_and(|t| !t.is_narration))
+                .collect();
             if words.is_empty() {
-                let tail = if end < turn.len() { &turn[end..] } else { &turn[turn.len()..] };
-                words = tail.iter().copied().filter(|&k| text(k).is_some_and(|t| !t.is_summary && !t.is_narration)).collect();
+                let tail = if end < turn.len() {
+                    &turn[end..]
+                } else {
+                    &turn[turn.len()..]
+                };
+                words = tail
+                    .iter()
+                    .copied()
+                    .filter(|&k| text(k).is_some_and(|t| !t.is_summary && !t.is_narration))
+                    .collect();
             }
-            let said: usize = words.iter().map(|&k| text(k).map_or(0, |t| super::text::count(&t.text))).sum();
+            let said: usize = words
+                .iter()
+                .map(|&k| text(k).map_or(0, |t| super::text::count(&t.text)))
+                .sum();
             // With bullet replies off, a sign-off line wins too.
-            let bar = if text(summary).is_some_and(|t| t.gives_way) { 0 } else { text(summary).map_or(0, |t| super::text::count(&t.text)) };
-            return if said > bar { words.into_iter().collect() } else { HashSet::from([summary]) };
+            let bar = if text(summary).is_some_and(|t| t.gives_way) {
+                0
+            } else {
+                text(summary).map_or(0, |t| super::text::count(&t.text))
+            };
+            return if said > bar {
+                words.into_iter().collect()
+            } else {
+                HashSet::from([summary])
+            };
         }
         // Words win over a narration paraphrase of them.
-        let words: Vec<usize> = final_words.iter().copied().filter(|&k| text(k).is_some_and(|t| !t.is_narration)).collect();
+        let words: Vec<usize> = final_words
+            .iter()
+            .copied()
+            .filter(|&k| text(k).is_some_and(|t| !t.is_narration))
+            .collect();
         if !words.is_empty() {
             return words.into_iter().collect();
         }
@@ -1651,8 +2182,12 @@ impl TranscriptModel {
     /// (pin, update_project, end_turn) and ToolSearch, which only loads a
     /// tool. A message after a pin is still the agent's last word.
     fn is_real_step(row: &Row) -> bool {
-        let RowContent::Tool(tool) = &row.content else { return false };
-        let Some(name) = tool.call.as_ref().map(|c| c.name.as_str()) else { return true };
+        let RowContent::Tool(tool) = &row.content else {
+            return false;
+        };
+        let Some(name) = tool.call.as_ref().map(|c| c.name.as_str()) else {
+            return true;
+        };
         !name.starts_with("mcp__threadbear") && name != "ToolSearch"
     }
 
@@ -1672,8 +2207,12 @@ impl TranscriptModel {
             }
         }
         match &item.content {
-            RowContent::Approval(approval) => approval.request.item_id.as_deref().unwrap_or("").is_empty(),
-            RowContent::Question(question) => question.request.item_id.as_deref().unwrap_or("").is_empty(),
+            RowContent::Approval(approval) => {
+                approval.request.item_id.as_deref().unwrap_or("").is_empty()
+            }
+            RowContent::Question(question) => {
+                question.request.item_id.as_deref().unwrap_or("").is_empty()
+            }
             _ => false,
         }
     }
@@ -1684,14 +2223,26 @@ impl TranscriptModel {
     /// the work carried on. The note an edit of Mike's leaves stays.
     fn stays_out(&self, k: usize, replies: &HashSet<usize>) -> bool {
         let item = &self.items[k];
-        if replies.contains(&k) || item.id.starts_with("rw:") || item.content.is_wake_note() || item.content.is_login_note() || item.content.is_saved_message_note() {
+        if replies.contains(&k)
+            || item.id.starts_with("rw:")
+            || item.content.is_wake_note()
+            || item.content.is_login_note()
+            || item.content.is_saved_message_note()
+        {
             return true;
         }
         match &item.content {
             RowContent::User(message) => !message.is_from_runner(),
-            RowContent::Error { .. } | RowContent::Footer(_) | RowContent::Asks(_) | RowContent::Review(_) | RowContent::Gap(_) | RowContent::PlanCard(_) => true,
+            RowContent::Error { .. }
+            | RowContent::Footer(_)
+            | RowContent::Asks(_)
+            | RowContent::Review(_)
+            | RowContent::Gap(_)
+            | RowContent::PlanCard(_) => true,
             RowContent::Images { generated, .. } => *generated,
-            RowContent::Tool(tool) => Self::is_taken_end_turn(tool) || self.pressed_runs.contains(&item.id),
+            RowContent::Tool(tool) => {
+                Self::is_taken_end_turn(tool) || self.pressed_runs.contains(&item.id)
+            }
             _ => false,
         }
     }
@@ -1710,7 +2261,15 @@ impl TranscriptModel {
                     continue;
                 }
                 waiting = Some(match waiting.take() {
-                    Some((_, earlier)) => (k, TurnGap { from: earlier.from, to: gap.to, woke_by: [earlier.woke_by, gap.woke_by.clone()].concat() }),
+                    Some((_, earlier)) => (
+                        k,
+                        TurnGap {
+                            from: earlier.from,
+                            to: gap.to,
+                            woke_by: [earlier.woke_by, gap.woke_by.clone()].concat(),
+                            runner_wake: gap.runner_wake.clone().or(earlier.runner_wake),
+                        },
+                    ),
                     None => (k, gap.clone()),
                 });
                 continue;
@@ -1769,7 +2328,8 @@ impl TranscriptModel {
         let i = i as usize;
         let turn = &self.items[i].turn_id;
         let mut j = i + 1;
-        while j < self.items.len() && self.is_work(&self.items[j]) && self.items[j].turn_id == *turn {
+        while j < self.items.len() && self.is_work(&self.items[j]) && self.items[j].turn_id == *turn
+        {
             j += 1;
         }
         j
@@ -1778,11 +2338,21 @@ impl TranscriptModel {
     /// The step a work: link in turn `turn_id` means (`WorkLinks.step`), and
     /// the group row it's folded into, None when it's shown as itself.
     pub fn work_step(&self, quote: &str, turn_id: &str) -> Option<(String, Option<String>)> {
-        let mut found = WorkLinks::step(quote, self.items.iter().filter(|item| item.turn_id.as_deref() == Some(turn_id)));
+        let mut found = WorkLinks::step(
+            quote,
+            self.items
+                .iter()
+                .filter(|item| item.turn_id.as_deref() == Some(turn_id)),
+        );
         // A runner's turn's summary covers its whole stretch, so it can
         // point at a step from the turn Mike's message started.
         if found.is_none() {
-            if let Some(block) = self.items.iter().position(|item| item.turn_id.as_deref() == Some(turn_id)).and_then(|first| self.done_block(first as isize)) {
+            if let Some(block) = self
+                .items
+                .iter()
+                .position(|item| item.turn_id.as_deref() == Some(turn_id))
+                .and_then(|first| self.done_block(first as isize))
+            {
                 found = WorkLinks::step(quote, self.items[block].iter());
             }
         }
@@ -1793,10 +2363,22 @@ impl TranscriptModel {
             if self.stays_out(i, &replies) {
                 return Some((row.id.clone(), None));
             }
-            return Some((row.id.clone(), turn.into_iter().find(|&k| !self.stays_out(k, &replies) && !self.is_unshown(k)).map(|k| format!("g:{}", self.items[k].id))));
+            return Some((
+                row.id.clone(),
+                turn.into_iter()
+                    .find(|&k| !self.stays_out(k, &replies) && !self.is_unshown(k))
+                    .map(|k| format!("g:{}", self.items[k].id)),
+            ));
         }
         let start = self.run_start(i as isize);
-        Some((row.id.clone(), if self.run_end(i as isize) - start > 1 { Some(format!("g:{}", self.items[start].id)) } else { None }))
+        Some((
+            row.id.clone(),
+            if self.run_end(i as isize) - start > 1 {
+                Some(format!("g:{}", self.items[start].id))
+            } else {
+                None
+            },
+        ))
     }
 
     /// The first row standing for item `item` or a later one.
@@ -1830,10 +2412,15 @@ impl TranscriptModel {
         // A new item can join the run before it, or end it (so it's no
         // longer the live group).
         if let Some(added) = self.dirty_insert {
-            start = start.min(self.run_start(added as isize)).min(self.run_start(added as isize - 1));
+            start = start
+                .min(self.run_start(added as isize))
+                .min(self.run_start(added as isize - 1));
             // A new turn or a note can join a finished stretch or end it
             // (done_block), which changes rows back to its first message.
-            if added > 0 && added < self.items.len() && self.items[added].turn_id != self.items[added - 1].turn_id {
+            if added > 0
+                && added < self.items.len()
+                && self.items[added].turn_id != self.items[added - 1].turn_id
+            {
                 start = start.min(self.block_start(added));
             }
         }
@@ -1849,7 +2436,11 @@ impl TranscriptModel {
         let first = self.first_row(start);
         // Rows from `last` on stand for items past the change (and the
         // working line) and stay as they are.
-        let last = if bounded { self.first_row(end) } else { self.rows.len() };
+        let last = if bounded {
+            self.first_row(end)
+        } else {
+            self.rows.len()
+        };
         let (built_rows, built_starts) = self.build_rows(start, Some(end), !bounded);
 
         let mut change = TranscriptChange::default();
@@ -1880,7 +2471,11 @@ impl TranscriptModel {
         let built_count = built_rows.len();
         self.rows.splice(first..last, built_rows);
         self.row_starts.splice(first..last, built_starts);
-        let shifted = if shifted_all { self.rows.len() } else { first + built_count };
+        let shifted = if shifted_all {
+            self.rows.len()
+        } else {
+            first + built_count
+        };
         for position in first..shifted {
             let id = self.rows[position].id.clone();
             self.index.insert(id, position);
@@ -1890,7 +2485,16 @@ impl TranscriptModel {
 
     /// The rows for items from `start` (a run boundary) up to `end`, with
     /// the working line after them while a turn runs.
-    fn build_rows(&self, start: usize, end: Option<usize>, working_line: bool) -> (Vec<Row>, Vec<usize>) {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "baselined at 309 lines when the lint was turned on (20 Nov 2026); split it when it's next worked on"
+    )]
+    fn build_rows(
+        &self,
+        start: usize,
+        end: Option<usize>,
+        working_line: bool,
+    ) -> (Vec<Row>, Vec<usize>) {
         let end = end.unwrap_or(self.items.len());
         let mut out: Vec<Row> = Vec::with_capacity(end.saturating_sub(start) + 2);
         let mut starts: Vec<usize> = Vec::with_capacity(out.capacity());
@@ -1914,11 +2518,24 @@ impl TranscriptModel {
                 // Every row of a finished turn starts at its first item, so a
                 // change anywhere in it rebuilds it whole (run_start).
                 let replies = self.replies(turn.clone());
-                let folded: Vec<usize> = turn.clone().filter(|&k| !self.stays_out(k, &replies) && !self.is_floating_card(k) && !self.is_unshown(k)).collect();
+                let folded: Vec<usize> = turn
+                    .clone()
+                    .filter(|&k| {
+                        !self.stays_out(k, &replies)
+                            && !self.is_floating_card(k)
+                            && !self.is_unshown(k)
+                    })
+                    .collect();
                 // The line of work goes above the reply, even when the reply
                 // came first: a turn that only answered has its summary
                 // folded under it (reply_of).
-                let group_at = folded.first().map(|&first| replies.iter().copied().min().map_or(first, |r| first.min(r)));
+                let group_at = folded.first().map(|&first| {
+                    replies
+                        .iter()
+                        .copied()
+                        .min()
+                        .map_or(first, |r| first.min(r))
+                });
                 // A stretch with the runner's turns in it has a footer for
                 // each: the last one stands for them all, with their time and
                 // cost added up, and the changes card has every turn's edits.
@@ -1937,15 +2554,31 @@ impl TranscriptModel {
                 // so it stays off the card (Mike, 12 Nov 2026). A stretch can
                 // hold earlier turns' replies too, so it's that turn's own;
                 // with no reply, over its footer.
-                let reviewed = footers.iter().rev().find_map(|(index, done)| done.review.as_ref().map(|review| (*index, review)));
+                let reviewed = footers
+                    .iter()
+                    .rev()
+                    .find_map(|(index, done)| done.review.as_ref().map(|review| (*index, review)));
                 let review_row: Option<Row> = reviewed.map(|(index, review)| {
                     let footer = &self.items[index];
-                    let id = format!("lr:{}", footer.turn_id.clone().unwrap_or_else(|| footer.id.clone()));
-                    derived(&id, footer.seq, footer.turn_id.clone(), RowContent::LabReview(review.clone()))
+                    let id = format!(
+                        "lr:{}",
+                        footer.turn_id.clone().unwrap_or_else(|| footer.id.clone())
+                    );
+                    derived(
+                        &id,
+                        footer.seq,
+                        footer.turn_id.clone(),
+                        RowContent::LabReview(review.clone()),
+                    )
                 });
                 let review_at = reviewed.map(|(index, _)| {
                     let turn_of = &self.items[index].turn_id;
-                    replies.iter().copied().filter(|&r| &self.items[r].turn_id == turn_of).min().unwrap_or(index)
+                    replies
+                        .iter()
+                        .copied()
+                        .filter(|&r| &self.items[r].turn_id == turn_of)
+                        .min()
+                        .unwrap_or(index)
                 });
                 for k in turn.clone() {
                     let row = &self.items[k];
@@ -1967,7 +2600,12 @@ impl TranscriptModel {
                         if worked > 0.0 {
                             group.summary = format!("Worked for {}", duration(worked));
                         }
-                        out.push(derived(&id, lead.seq, lead.turn_id.clone(), RowContent::Group(group)));
+                        out.push(derived(
+                            &id,
+                            lead.seq,
+                            lead.turn_id.clone(),
+                            RowContent::Group(group),
+                        ));
                         starts.push(turn.start);
                         if open {
                             for &m in &folded {
@@ -1987,39 +2625,72 @@ impl TranscriptModel {
                             out.push(row.clone());
                             starts.push(turn.start);
                         }
-                    } else if !self.stays_out(k, &replies) {
-                        continue;
-                    } else if matches!(&row.content, RowContent::Asks(card) if !card.is_open) {
-                        continue;
-                    } else if matches!(&row.content, RowContent::Tool(tool) if Self::is_taken_end_turn(tool)) {
+                    } else if !self.stays_out(k, &replies)
+                        || matches!(&row.content, RowContent::Asks(card) if !card.is_open)
+                        || matches!(&row.content, RowContent::Tool(tool) if Self::is_taken_end_turn(tool))
+                    {
                         continue;
                     } else if matches!(row.content, RowContent::Gap(_)) {
                         let Some(gap) = gaps.get(&k) else { continue };
-                        out.push(derived(&row.id, row.seq, row.turn_id.clone(), RowContent::Gap(gap.clone())));
+                        out.push(derived(
+                            &row.id,
+                            row.seq,
+                            row.turn_id.clone(),
+                            RowContent::Gap(gap.clone()),
+                        ));
                         starts.push(turn.start);
                     } else if let RowContent::Footer(done) = &row.content {
                         if Some(k) != footers.last().map(|(index, _)| *index) {
                             continue;
                         }
-                        let stretch: Vec<String> = footers.iter().map(|(index, _)| self.items[*index].turn_id.clone().unwrap_or_default()).collect();
+                        let stretch: Vec<String> = footers
+                            .iter()
+                            .map(|(index, _)| {
+                                self.items[*index].turn_id.clone().unwrap_or_default()
+                            })
+                            .collect();
                         // A turn that ended with a summary has no changes
                         // card: the summary says what changed, and the edits
                         // are still in the folded work (Mike, 30 Oct). One
                         // reply's final message counts too (6 Nov).
-                        if !stretch.iter().any(|t| self.summarized_turns.contains(t) || self.replied_turns.contains(t)) {
+                        if !stretch.iter().any(|t| {
+                            self.summarized_turns.contains(t) || self.replied_turns.contains(t)
+                        }) {
                             if let Some(card) = self.changed_files(&stretch) {
-                                out.push(derived(&format!("cf:{}", card.turn_id), row.seq, row.turn_id.clone(), RowContent::Changes(card)));
+                                out.push(derived(
+                                    &format!("cf:{}", card.turn_id),
+                                    row.seq,
+                                    row.turn_id.clone(),
+                                    RowContent::Changes(card),
+                                ));
                                 starts.push(turn.start);
                             }
                         }
                         if footers.len() > 1 {
                             let mut done = done.clone();
                             done.duration_ms = worked;
-                            let costs: Vec<f64> = footers.iter().filter_map(|(_, d)| d.cost_usd).collect();
-                            done.cost_usd = if costs.is_empty() { None } else { Some(costs.iter().sum()) };
-                            let tokens: Vec<TurnTokens> = footers.iter().filter_map(|(_, d)| TurnTokens::from_usage(d.usage.as_ref())).collect();
-                            done.usage = tokens.iter().copied().reduce(TurnTokens::add).map(TurnTokens::usage);
-                            out.push(derived(&row.id, row.seq, row.turn_id.clone(), RowContent::Footer(done)));
+                            let costs: Vec<f64> =
+                                footers.iter().filter_map(|(_, d)| d.cost_usd).collect();
+                            done.cost_usd = if costs.is_empty() {
+                                None
+                            } else {
+                                Some(costs.iter().sum())
+                            };
+                            let tokens: Vec<TurnTokens> = footers
+                                .iter()
+                                .filter_map(|(_, d)| TurnTokens::from_usage(d.usage.as_ref()))
+                                .collect();
+                            done.usage = tokens
+                                .iter()
+                                .copied()
+                                .reduce(std::ops::Add::add)
+                                .map(TurnTokens::usage);
+                            out.push(derived(
+                                &row.id,
+                                row.seq,
+                                row.turn_id.clone(),
+                                RowContent::Footer(done),
+                            ));
                         } else {
                             out.push(row.clone());
                         }
@@ -2048,10 +2719,18 @@ impl TranscriptModel {
                 } else {
                     let id = format!("g:{}", item.id);
                     let open = self.expanded.contains(&id);
-                    let live = run_end == self.items.len() && self.open_turn.is_some() && item.turn_id.as_deref().unwrap_or("") == self.open_turn.as_deref().unwrap_or("");
+                    let live = run_end == self.items.len()
+                        && self.open_turn.is_some()
+                        && item.turn_id.as_deref().unwrap_or("")
+                            == self.open_turn.as_deref().unwrap_or("");
                     let members: Vec<&Row> = self.items[i..run_end].iter().collect();
                     let group = WorkGroup::from_members(&members, open, live);
-                    out.push(derived(&id, item.seq, item.turn_id.clone(), RowContent::Group(group)));
+                    out.push(derived(
+                        &id,
+                        item.seq,
+                        item.turn_id.clone(),
+                        RowContent::Group(group),
+                    ));
                     starts.push(i);
                     if open {
                         for k in i..run_end {
@@ -2067,12 +2746,20 @@ impl TranscriptModel {
                 // A card that's been answered or moved past isn't shown: the
                 // answers bubble says what was picked (Mike, 28 Oct).
                 i += 1;
-            } else if matches!(&item.content, RowContent::Tool(tool) if Self::is_taken_end_turn(tool)) {
+            } else if matches!(&item.content, RowContent::Tool(tool) if Self::is_taken_end_turn(tool))
+            {
                 i += 1;
             } else {
                 if matches!(item.content, RowContent::Footer(_)) {
-                    if let Some(card) = self.changed_files(&[item.turn_id.clone().unwrap_or_default()]) {
-                        out.push(derived(&format!("cf:{}", card.turn_id), item.seq, item.turn_id.clone(), RowContent::Changes(card)));
+                    if let Some(card) =
+                        self.changed_files(&[item.turn_id.clone().unwrap_or_default()])
+                    {
+                        out.push(derived(
+                            &format!("cf:{}", card.turn_id),
+                            item.seq,
+                            item.turn_id.clone(),
+                            RowContent::Changes(card),
+                        ));
                         starts.push(i);
                     }
                 }
@@ -2082,7 +2769,12 @@ impl TranscriptModel {
             }
         }
         let floating: Vec<usize> = if working_line {
-            let mut list: Vec<usize> = self.pending_cards.keys().filter_map(|k| self.item_index.get(k).copied()).filter(|&k| self.is_floating_card(k)).collect();
+            let mut list: Vec<usize> = self
+                .pending_cards
+                .keys()
+                .filter_map(|k| self.item_index.get(k).copied())
+                .filter(|&k| self.is_floating_card(k))
+                .collect();
             list.sort_unstable();
             list
         } else {
@@ -2093,24 +2785,52 @@ impl TranscriptModel {
             starts.push(self.items.len());
         }
         let turn = self.open_turn.clone();
-        if working_line && turn.as_ref().is_some_and(|t| !self.pending_cards.values().any(|v| v == t)) {
+        if working_line
+            && turn
+                .as_ref()
+                .is_some_and(|t| !self.pending_cards.values().any(|v| v == t))
+        {
             let turn = turn.unwrap_or_default();
-            let status = WorkingStatus { turn_id: turn.clone(), started_at: self.turn_starts.get(&turn).copied() };
-            out.push(derived(&format!("w:{turn}"), self.last_seq, Some(turn), RowContent::Working(status)));
+            let status = WorkingStatus {
+                turn_id: turn.clone(),
+                started_at: self.turn_starts.get(&turn).copied(),
+            };
+            out.push(derived(
+                &format!("w:{turn}"),
+                self.last_seq,
+                Some(turn),
+                RowContent::Working(status),
+            ));
             starts.push(self.items.len());
-        } else if working_line && self.open_turn.is_none() && !self.background.is_empty() && floating.is_empty() {
+        } else if working_line
+            && self.open_turn.is_none()
+            && !self.background.is_empty()
+            && floating.is_empty()
+        {
             // Between turns with sub-agents or jobs still going: the thread
             // is still being worked on, and this says so where the working
             // line would be. Not under a card a sub-agent is waiting on.
-            let status = BackgroundStatus { tasks: self.background.clone() };
-            out.push(derived("bg:", self.last_seq, None, RowContent::Background(status)));
+            let status = BackgroundStatus {
+                tasks: self.background.clone(),
+            };
+            out.push(derived(
+                "bg:",
+                self.last_seq,
+                None,
+                RowContent::Background(status),
+            ));
             starts.push(self.items.len());
         }
         // Mike's messages on their way, last: under the working line, as a
         // queued one waits for that turn to end.
         if working_line {
             for message in &self.pending {
-                out.push(derived(&format!("p:{}", message.id), self.last_seq, None, message.row().content));
+                out.push(derived(
+                    &format!("p:{}", message.id),
+                    self.last_seq,
+                    None,
+                    message.row().content,
+                ));
                 starts.push(self.items.len());
             }
         }
@@ -2130,15 +2850,22 @@ impl TranscriptModel {
     /// up, as one card under the last one's footer.
     fn changed_files(&self, turns: &[String]) -> Option<ChangedFiles> {
         let turn = turns.last()?;
-        let ids: Vec<&String> = turns.iter().flat_map(|t| self.edits_by_turn.get(t).into_iter().flatten()).collect();
+        let ids: Vec<&String> = turns
+            .iter()
+            .flat_map(|t| self.edits_by_turn.get(t).into_iter().flatten())
+            .collect();
         if ids.is_empty() {
             return None;
         }
         let mut order: Vec<String> = Vec::new();
         let mut files: HashMap<String, ChangedFile> = HashMap::new();
         for id in ids {
-            let Some(&i) = self.item_index.get(id) else { continue };
-            let RowContent::Tool(tool) = &self.items[i].content else { continue };
+            let Some(&i) = self.item_index.get(id) else {
+                continue;
+            };
+            let RowContent::Tool(tool) = &self.items[i].content else {
+                continue;
+            };
             if tool.failed() {
                 continue;
             }
@@ -2147,7 +2874,11 @@ impl TranscriptModel {
                 if diff.hunks.is_empty() || Self::is_plan_file(&diff.path) {
                     continue;
                 }
-                let path = if diff.path.is_empty() { tool.title() } else { diff.path.clone() };
+                let path = if diff.path.is_empty() {
+                    tool.title()
+                } else {
+                    diff.path.clone()
+                };
                 let (added, removed) = DiffBuilder::stats(&diff);
                 if let Some(file) = files.get_mut(&path) {
                     file.added += added;
@@ -2174,6 +2905,9 @@ impl TranscriptModel {
         if order.is_empty() {
             return None;
         }
-        Some(ChangedFiles { turn_id: turn.clone(), files: order.iter().filter_map(|p| files.get(p).cloned()).collect() })
+        Some(ChangedFiles {
+            turn_id: turn.clone(),
+            files: order.iter().filter_map(|p| files.get(p).cloned()).collect(),
+        })
     }
 }

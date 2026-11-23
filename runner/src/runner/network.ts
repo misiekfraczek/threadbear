@@ -4,7 +4,6 @@
 // is the Runner; runner.ts puts them on its prototype.
 import type { Runner } from '../runner.ts';
 import type { RunnerPart } from './part.ts';
-import { reachable } from '../net-probe.ts';
 import type { Provider } from '../protocol.ts';
 import type { ThreadState } from '../runner.ts';
 import { CARRY_ON_NETWORK, NET_CARRY_ON_MAX, NET_PROBE_FIRST_MS, NET_PROBE_MAX_MS, NET_WAIT_MAX_MS } from '../runner.ts';
@@ -95,7 +94,7 @@ export const networkPart = {
     this.markDirty(st);
     if (rt.deleted || rt.turn || rec.queue.length || this.bucket(rec) !== 'inbox') return;
     try {
-      const turnId = this.sendTo(st, CARRY_ON_NETWORK, [], { origin: 'runner', queue: true });
+      const turnId = this.sendTo(st, CARRY_ON_NETWORK, [], { origin: 'runner', queue: true, wakeReason: 'The connection came back' });
       rec.netCarryOn = { turnId, since: w.since, tries: w.tries + 1 };
       this.markDirty(st);
       this.log.info('carried on after the network came back', { threadId: rec.id, tries: w.tries + 1 });

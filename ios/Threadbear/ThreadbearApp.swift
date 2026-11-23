@@ -7,9 +7,8 @@ struct ThreadbearApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var model = AppModel()
     @State private var quick = QuickAskModel()
-    /// A Quick Ask link waiting for a yes: every one is asked about, the first included.
-    @State private var confirmQuickAsk: QuickAskLink?
-    /// A Quick Ask link that couldn't be used (not https, or missing its token).
+    /// A threadbear://quickask link opened from outside: never taken, as any app
+    /// claiming the scheme could have caught it (and its token) first.
     @State private var refusedQuickAsk = false
     @Environment(\.scenePhase) private var scenePhase
 
@@ -34,8 +33,13 @@ struct ThreadbearApp: App {
                 .onChange(of: scenePhase, initial: true) { _, phase in
                     quick.scenePhaseChanged(to: phase)
                     switch phase {
-                    case .background: model.wentToBackground()
-                    case .active: model.comingBack()
+                    case .background:
+                        model.wentToBackground()
+                        // About 1.2 GB, and the GPU's off limits in the background.
+                        WhisperEngine.shared.unload()
+                    case .active:
+                        model.comingBack()
+                        Dictation.prepare()
                     default: break
                     }
                 }
@@ -52,34 +56,22 @@ struct ThreadbearApp: App {
                         }
                     }
                 }
-                // threadbear://quickask links carry the archive server for quick ask.
-                // threadbear://pair links are never taken from here: any app can
+                // threadbear://quickask and threadbear://pair links are never taken from here: any app can
                 // claim the scheme, so the Mac's code is read by the app's own
                 // scanner instead (Daybreak 127), and an opened one says so.
                 // threadbear://open is Voice Type's keyboard button: coming forward is all
                 // it wants, and passing it on would show a "not a pairing link" error.
                 .onOpenURL { url in
                     if url.host() == "open" { return }
-                    switch QuickAskLink.parse(url) {
-                    case .success(let link): confirmQuickAsk = link
-                    case .failure(.unusable): refusedQuickAsk = true
+                    switch QuickAskSetup.parse(url.absoluteString) {
+                    // A Quick Ask link, or a setup code somehow opened as one: both
+                    // are read by Settings › Ask's own scanner instead.
+                    case .failure(.link), .failure(.unusable), .success: refusedQuickAsk = true
                     case .failure(.notQuickAsk):
                         // A pairing link from outside is refused, saying to scan
                         // the code in the app; anything else is "not a pairing code".
                         model.askToPair(url.absoluteString, from: .opened)
                     }
-                }
-                .alert(confirmQuickAsk.map { "Use Quick Ask on \($0.hostName)?" } ?? "",
-                       isPresented: Binding(get: { confirmQuickAsk != nil }, set: { if !$0 { confirmQuickAsk = nil } }),
-                       presenting: confirmQuickAsk) { link in
-                    Button("Use \(link.hostName)") {
-                        quick.settings.apply(link)
-                        quick.settingsChanged()
-                        confirmQuickAsk = nil
-                    }
-                    Button("Cancel", role: .cancel) { confirmQuickAsk = nil }
-                } message: { link in
-                    Text(Self.quickAskMessage(link, current: quick.settings.baseURL))
                 }
                 // Cancel leaves the saved pairing and the kept runner keys as they were:
                 // nothing is saved until the yes, and then only once the token works.
@@ -93,24 +85,12 @@ struct ThreadbearApp: App {
                 } message: { request in
                     Text(request.message)
                 }
-                .alert("This Quick Ask link can't be used", isPresented: $refusedQuickAsk) {
+                .alert("Threadbear doesn't take Quick Ask links", isPresented: $refusedQuickAsk) {
                     Button("OK", role: .cancel) {}
                 } message: {
-                    Text("Quick Ask links need a secure (https) server address and a token. Nothing was changed.")
+                    Text(QuickAskSetup.linkRefusal)
                 }
         }
-    }
-}
-
-extension ThreadbearApp {
-    /// What the Quick Ask alert says: where questions will go, and what it replaces.
-    static func quickAskMessage(_ link: QuickAskLink, current: URL?) -> String {
-        let ending = "Only say yes if you just scanned a code from your own server."
-        guard let current else { return "This link sends your questions and its token to \(link.hostName). \(ending)" }
-        if link.changesServer(from: current) {
-            return "This link sends your questions to \(link.hostName) instead of \(QuickAskLink.hostName(current)). \(ending)"
-        }
-        return "This link gives Quick Ask a new token for \(link.hostName). \(ending)"
     }
 }
 
@@ -191,6 +171,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     /// about a thread other than the one on screen.
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping @Sendable (UNNotificationPresentationOptions) -> Void) {
         Task { @MainActor in completionHandler([.banner, .sound]) }
+    }
+
+    /// The backend's silent push:clear: the thread no longer needs you, so its
+    /// notification comes down (DeliveredNotifications). Background pushes
+    /// need the remote-notification background mode (Info.plist).
+    func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                     fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        guard let threadId = userInfo["clear"] as? String else { completionHandler(.noData); return }
+        Task { @MainActor in
+            await DeliveredNotifications.clear(threadId: threadId)
+            completionHandler(.newData)
+        }
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping @Sendable () -> Void) {

@@ -5,8 +5,7 @@ Feature: Open Anything
 
   # GPUI-only: the Swift app is frozen and hasn't got the box (Mike picked
   # this design, "A, the palette", in thread 5d33618f), so every scenario
-  # here is @swift-pending. It's the openAnything experiment, which the
-  # mock's hello has on unless a scenario is @open-anything-off.
+  # here is @swift-pending.
 
   Background:
     Given the app is connected to a runner with the demo threads
@@ -35,6 +34,20 @@ Feature: Open Anything
     When I press Return in the Open Anything box
     Then the open thread is "Set up the Cloudflare tunnel for the preview server"
     And the Open Anything box is down
+
+  # Picking the thread that's open already used to leave the keyboard with
+  # no one: the box's field went, and opening a shown thread focused nothing,
+  # so ⌘K did nothing until a click (found benchmarking, thread 0b6b183c).
+  @nav.openanything @swift-pending
+  Scenario: Picking the thread that's open already leaves the keys working
+    When I open the thread "Rename the Settings tabs"
+    And I press "k" with "cmd"
+    And I type "Rename the Settings tabs" in the Open Anything box
+    And I press Return in the Open Anything box
+    Then the Open Anything box is down
+    And the open thread is "Rename the Settings tabs"
+    When I press "k" with "cmd"
+    Then the Open Anything box is up
 
   @nav.openanything @swift-pending
   Scenario: A panel opens where it's from, with its button lit
@@ -95,16 +108,3 @@ Feature: Open Anything
     When I open Settings on "keyboard"
     Then Settings lists "Open Anything: ⌘K" under Keyboard
     And Settings lists "Open Anything (second key): ⌘P" under Keyboard
-
-  # The experiment off (Settings > General > Experiments): no keys, no menu
-  # item and no lines in Settings.
-  @nav.openanything @swift-pending @open-anything-off
-  Scenario: With its experiment off, ⌘K and ⌘P do nothing and it's in no menu
-    When I press "k" with "cmd"
-    Then the Open Anything box stays down
-    When I press "p" with "cmd"
-    Then the Open Anything box stays down
-    And the "Go" menu hasn't "Open Anything…"
-    When I open Settings on "keyboard"
-    Then Settings lists "Archive: ⌘E" under Keyboard
-    And Settings doesn't list "Open Anything: ⌘K" under Keyboard

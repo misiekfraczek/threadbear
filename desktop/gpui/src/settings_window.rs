@@ -13,26 +13,30 @@
 use crate::a11y::A11yRole as _;
 use crate::app::Threadbear;
 use crate::home_page::info_tip;
+use crate::spinner::Spinner;
 use crate::{call, icons, style};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use crate::spinner::Spinner;
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _};
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 // The zoom-aware px (style.rs), in place of GPUI's.
 use crate::style::px;
+use crate::tips::Tip as _;
 use serde_json::{json, Value};
 use std::time::Duration;
 use threadbear_core::completion_sound::{self, Ding};
 use threadbear_core::new_thread::abbreviate_home;
-use threadbear_core::runner_settings::{experiment_about, BringIn, RunnerSettings, StandingInstructions};
-use crate::tips::Tip as _;
+use threadbear_core::runner_settings::{
+    experiment_about, BringIn, RunnerSettings, StandingInstructions,
+};
 
-mod devices;
+pub(crate) mod devices;
 mod keyboard;
 mod pools;
 mod reviewers;
@@ -50,7 +54,14 @@ pub(crate) enum Tab {
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 6] = [Tab::General, Tab::Models, Tab::Pools, Tab::Runners, Tab::Devices, Tab::Keyboard];
+    pub(crate) const ALL: [Tab; 6] = [
+        Tab::General,
+        Tab::Models,
+        Tab::Pools,
+        Tab::Runners,
+        Tab::Devices,
+        Tab::Keyboard,
+    ];
 
     pub(crate) fn title(self) -> &'static str {
         match self {
@@ -93,6 +104,15 @@ impl Tab {
 
 /// The sidebar's width, and the window's, at 100% (`SettingsLayout`).
 const SIDEBAR_WIDTH: f32 = 215.;
+/// The Same as the system tile's tip, and its label for scripts.
+const APPEARANCE_TIP: &str = if cfg!(target_os = "macos") {
+    "Light or dark as the Mac is"
+} else if cfg!(target_os = "windows") {
+    "Light or dark as Windows is"
+} else {
+    "Light or dark as the system is"
+};
+const FONT_TIP: &str = "The font for everything but code";
 
 impl Threadbear {
     /// ⌘, or the gear: the window, brought forward if it's open, on `tab` if
@@ -125,13 +145,19 @@ impl Threadbear {
             let opened = gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions { title: Some(tab.title().into()), appears_transparent: false, traffic_light_position: None }),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(tab.title().into()),
+                        appears_transparent: false,
+                        traffic_light_position: None,
+                    }),
                     window_min_size: Some(size(px(640.), px(420.))),
                     app_id: Some("threadbear".into()),
                     ..Default::default()
                 },
                 cx,
-                move |window, cx| cx.new(|cx| SettingsWindow::new(app, client, instructions, tab, window, cx)),
+                move |window, cx| {
+                    cx.new(|cx| SettingsWindow::new(app, client, instructions, tab, window, cx))
+                },
             );
             me.update(cx, |me, cx| match opened {
                 Ok((handle, view)) => {
@@ -153,7 +179,10 @@ impl Threadbear {
             let res = call(client, "instructions.get", json!({})).await;
             this.update(cx, |this, cx| {
                 match res {
-                    Ok(v) => this.standing_instructions = Some(StandingInstructions::decode(&v["instructions"])),
+                    Ok(v) => {
+                        this.standing_instructions =
+                            Some(StandingInstructions::decode(&v["instructions"]))
+                    }
                     // -32601: none for this runner.
                     Err(e) if e.code == -32601 => this.standing_instructions = None,
                     Err(_) => {}
@@ -214,18 +243,110 @@ const SIDEBAR_CONTEXT: &str = "SettingsSidebar";
 fn bind_sidebar_keys(cx: &mut App) {
     static BOUND: std::sync::Once = std::sync::Once::new();
     BOUND.call_once(|| {
-        cx.bind_keys([KeyBinding::new("up", PreviousSection, Some(SIDEBAR_CONTEXT)), KeyBinding::new("down", NextSection, Some(SIDEBAR_CONTEXT))]);
+        cx.bind_keys([
+            KeyBinding::new("up", PreviousSection, Some(SIDEBAR_CONTEXT)),
+            KeyBinding::new("down", NextSection, Some(SIDEBAR_CONTEXT)),
+        ]);
     });
 }
 
+/// The app, for a section's bear button: sections are drawn by free
+/// functions that have only the `App`.
+struct SettingsApp(WeakEntity<Threadbear>);
+impl Global for SettingsApp {}
+
+/// Starts a thread about a section, in the main window (`start_thread_about`).
+fn start_thread_about(title: &str, cx: &mut App) {
+    let Some(app) = cx.try_global::<SettingsApp>().and_then(|a| a.0.upgrade()) else {
+        return;
+    };
+    let main = app.read(cx).main_window;
+    let words = format!("About Threadbear's {title} settings: ");
+    cx.activate(true);
+    main.update(cx, |_, window, cx| {
+        app.update(cx, |app, cx| app.start_thread_about(words, window, cx))
+    })
+    .ok();
+}
+
+/// A section's bear button, at the end of its heading: start a thread about
+/// it (Mike, 17 Nov, in place of "Ask your agent to ..." in its ⓘ).
+fn thread_button(id: &str, title: &str, cx: &App) -> AnyElement {
+    let tip = format!("Start a thread about {title}");
+    let title = title.to_owned();
+    let (faint, fg) = (style::secondary_text(cx), cx.theme().foreground);
+    div()
+        .id(SharedString::from(format!("{id}-thread")))
+        .test_support()
+        .a11y_role(Role::Button)
+        .aria_label(tip.clone())
+        .tip(tip)
+        .cursor_pointer()
+        .p(px(2.))
+        .rounded(px(4.))
+        .text_color(faint)
+        .hover(move |s| s.text_color(fg))
+        .on_click(move |_, _, cx| start_thread_about(&title, cx))
+        .child(icons::symbol("bear.plus").with_size(px(17.)))
+        .into_any_element()
+}
+
+/// A section's ⓘ: what it is, then a button to start a thread about it.
+fn section_info(id: &str, title: &str, about: &str, cx: &App) -> AnyElement {
+    use gpui_kit::component::popover::Popover;
+    let secondary = style::secondary_text(cx);
+    let (about, title) = (SharedString::from(about.to_owned()), title.to_owned());
+    let trigger_tip = about.clone();
+    let button_id = SharedString::from(format!("{id}-info-thread"));
+    Popover::new(ElementId::Name(SharedString::from(format!("{id}-info"))))
+        .anchor(gpui_kit::Anchor::BottomLeft)
+        .trigger(crate::home_page::InfoTrigger::new(
+            SharedString::from(format!("{id}-info")),
+            trigger_tip,
+            secondary,
+        ))
+        .content(move |_, _, _| {
+            let title = title.clone();
+            v_flex()
+                .w(px(280.))
+                .p(px(12.))
+                .gap(px(10.))
+                .text_size(px(12.))
+                .child(about.clone())
+                .child(
+                    h_flex().child(
+                        Button::new(button_id.clone())
+                            .label("Start a thread about this")
+                            .icon(icons::symbol("bear.plus"))
+                            .small()
+                            .secondary()
+                            .tooltip("Opens a new thread to ask your agent about these settings")
+                            .on_click(move |_, _, cx| start_thread_about(&title, cx)),
+                    ),
+                )
+        })
+        .into_any_element()
+}
+
 impl SettingsWindow {
-    fn new(app: WeakEntity<Threadbear>, client: std::sync::Arc<threadbear_client::runner::Client>, instructions_now: Option<StandingInstructions>, tab: Tab, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        app: WeakEntity<Threadbear>,
+        client: std::sync::Arc<threadbear_client::runner::Client>,
+        instructions_now: Option<StandingInstructions>,
+        tab: Tab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.set_global(SettingsApp(app.clone()));
         let instructions = cx.new(|cx| TextareaState::new(window, cx).placeholder("For example: I build with React, TypeScript and Convex. Write plainly and briefly."));
-        let mut subs = vec![cx.subscribe_in(&instructions, window, |this, _, ev: &InputEvent, _, cx| {
-            if matches!(ev, InputEvent::Change) && !this.filling {
-                this.schedule_instructions_save(cx);
-            }
-        })];
+        let mut subs =
+            vec![
+                cx.subscribe_in(&instructions, window, |this, _, ev: &InputEvent, _, cx| {
+                    if matches!(ev, InputEvent::Change) && !this.filling {
+                        this.schedule_instructions_save(cx);
+                    }
+                }),
+            ];
         if let Some(app) = app.upgrade() {
             // Everything it shows is the app's, so it draws again when that changes.
             subs.push(cx.observe_in(&app, window, |this, app, window, cx| {
@@ -241,17 +362,19 @@ impl SettingsWindow {
         // In front, the app is: threads in the main window still read as
         // Mike looks at them (`Threadbear::looking_changed`).
         let looking_app = app.clone();
-        subs.push(cx.observe_window_activation(window, move |this, window, cx| {
-            let (key, active) = (crate::thread::window_key(window), window.is_window_active());
-            if let Some(app) = looking_app.upgrade() {
-                app.update(cx, |app, cx| app.looking_changed(key, active, cx));
-            }
-            // Away from the window, a key being listened for is never mind,
-            // as the Swift recorder stops when the app goes to the back.
-            if !active {
-                this.stop_listening(cx);
-            }
-        }));
+        subs.push(
+            cx.observe_window_activation(window, move |this, window, cx| {
+                let (key, active) = (crate::thread::window_key(window), window.is_window_active());
+                if let Some(app) = looking_app.upgrade() {
+                    app.update(cx, |app, cx| app.looking_changed(key, active, cx));
+                }
+                // Away from the window, a key being listened for is never mind,
+                // as the Swift recorder stops when the app goes to the back.
+                if !active {
+                    this.stop_listening(cx);
+                }
+            }),
+        );
         // Closing it saves what's typed and not yet sent (`onDisappear`).
         let me = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -264,8 +387,16 @@ impl SettingsWindow {
         });
         // The ding's volume: kept as it's dragged, and heard when it's let go
         // (the Swift slider's `editing` ending).
-        let volume_now = app.upgrade().map_or(completion_sound::DEFAULT_VOLUME, |a| a.read(cx).settings.ding_volume());
-        let volume = cx.new(|_| SliderState::new().min(0.1).max(1.).step(0.01).default_value(volume_now as f32));
+        let volume_now = app.upgrade().map_or(completion_sound::DEFAULT_VOLUME, |a| {
+            a.read(cx).settings.ding_volume()
+        });
+        let volume = cx.new(|_| {
+            SliderState::new()
+                .min(0.1)
+                .max(1.)
+                .step(0.01)
+                .default_value(volume_now as f32)
+        });
         let volume_app = app.clone();
         subs.push(cx.subscribe(&volume, move |_, _, ev: &SliderEvent, cx| {
             let (value, let_go) = match ev {
@@ -319,7 +450,8 @@ impl SettingsWindow {
             self.devices_hidden();
             self.tab = tab;
             window.set_window_title(tab.title());
-            self.scroll.set_offset(point(gpui_kit::px(0.), gpui_kit::px(0.)));
+            self.scroll
+                .set_offset(point(gpui_kit::px(0.), gpui_kit::px(0.)));
             cx.notify();
         }
     }
@@ -341,7 +473,12 @@ impl SettingsWindow {
     /// The runner's instructions came in or changed: the box shows them, unless
     /// something's being typed there (`onChange(of: saved)`). A file changed
     /// outside Settings is read as it was when reading started.
-    fn follow_saved_instructions(&mut self, saved: Option<StandingInstructions>, window: &mut Window, cx: &mut Context<Self>) {
+    fn follow_saved_instructions(
+        &mut self,
+        saved: Option<StandingInstructions>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(saved) = saved else { return };
         if saved.outside {
             if self.reviewed.is_none() {
@@ -354,7 +491,8 @@ impl SettingsWindow {
         let first = self.instructions_base.is_none();
         if first || (self.instructions_save.is_none() && typed.trim() != saved.text.trim()) {
             self.filling = true;
-            self.instructions.update(cx, |s, cx| s.set_value(saved.text.clone(), window, cx));
+            self.instructions
+                .update(cx, |s, cx| s.set_value(saved.text.clone(), window, cx));
             self.filling = false;
             self.instructions_base = Some(saved.text);
         }
@@ -384,14 +522,20 @@ impl SettingsWindow {
         if wanted.trim() == saved.trim() {
             return;
         }
-        let Some(client) = self.client(cx) else { return };
+        let Some(client) = self.client(cx) else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let res = call(client, "instructions.set", json!({ "text": wanted })).await;
             this.update(cx, |this, cx| {
                 match res {
                     Ok(v) => {
                         let now = StandingInstructions::decode(&v["instructions"]);
-                        this.instructions_status = Some(if wanted.trim().is_empty() { "Cleared".into() } else { "Saved".into() });
+                        this.instructions_status = Some(if wanted.trim().is_empty() {
+                            "Cleared".into()
+                        } else {
+                            "Saved".into()
+                        });
                         this.instructions_base = Some(now.text.clone());
                         if let Some(app) = this.app.upgrade() {
                             app.update(cx, |app, cx| {
@@ -415,7 +559,9 @@ impl SettingsWindow {
         if self.resolving {
             return;
         }
-        let Some(client) = self.client(cx) else { return };
+        let Some(client) = self.client(cx) else {
+            return;
+        };
         self.resolving = true;
         self.resolve_error = None;
         cx.notify();
@@ -451,19 +597,37 @@ impl SettingsWindow {
     }
 
     fn choose_default_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Choose".into()) });
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = paths.await {
                 if let Some(path) = paths.pop() {
-                    this.update(cx, |this, cx| this.update(json!({ "defaultCwd": path.to_string_lossy() }), cx)).ok();
+                    this.update(cx, |this, cx| {
+                        this.update(json!({ "defaultCwd": path.to_string_lossy() }), cx)
+                    })
+                    .ok();
                 }
             }
         })
         .detach();
     }
 
-    fn add_private_folders(&mut self, current: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: true, prompt: Some("Add".into()) });
+    fn add_private_folders(
+        &mut self,
+        current: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some("Add".into()),
+        });
         let home = std::env::var("HOME").unwrap_or_default();
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = paths.await {
@@ -474,7 +638,10 @@ impl SettingsWindow {
                         folders.push(folder);
                     }
                 }
-                this.update(cx, |this, cx| this.update(json!({ "models": { "privateFolders": folders } }), cx)).ok();
+                this.update(cx, |this, cx| {
+                    this.update(json!({ "models": { "privateFolders": folders } }), cx)
+                })
+                .ok();
             }
         })
         .detach();
@@ -492,8 +659,12 @@ impl SettingsWindow {
             // what's pressed), so the arrows carry on from there.
             .track_focus(&self.sidebar_focus)
             .key_context(SIDEBAR_CONTEXT)
-            .on_action(cx.listener(|this, _: &PreviousSection, window, cx| this.step_section(-1, window, cx)))
-            .on_action(cx.listener(|this, _: &NextSection, window, cx| this.step_section(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousSection, window, cx| {
+                this.step_section(-1, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &NextSection, window, cx| this.step_section(1, window, cx)),
+            )
             .w(px(SIDEBAR_WIDTH))
             .flex_none()
             .h_full()
@@ -506,25 +677,80 @@ impl SettingsWindow {
             .children(Tab::ALL.into_iter().map(|tab| {
                 let on = tab == self.tab;
                 let hovered = self.hovered == Some(tab);
-                crate::highlights::tipped(h_flex().id(SharedString::from(format!("settings-tab-{}", tab.name()))).h(px(30.)).px(px(8.)).gap(px(9.)).items_center().rounded(px(7.)), tab.title())
-                    .when(on, |s| s.bg(on_fill))
-                    .when(!on && hovered, |s| s.bg(hover))
-                    .on_hover(cx.listener(move |this, over: &bool, _, cx| {
-                        this.hovered = if *over { Some(tab) } else if this.hovered == Some(tab) { None } else { this.hovered };
-                        cx.notify();
-                    }))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.show(tab, window, cx)))
-                    .child(div().w(px(18.)).flex().justify_center().child(icons::symbol(tab.symbol()).with_size(px(13.)).text_color(if on { fg } else { secondary })))
-                    .child(div().text_size(px(13.)).line_height(px(16.)).text_color(fg).when(on, |s| s.font_medium()).child(tab.title()))
+                crate::highlights::tipped(
+                    h_flex()
+                        .id(SharedString::from(format!("settings-tab-{}", tab.name())))
+                        .h(px(30.))
+                        .px(px(8.))
+                        .gap(px(9.))
+                        .items_center()
+                        .rounded(px(7.)),
+                    tab.title(),
+                )
+                .when(on, |s| s.bg(on_fill))
+                .when(!on && hovered, |s| s.bg(hover))
+                .on_hover(cx.listener(move |this, over: &bool, _, cx| {
+                    this.hovered = if *over {
+                        Some(tab)
+                    } else if this.hovered == Some(tab) {
+                        None
+                    } else {
+                        this.hovered
+                    };
+                    cx.notify();
+                }))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, window, cx| this.show(tab, window, cx)),
+                )
+                .child(
+                    div().w(px(18.)).flex().justify_center().child(
+                        icons::symbol(tab.symbol())
+                            .with_size(px(13.))
+                            .text_color(if on { fg } else { secondary }),
+                    ),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .line_height(px(16.))
+                        .text_color(fg)
+                        .when(on, |s| s.font_medium())
+                        .child(tab.title()),
+                )
             }))
     }
 
-    fn render_general(&mut self, settings: Option<&RunnerSettings>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "baselined at 288 lines when the lint was turned on (20 Nov 2026); split it when it's next worked on"
+    )]
+    fn render_general(
+        &mut self,
+        settings: Option<&RunnerSettings>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         // This Mac's own, so they're here while the runner's away too.
-        let mut sections = vec![self.appearance_section(cx), self.panels_section(cx), self.quitting_section(cx), self.notifications_section(cx)];
+        let mut sections = vec![
+            self.appearance_section(cx),
+            self.panels_section(cx),
+            self.quitting_section(cx),
+            self.notifications_section(cx),
+        ];
         // The web runtime is this Mac's too (web_runtime.rs), last, so it
         // moves nothing the Swift app's General has.
-        let web_runtime = section("settings-web-runtime", "Web runtime", crate::web_runtime::SETTINGS_ABOUT, "check whether it's installed and working, or why a diagram or panel isn't showing.", vec![row("Web runtime", crate::web_runtime::settings_control(cx), cx)], cx);
+        let web_runtime = section(
+            "settings-web-runtime",
+            "Web runtime",
+            crate::web_runtime::SETTINGS_ABOUT,
+            "check whether it's installed and working, or why a diagram or panel isn't showing.",
+            vec![row(
+                "Web runtime",
+                crate::web_runtime::settings_control(cx),
+                cx,
+            )],
+            cx,
+        );
         let Some(settings) = settings else {
             sections.push(plain_note(&waiting_text(&self.app, cx), cx));
             sections.push(web_runtime);
@@ -536,8 +762,25 @@ impl SettingsWindow {
         let folder_control = h_flex()
             .gap(px(8.))
             .items_center()
-            .child(div().id("settings-default-folder").max_w(px(280.)).text_ellipsis_middle().whitespace_nowrap().overflow_hidden().text_size(px(13.)).text_color(style::secondary_text(cx)).tip(full.clone()).child(folder))
-            .child(self.button("settings-choose-folder", "Choose…", "Pick the folder new threads start in", cx, |this, window, cx| this.choose_default_folder(window, cx)));
+            .child(
+                div()
+                    .id("settings-default-folder")
+                    .max_w(px(280.))
+                    .text_ellipsis_middle()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_size(px(13.))
+                    .text_color(style::secondary_text(cx))
+                    .tip(full)
+                    .child(folder),
+            )
+            .child(self.button(
+                "settings-choose-folder",
+                "Choose…",
+                "Pick the folder new threads start in",
+                cx,
+                |this, window, cx| this.choose_default_folder(window, cx),
+            ));
         sections.push(section(
             "settings-new-threads",
             "New threads",
@@ -551,28 +794,63 @@ impl SettingsWindow {
         }
         if settings.lab_review_supported {
             let on = settings.lab_review;
-            let switch = self.switch("settings-lab-review", on, "Have another lab check each code change a thread makes", cx, |this, on, cx| this.update(json!({ "labReview": on }), cx));
-            let mut rows = vec![row("Review code changes before a thread is done", switch, cx)];
-            // Who reviews, in order, while reviews are on (reviewers.rs).
-            if let Some(list) = settings.lab_reviewers.as_ref().filter(|_| on) {
-                rows.extend(self.reviewer_rows(list, cx));
-            }
-            sections.push(section(
+            let switch = self.switch(
+                "settings-lab-review",
+                on,
+                "Have another lab check each code change a thread makes",
+                cx,
+                |this, on, cx| this.update(json!({ "labReview": on }), cx),
+            );
+            let rows = vec![row(
+                "Review code changes before a thread is done",
+                switch,
+                cx,
+            )];
+            let review = section(
                 "settings-code-review",
                 "Code review",
-                "When a thread changes code and is done, another lab tries to break the change in a review thread of its own. Your thread waits for what it finds, fixes what holds up, and tells you in its reply. The reviewers below go in order: the first that isn't the thread's own provider and has a login with room reviews, on its model and effort, so when one runs out the next takes over. Drag them to change the order. With no other lab to hand, a fresh session of the thread's own provider reviews instead.",
+                "When a thread changes code and is done, another lab tries to break the change in a review thread of its own. Your thread waits for what it finds, fixes what holds up, and tells you in its reply.\n\nA change gets one reviewer: the first in Every change that isn't the thread's own provider and has a login with room, so when one runs out the next takes over. Drag them to change the order. A big or risky change gets everyone in Big or risky changes at once, or one reviewer from Every change if fewer than two of them can review. With no other lab to hand, a fresh session of the thread's own provider reviews.",
                 "explain what a review found, change who reviews, or turn reviews on or off for you.",
                 rows,
                 cx,
-            ));
+            );
+            // Who reviews, while reviews are on (reviewers.rs): two lists
+            // under the switch, kept closer to it than the next section.
+            let lists = if on {
+                self.review_lists(settings, cx)
+            } else {
+                Vec::new()
+            };
+            if lists.is_empty() {
+                sections.push(review);
+            } else {
+                sections.push(
+                    v_flex()
+                        .gap(px(20.))
+                        .child(review)
+                        .children(lists)
+                        .into_any_element(),
+                );
+            }
         }
         // Why it's worth turning on, then what's in it, for anyone wary of
         // turning it on (the Swift app's, Mike, 29 Oct). This Mac's own
         // (activity.rs), but where the Swift app has it.
-        let activity = self.app.upgrade().is_some_and(|a| a.read(cx).settings.saved.activity_log == Some(true));
-        let switch = self.switch("settings-activity-log", activity, "Note what you click and open in this app", cx, |this, on, cx| {
-            this.app.update(cx, |app, cx| app.set_activity_log(on, cx)).ok();
-        });
+        let activity = self
+            .app
+            .upgrade()
+            .is_some_and(|a| a.read(cx).settings.saved.activity_log == Some(true));
+        let switch = self.switch(
+            "settings-activity-log",
+            activity,
+            "Note what you click and open in this app",
+            cx,
+            |this, on, cx| {
+                this.app
+                    .update(cx, |app, cx| app.set_activity_log(on, cx))
+                    .ok();
+            },
+        );
         sections.push(section(
             "settings-activity",
             "Activity log",
@@ -582,7 +860,13 @@ impl SettingsWindow {
             cx,
         ));
         if let Some(on) = settings.keep_awake {
-            let switch = self.switch("settings-keep-awake", on, "Stop your Mac sleeping on its own while a thread is working", cx, |this, on, cx| this.update(json!({ "keepAwake": on }), cx));
+            let switch = self.switch(
+                "settings-keep-awake",
+                on,
+                "Stop your Mac sleeping on its own while a thread is working",
+                cx,
+                |this, on, cx| this.update(json!({ "keepAwake": on }), cx),
+            );
             sections.push(section(
                 "settings-sleep",
                 "Sleep",
@@ -592,14 +876,81 @@ impl SettingsWindow {
                 cx,
             ));
         }
-        if let Some(on) = settings.full_sync {
-            let switch = self.switch("settings-full-sync", on, "Send tool output and diffs to your Convex deployment", cx, |this, on, cx| this.update(json!({ "fullSync": on }), cx));
-            sections.push(section("settings-full-sync", "Full sync", FULL_SYNC_ABOUT, FULL_SYNC_ASK, vec![row("Send tool output to Convex", switch, cx)], cx));
+        // The Usage panel's own settings (Mike, 18 Nov: not dumped at the
+        // foot of the panel). The spare week nudge is the runner's; whether
+        // to show a model's own week is this app's, and only while a login
+        // has one.
+        let mut usage_rows = Vec::new();
+        if let Some(on) = settings.spare_week {
+            let switch = self.switch("settings-spare-week", on, "Start a thread with ideas a day before a login's week resets with lots of it unused", cx, |this, on, cx| this.update(json!({ "spareWeek": on }), cx));
+            usage_rows.push(row("Tell me when a week's about to go unused", switch, cx));
         }
-        if settings.bring_in_supported && self.app.upgrade().is_some_and(|a| a.read(cx).upstream_on) {
+        if let Some(app) = self.app.upgrade() {
+            let titles = threadbear_core::usage::model_week_titles(&app.read(cx).logins.accounts);
+            if !titles.is_empty() {
+                let on = app.read(cx).usage.show_model_weeks;
+                let switch = self.switch(
+                    "settings-model-weeks",
+                    on,
+                    threadbear_core::usage::MODEL_WEEKS_TIP,
+                    cx,
+                    |this, on, cx| {
+                        this.app
+                            .update(cx, |app, cx| app.set_show_model_weeks(on, cx))
+                            .ok();
+                    },
+                );
+                usage_rows.push(row_with(
+                    div()
+                        .child(threadbear_core::usage::model_weeks_switch(&titles))
+                        .into_any_element(),
+                    switch,
+                    cx,
+                ));
+            }
+        }
+        if !usage_rows.is_empty() {
+            sections.push(section(
+                "settings-usage",
+                "Usage",
+                "A day before a login's week resets, if at the rate it's going 30% or more of it would be left, a thread on that login suggests work to spend it on and asks before starting any. The Usage panel's Find work for it does the same whenever you like.",
+                "suggest work for a login with room left, or turn this off for you.",
+                usage_rows,
+                cx,
+            ));
+        }
+        if let Some(on) = settings.full_sync {
+            let switch = self.switch(
+                "settings-full-sync",
+                on,
+                "Send tool output and diffs to your Convex deployment",
+                cx,
+                |this, on, cx| this.update(json!({ "fullSync": on }), cx),
+            );
+            sections.push(section(
+                "settings-full-sync",
+                "Full sync",
+                FULL_SYNC_ABOUT,
+                FULL_SYNC_ASK,
+                vec![row("Send tool output to Convex", switch, cx)],
+                cx,
+            ));
+        }
+        if settings.bring_in_supported && self.app.upgrade().is_some_and(|a| a.read(cx).upstream_on)
+        {
             let current = settings.bring_in;
-            let choices: Vec<(String, bool, Value)> = BringIn::choices(current).into_iter().map(|b| (b.title(), b == current, json!({ "bringIn": b.json() }))).collect();
-            let menu = self.menu("settings-bring-in", current.title(), None, "How often a thread starts to bring in Mike's new releases", choices, cx);
+            let choices: Vec<(String, bool, Value)> = BringIn::choices(current)
+                .into_iter()
+                .map(|b| (b.title(), b == current, json!({ "bringIn": b.json() })))
+                .collect();
+            let menu = self.menu(
+                "settings-bring-in",
+                current.title(),
+                None,
+                "How often a thread starts to bring in Mike's new releases",
+                choices,
+                cx,
+            );
             let menu = h_flex().child(menu);
             sections.push(section(
                 "settings-updates",
@@ -616,13 +967,31 @@ impl SettingsWindow {
                 .iter()
                 .map(|e| {
                     let (id, on) = (e.id.clone(), e.on);
-                    let tip = if on { format!("Turn {} off", e.name) } else { format!("Try {}", e.name) };
-                    let switch = self.switch_owned(format!("settings-experiment-{id}"), on, tip, cx, move |this, on, cx| this.update(json!({ "experiments": { id.clone(): on } }), cx));
+                    let tip = if on {
+                        format!("Turn {} off", e.name)
+                    } else {
+                        format!("Try {}", e.name)
+                    };
+                    let switch = self.switch_owned(
+                        format!("settings-experiment-{id}"),
+                        on,
+                        tip,
+                        cx,
+                        move |this, on, cx| {
+                            this.update(json!({ "experiments": { id.clone(): on } }), cx)
+                        },
+                    );
                     let label = h_flex()
                         .gap(px(6.))
                         .items_center()
                         .child(e.name.clone())
-                        .when(!e.does.is_empty(), |s| s.child(info_tip(SharedString::from(format!("experiment-{}", e.id)), experiment_about(&e.does), cx)));
+                        .when(!e.does.is_empty(), |s| {
+                            s.child(info_tip(
+                                SharedString::from(format!("experiment-{}", e.id)),
+                                experiment_about(&e.does),
+                                cx,
+                            ))
+                        });
                     row_with(label.into_any_element(), switch, cx)
                 })
                 .collect();
@@ -635,41 +1004,187 @@ impl SettingsWindow {
                 cx,
             ));
         }
-        let version = self.app.upgrade().map(|a| a.read(cx).runner_version.clone()).unwrap_or_default();
+        let version = self
+            .app
+            .upgrade()
+            .map(|a| a.read(cx).runner_version.clone())
+            .unwrap_or_default();
         sections.push(section(
             "settings-runner",
             "Runner",
             "The background program that runs your threads. It updates itself.",
             "check on it if something seems wrong. Your agent can read its status and logs.",
-            vec![row("Version", div().text_size(px(13.)).text_color(style::secondary_text(cx)).child(if version.is_empty() { "Not connected".to_owned() } else { version }), cx)],
+            vec![row(
+                "Version",
+                div()
+                    .text_size(px(13.))
+                    .text_color(style::secondary_text(cx))
+                    .child(if version.is_empty() {
+                        "Not connected".to_owned()
+                    } else {
+                        version
+                    }),
+                cx,
+            )],
             cx,
         ));
         sections.push(web_runtime);
         sections
     }
 
-    /// The appearance is this app's own, so it's here while the runner's away too.
+    /// The appearance is this app's own, so it's here while the runner's away
+    /// too. Light or dark as pictures, then the accent, spacing, text size
+    /// and font (Mike picked these from three directions, 17 Nov). Each
+    /// changes every window as it's clicked.
     fn appearance_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let current = style::appearance();
         let app = self.app.clone();
-        let menu = Button::new("settings-appearance").label(current.title()).small().secondary().dropdown_caret(true).tooltip("Light or dark for Threadbear, whatever the Mac is set to").dropdown_menu(move |menu: PopupMenu, _, _| {
-            let mut menu = menu;
-            for choice in style::Appearance::ALL {
+        let current = style::appearance();
+        let looks = h_flex()
+            .gap(px(14.))
+            .children(style::Appearance::ALL.into_iter().map(|choice| {
                 let app = app.clone();
-                menu = menu.item(PopupMenuItem::new(choice.title()).checked(choice == current).on_click(move |_, window, cx| {
+                let tip = match choice {
+                    style::Appearance::System => APPEARANCE_TIP,
+                    style::Appearance::Light => "Always light, whatever the system is set to",
+                    style::Appearance::Dark => "Always dark, whatever the system is set to",
+                };
+                look_tile(choice, choice == current, tip, cx, move |_, window, cx| {
                     if let Some(app) = app.upgrade() {
                         app.update(cx, |app, cx| app.set_appearance(choice, window, cx));
                     }
+                })
+            }));
+        let accent_now = style::accent_choice();
+        let accents =
+            h_flex()
+                .gap(px(8.))
+                .items_center()
+                .children(style::Accent::ALL.into_iter().map(|choice| {
+                    let app = app.clone();
+                    accent_dot(choice, choice == accent_now, cx, move |_, window, cx| {
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |app, cx| app.set_accent(choice, window, cx));
+                        }
+                    })
                 }));
-            }
-            menu
-        });
+        let compact = style::compact();
+        let spacing = segmented(
+            [
+                ("Roomy", "More room between rows and turns", !compact, false),
+                (
+                    "Compact",
+                    "Rows and turns closer together, so more fit",
+                    compact,
+                    true,
+                ),
+            ]
+            .map(|(label, tip, on, value)| {
+                let app = app.clone();
+                Segment {
+                    id: SharedString::from(format!("settings-spacing-{}", label.to_lowercase())),
+                    label,
+                    tip,
+                    on,
+                    click: Box::new(move |window: &mut Window, cx: &mut App| {
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |app, cx| app.set_compact(value, window, cx));
+                        }
+                    }),
+                }
+            }),
+            cx,
+        );
+        // The zoom (⌘= and ⌘-) at three of its steps; one between them
+        // lights whichever side it's on.
+        let zoom = style::zoom_percent();
+        let text_size = segmented(
+            [
+                (
+                    "Smaller",
+                    "Text and everything else a step smaller (90%)",
+                    zoom < 100,
+                    90,
+                ),
+                ("Normal", "Text at its usual size (100%)", zoom == 100, 100),
+                (
+                    "Larger",
+                    "Text and everything else a step larger (110%)",
+                    zoom > 100,
+                    110,
+                ),
+            ]
+            .map(|(label, tip, on, percent)| {
+                let app = app.clone();
+                Segment {
+                    id: SharedString::from(format!("settings-text-size-{}", label.to_lowercase())),
+                    label,
+                    tip,
+                    on,
+                    click: Box::new(move |window: &mut Window, cx: &mut App| {
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |app, cx| app.set_zoom(percent, window, cx));
+                        }
+                        // set_zoom redraws the window it's given, this one.
+                        cx.refresh_windows();
+                    }),
+                }
+            }),
+            cx,
+        );
+        let font_now = style::font_choice();
+        let font_app = app;
+        let font_menu = Button::new("settings-font")
+            .label(font_now.title())
+            .small()
+            .secondary()
+            .dropdown_caret(true)
+            .tooltip(FONT_TIP)
+            .dropdown_menu(move |menu: PopupMenu, _, _| {
+                let mut menu = menu;
+                for choice in style::Font::ALL {
+                    let app = font_app.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.title())
+                            .checked(choice == font_now)
+                            .on_click(move |_, window, cx| {
+                                if let Some(app) = app.upgrade() {
+                                    app.update(cx, |app, cx| app.set_font(choice, window, cx));
+                                }
+                            }),
+                    );
+                }
+                menu
+            });
+        let font = div()
+            .id("settings-font-holder")
+            .test_support()
+            .a11y_role(Role::GenericContainer)
+            .aria_label(FONT_TIP)
+            .flex_none()
+            .child(font_menu);
         section(
             "settings-appearance-section",
             "Appearance",
-            "Light or dark for Threadbear only. Same as the Mac follows System Settings > Appearance.",
-            "change it for you.",
-            vec![row("Appearance", div().id("settings-appearance-holder").test_support().a11y_role(Role::GenericContainer).aria_label("Light or dark for Threadbear, whatever the Mac is set to").child(menu), cx)],
+            if cfg!(target_os = "macos") {
+                "How Threadbear looks, for Threadbear only. Same as the Mac follows System Settings > Appearance, and the first accent is the Mac's own. Text size is the same as View > Zoom (⌘= and ⌘-). The bear colours are Wayne Sutton's, from his fork."
+            } else if cfg!(target_os = "windows") {
+                "How Threadbear looks, for Threadbear only. Same as Windows follows Settings > Personalization > Colors. Text size is the same as View > Zoom (Ctrl+= and Ctrl+-). The bear colours are Wayne Sutton's, from his fork."
+            } else {
+                "How Threadbear looks, for Threadbear only. Text size is the same as View > Zoom (Ctrl+= and Ctrl+-). The bear colours are Wayne Sutton's, from his fork."
+            },
+            "change any of it for you.",
+            vec![
+                div()
+                    .px(px(ROW_INSET))
+                    .pt(px(12.))
+                    .pb(px(10.))
+                    .child(looks)
+                    .into_any_element(),
+                row("Accent", accents, cx),
+                row("Spacing", spacing, cx),
+                row("Text size", text_size, cx),
+                row("Font", font, cx),
+            ],
             cx,
         )
     }
@@ -677,10 +1192,21 @@ impl SettingsWindow {
     /// Whether a press held on a panel's background picks it up, or only one
     /// on its title or tab (`panelBackgroundDrag`, off to begin with).
     fn panels_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let on = self.app.upgrade().is_some_and(|a| a.read(cx).settings.panel_background_drag());
-        let switch = self.switch("settings-panel-background-drag", on, "Press and hold anywhere on a panel to move it, not just on its title or tab", cx, |this, on, cx| {
-            this.app.update(cx, |app, cx| app.set_panel_background_drag(on, cx)).ok();
-        });
+        let on = self
+            .app
+            .upgrade()
+            .is_some_and(|a| a.read(cx).settings.panel_background_drag());
+        let switch = self.switch(
+            "settings-panel-background-drag",
+            on,
+            "Press and hold anywhere on a panel to move it, not just on its title or tab",
+            cx,
+            |this, on, cx| {
+                this.app
+                    .update(cx, |app, cx| app.set_panel_background_drag(on, cx))
+                    .ok();
+            },
+        );
         section(
             "settings-panels",
             "Panels",
@@ -694,15 +1220,24 @@ impl SettingsWindow {
     /// `QuitPrompt`'s switch: ticking Don't ask again turns it off, and this
     /// turns it back on.
     fn quitting_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let on = self.app.upgrade().is_none_or(|a| a.read(cx).settings.asks_before_quitting());
-        let switch = self.switch("settings-ask-before-quitting", on, "Ask to confirm when you quit Threadbear", cx, |this, on, cx| {
-            this.app
-                .update(cx, |app, cx| {
-                    app.settings.saved.ask_before_quitting = Some(on);
-                    app.save_settings_soon(cx);
-                })
-                .ok();
-        });
+        let on = self
+            .app
+            .upgrade()
+            .is_none_or(|a| a.read(cx).settings.asks_before_quitting());
+        let switch = self.switch(
+            "settings-ask-before-quitting",
+            on,
+            "Ask to confirm when you quit Threadbear",
+            cx,
+            |this, on, cx| {
+                this.app
+                    .update(cx, |app, cx| {
+                        app.settings.saved.ask_before_quitting = Some(on);
+                        app.save_settings_soon(cx);
+                    })
+                    .ok();
+            },
+        );
         section(
             "settings-quitting",
             "Quitting",
@@ -719,43 +1254,75 @@ impl SettingsWindow {
             let s = &a.read(cx).settings;
             (s.ding_on(), s.ding())
         });
-        let switch = self.switch("settings-ding", on, "A soft ding when a thread is done and ready for you", cx, |this, on, cx| {
-            this.app
-                .update(cx, |app, cx| {
-                    app.settings.saved.completion_sound = Some(on);
-                    app.save_settings_soon(cx);
-                    if on {
-                        crate::ding::play(app.settings.ding(), app.settings.ding_volume());
-                    }
-                })
-                .ok();
-        });
-        let app = self.app.clone();
-        let picker = Button::new("settings-ding-sound").label(ding.title()).small().secondary().dropdown_caret(true).tooltip("Which ding plays").dropdown_menu(move |menu: PopupMenu, _, _| {
-            let mut menu = menu;
-            for choice in Ding::ALL {
-                let app = app.clone();
-                menu = menu.item(PopupMenuItem::new(choice.title()).checked(choice == ding).on_click(move |_, _, cx| {
-                    app.update(cx, |app, cx| {
-                        app.settings.saved.completion_sound_ding = Some(choice.name().to_owned());
+        let switch = self.switch(
+            "settings-ding",
+            on,
+            "A soft ding when a thread is done and ready for you",
+            cx,
+            |this, on, cx| {
+                this.app
+                    .update(cx, |app, cx| {
+                        app.settings.saved.completion_sound = Some(on);
                         app.save_settings_soon(cx);
-                        crate::ding::play(choice, app.settings.ding_volume());
+                        if on {
+                            crate::ding::play(app.settings.ding(), app.settings.ding_volume());
+                        }
                     })
                     .ok();
-                }));
-            }
-            menu
-        });
+            },
+        );
+        let app = self.app.clone();
+        let picker = Button::new("settings-ding-sound")
+            .label(ding.title())
+            .small()
+            .secondary()
+            .dropdown_caret(true)
+            .tooltip("Which ding plays")
+            .dropdown_menu(move |menu: PopupMenu, _, _| {
+                let mut menu = menu;
+                for choice in Ding::ALL {
+                    let app = app.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.title())
+                            .checked(choice == ding)
+                            .on_click(move |_, _, cx| {
+                                app.update(cx, |app, cx| {
+                                    app.settings.saved.completion_sound_ding =
+                                        Some(choice.name().to_owned());
+                                    app.save_settings_soon(cx);
+                                    crate::ding::play(choice, app.settings.ding_volume());
+                                })
+                                .ok();
+                            }),
+                    );
+                }
+                menu
+            });
         let volume = h_flex()
             .gap(px(8.))
             .items_center()
-            .child(div().id("settings-ding-volume").test_support().a11y_role(Role::GenericContainer).aria_label("How loud the ding is").w(px(180.)).tip("How loud the ding is").child(Slider::new(&self.volume).horizontal()))
-            .child(self.button("settings-ding-play", "Play", "Hear the ding", cx, |this, _, cx| {
-                if let Some(app) = this.app.upgrade() {
-                    let s = &app.read(cx).settings;
-                    crate::ding::play(s.ding(), s.ding_volume());
-                }
-            }));
+            .child(
+                div()
+                    .id("settings-ding-volume")
+                    .test_support()
+                    .a11y_role(Role::GenericContainer)
+                    .aria_label("How loud the ding is")
+                    .w(px(180.))
+                    .tip("How loud the ding is")
+                    .child(Slider::new(&self.volume).horizontal()),
+            )
+            .child(self.button(
+                "settings-ding-play",
+                "Play",
+                "Hear the ding",
+                cx,
+                |this, _, cx| {
+                    if let Some(app) = this.app.upgrade() {
+                        let s = &app.read(cx).settings;
+                        crate::ding::play(s.ding(), s.ding_volume());
+                    }
+                },
+            ));
         section(
             "settings-notifications",
             "Notifications",
@@ -772,38 +1339,68 @@ impl SettingsWindow {
 
     /// `InstructionsSection`: the box, or, when the file was changed outside
     /// Settings, what it holds with Use These and Clear.
-    fn instructions_section(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn instructions_section(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let current = self.app.upgrade()?.read(cx).standing_instructions.clone()?;
         let secondary = style::secondary_text(cx);
         let body: AnyElement = if current.outside {
-            let reviewed = self.reviewed.clone().unwrap_or_else(|| current.text.clone());
+            let reviewed = self
+                .reviewed
+                .clone()
+                .unwrap_or_else(|| current.text.clone());
             let newer = current.text != reviewed;
             let empty = reviewed.is_empty();
-            let shown = if empty { "The file is gone, or can't be read.".to_owned() } else { reviewed.clone() };
-            let (use_text, file_text) = (reviewed.clone(), current.text.clone());
+            let shown = if empty {
+                "The file is gone, or can't be read.".to_owned()
+            } else {
+                reviewed.clone()
+            };
+            let (use_text, file_text) = (reviewed, current.text);
             let mut buttons = h_flex().gap(px(8.)).items_center();
             if self.resolving {
                 buttons = buttons.child(Spinner::new().with_size(px(12.)).color(secondary));
             }
             if newer {
-                buttons = buttons.child(self.button("settings-instructions-newer", "Show Newer Version", "The file has changed again. Show what it holds now", cx, move |this, _, cx| {
-                    this.reviewed = Some(file_text.clone());
-                    cx.notify();
-                }));
+                buttons = buttons.child(self.button(
+                    "settings-instructions-newer",
+                    "Show Newer Version",
+                    "The file has changed again. Show what it holds now",
+                    cx,
+                    move |this, _, cx| {
+                        this.reviewed = Some(file_text.clone());
+                        cx.notify();
+                    },
+                ));
             }
             buttons = buttons
                 .child(div().flex_1())
-                .child(self.button("settings-instructions-clear", "Clear", "Delete these, so agents are given no standing instructions", cx, |this, _, cx| this.resolve_outside(String::new(), cx)))
+                .child(self.button(
+                    "settings-instructions-clear",
+                    "Clear",
+                    "Delete these, so agents are given no standing instructions",
+                    cx,
+                    |this, _, cx| this.resolve_outside(String::new(), cx),
+                ))
                 .child(
-                    div().id("settings-instructions-use").test_support().a11y_role(Role::GenericContainer).aria_label("Give every agent exactly the text shown here").child(
-                        Button::new("settings-instructions-use-button")
-                            .label("Use These")
-                            .small()
-                            .secondary()
-                            .disabled(empty || self.resolving)
-                            .tooltip("Give every agent exactly the text shown here")
-                            .on_click(cx.listener(move |this, _, _, cx| this.resolve_outside(use_text.clone(), cx))),
-                    ),
+                    div()
+                        .id("settings-instructions-use")
+                        .test_support()
+                        .a11y_role(Role::GenericContainer)
+                        .aria_label("Give every agent exactly the text shown here")
+                        .child(
+                            Button::new("settings-instructions-use-button")
+                                .label("Use These")
+                                .small()
+                                .secondary()
+                                .disabled(empty || self.resolving)
+                                .tooltip("Give every agent exactly the text shown here")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.resolve_outside(use_text.clone(), cx)
+                                })),
+                        ),
                 );
             v_flex()
                 .gap(px(8.))
@@ -826,8 +1423,21 @@ impl SettingsWindow {
             v_flex()
                 .gap(px(6.))
                 .p(px(12.))
-                .child(div().id("settings-instructions").test_support().a11y_role(Role::GenericContainer).aria_label("What every thread's agent should always keep in mind").child(Textarea::new(&self.instructions).h(px(120.)).appearance(false)))
-                .when_some(self.instructions_status.clone(), |s, status| s.child(div().text_size(px(11.)).text_color(secondary).child(status)))
+                .child(
+                    div()
+                        .id("settings-instructions")
+                        .test_support()
+                        .a11y_role(Role::GenericContainer)
+                        .aria_label("What every thread's agent should always keep in mind")
+                        .child(
+                            Textarea::new(&self.instructions)
+                                .h(px(120.))
+                                .appearance(false),
+                        ),
+                )
+                .when_some(self.instructions_status.clone(), |s, status| {
+                    s.child(div().text_size(px(11.)).text_color(secondary).child(status))
+                })
                 .into_any_element()
         };
         Some(section_with_body(
@@ -840,8 +1450,14 @@ impl SettingsWindow {
         ))
     }
 
-    fn render_models(&mut self, settings: Option<&RunnerSettings>, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let Some(settings) = settings else { return vec![plain_note(&waiting_text(&self.app, cx), cx)] };
+    fn render_models(
+        &mut self,
+        settings: Option<&RunnerSettings>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(settings) = settings else {
+            return vec![plain_note(&waiting_text(&self.app, cx), cx)];
+        };
         let mut sections = Vec::new();
         if settings.pool_supported {
             if let Some(app) = self.app.upgrade() {
@@ -850,25 +1466,67 @@ impl SettingsWindow {
                 let pools: Vec<(String, String, Option<String>, String)> = logins
                     .pools
                     .iter()
-                    .filter(|pool| pool.account_ids.iter().any(|id| logins.account(id).is_some_and(|a| small.iter().any(|p| p == a.provider_id()))))
+                    .filter(|pool| {
+                        pool.account_ids.iter().any(|id| {
+                            logins
+                                .account(id)
+                                .is_some_and(|a| small.iter().any(|p| p == a.provider_id()))
+                        })
+                    })
                     .map(|pool| {
-                        let provider = pool.account_ids.iter().find_map(|id| logins.account(id)).map_or("claude", |a| a.provider_id()).to_owned();
-                        (pool.id.clone(), pool.title.clone(), pool.icon.clone().filter(|i| !i.is_empty()), provider)
+                        let provider = pool
+                            .account_ids
+                            .iter()
+                            .find_map(|id| logins.account(id))
+                            .map_or("claude", |a| a.provider_id())
+                            .to_owned();
+                        (
+                            pool.id.clone(),
+                            pool.title.clone(),
+                            pool.icon.clone().filter(|i| !i.is_empty()),
+                            provider,
+                        )
                     })
                     .collect();
                 let set = settings.pool.clone();
                 // The pool's own icon, else its logins' provider's mark (`Pools.symbol`).
-                let face: Option<Icon> = set.as_ref().and_then(|id| pools.iter().find(|p| &p.0 == id)).map(|(_, _, icon, provider)| match icon {
-                    Some(symbol) => icons::symbol(symbol),
-                    None => icons::provider_mark(provider),
-                });
+                let face: Option<Icon> = set
+                    .as_ref()
+                    .and_then(|id| pools.iter().find(|p| &p.0 == id))
+                    .map(|(_, _, icon, provider)| match icon {
+                        Some(symbol) => icons::symbol(symbol),
+                        None => icons::provider_mark(provider),
+                    });
                 let label = match &set {
-                    Some(id) => pools.iter().find(|p| &p.0 == id).map_or_else(|| format!("{id}, which has no Claude login"), |p| p.1.clone()),
+                    Some(id) => pools.iter().find(|p| &p.0 == id).map_or_else(
+                        || format!("{id}, which has no Claude login"),
+                        |p| p.1.clone(),
+                    ),
                     None => "None".to_owned(),
                 };
-                let mut choices: Vec<(String, bool, Value)> = pools.iter().map(|(id, title, _, _)| (title.clone(), set.as_deref() == Some(id.as_str()), json!({ "models": { "pool": id } }))).collect();
-                choices.push(("None".into(), set.is_none(), json!({ "models": { "pool": Value::Null } })));
-                let menu = self.menu("settings-small-jobs", label, face, "Which pool's Claude logins write titles and do the librarian's work", choices, cx);
+                let mut choices: Vec<(String, bool, Value)> = pools
+                    .iter()
+                    .map(|(id, title, _, _)| {
+                        (
+                            title.clone(),
+                            set.as_deref() == Some(id.as_str()),
+                            json!({ "models": { "pool": id } }),
+                        )
+                    })
+                    .collect();
+                choices.push((
+                    "None".into(),
+                    set.is_none(),
+                    json!({ "models": { "pool": Value::Null } }),
+                ));
+                let menu = self.menu(
+                    "settings-small-jobs",
+                    label,
+                    face,
+                    "Which pool's Claude logins write titles and do the librarian's work",
+                    choices,
+                    cx,
+                );
                 sections.push(section(
                     "settings-small-jobs-section",
                     "Small jobs",
@@ -882,17 +1540,63 @@ impl SettingsWindow {
         let secondary = style::secondary_text(cx);
         let mut rows: Vec<AnyElement> = Vec::new();
         if settings.private_folders.is_empty() {
-            rows.push(row_with(div().text_color(secondary).child("None yet").into_any_element(), div().into_any_element(), cx));
+            rows.push(row_with(
+                div()
+                    .text_color(secondary)
+                    .child("None yet")
+                    .into_any_element(),
+                div().into_any_element(),
+                cx,
+            ));
         }
         for folder in &settings.private_folders {
-            let rest: Vec<String> = settings.private_folders.iter().filter(|f| *f != folder).cloned().collect();
-            let remove = self.icon_button(format!("settings-private-remove-{folder}"), "minus.circle", "Stop keeping this folder private", cx, move |this, _, cx| this.update(json!({ "models": { "privateFolders": rest.clone() } }), cx));
-            let label = h_flex().gap(px(8.)).items_center().min_w_0().child(icons::symbol("folder").with_size(px(13.)).text_color(secondary)).child(div().min_w_0().text_ellipsis_middle().whitespace_nowrap().overflow_hidden().child(folder.clone()));
+            let rest: Vec<String> = settings
+                .private_folders
+                .iter()
+                .filter(|f| *f != folder)
+                .cloned()
+                .collect();
+            let remove = self.icon_button(
+                format!("settings-private-remove-{folder}"),
+                "minus.circle",
+                "Stop keeping this folder private",
+                cx,
+                move |this, _, cx| {
+                    this.update(json!({ "models": { "privateFolders": rest.clone() } }), cx)
+                },
+            );
+            let label = h_flex()
+                .gap(px(8.))
+                .items_center()
+                .min_w_0()
+                .child(
+                    icons::symbol("folder")
+                        .with_size(px(13.))
+                        .text_color(secondary),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_ellipsis_middle()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(folder.clone()),
+                );
             rows.push(row_with(label.into_any_element(), remove, cx));
         }
         let current = settings.private_folders.clone();
-        let add = self.button("settings-private-add", "Add Folder…", "Keep a folder's threads from ever being sent for titles and other small jobs", cx, move |this, window, cx| this.add_private_folders(current.clone(), window, cx));
-        rows.push(row_with(h_flex().child(add).into_any_element(), div().into_any_element(), cx));
+        let add = self.button(
+            "settings-private-add",
+            "Add Folder…",
+            "Keep a folder's threads from ever being sent for titles and other small jobs",
+            cx,
+            move |this, window, cx| this.add_private_folders(current.clone(), window, cx),
+        );
+        rows.push(row_with(
+            h_flex().child(add).into_any_element(),
+            div().into_any_element(),
+            cx,
+        ));
         sections.push(section(
             "settings-private-folders",
             "Private folders",
@@ -906,90 +1610,213 @@ impl SettingsWindow {
 
     // Controls.
 
-    fn button(&self, id: &'static str, label: &'static str, tip: &'static str, cx: &mut Context<Self>, action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> AnyElement {
+    fn button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        tip: &'static str,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
         div()
             .id(SharedString::from(format!("{id}-holder")))
             .test_support()
-            .a11y_role(Role::GenericContainer).aria_label(tip)
+            .a11y_role(Role::GenericContainer)
+            .aria_label(tip)
             .flex_none()
-            .child(Button::new(id).label(label).small().secondary().tooltip(tip).on_click(cx.listener(move |this, _, window, cx| action(this, window, cx))))
+            .child(
+                Button::new(id)
+                    .label(label)
+                    .small()
+                    .secondary()
+                    .tooltip(tip)
+                    .on_click(cx.listener(move |this, _, window, cx| action(this, window, cx))),
+            )
             .into_any_element()
     }
 
-    fn button_owned(&self, id: &'static str, label: &'static str, tip: String, cx: &mut Context<Self>, action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> AnyElement {
+    fn button_owned(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        tip: String,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
         div()
             .id(SharedString::from(format!("{id}-holder")))
             .test_support()
-            .a11y_role(Role::GenericContainer).aria_label(tip.clone())
+            .a11y_role(Role::GenericContainer)
+            .aria_label(tip.clone())
             .flex_none()
-            .child(Button::new(id).label(label).small().secondary().tooltip(tip).on_click(cx.listener(move |this, _, window, cx| action(this, window, cx))))
+            .child(
+                Button::new(id)
+                    .label(label)
+                    .small()
+                    .secondary()
+                    .tooltip(tip)
+                    .on_click(cx.listener(move |this, _, window, cx| action(this, window, cx))),
+            )
             .into_any_element()
     }
 
-    fn icon_button_owned(&self, id: String, symbol: &'static str, tip: String, cx: &mut Context<Self>, action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> AnyElement {
-        let (hover, secondary, fg) = (style::primary_opacity(cx, 0.08), style::secondary_text(cx), cx.theme().foreground);
-        crate::highlights::tipped(div().id(SharedString::from(id)).flex_none().size(px(22.)).rounded(px(5.)).flex().items_center().justify_center().cursor_pointer().text_color(secondary).hover(move |s| s.bg(hover).text_color(fg)), tip)
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
-            .child(icons::symbol(symbol).with_size(px(13.)))
-            .into_any_element()
+    fn icon_button_owned(
+        &self,
+        id: String,
+        symbol: &'static str,
+        tip: String,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let (hover, secondary, fg) = (
+            style::primary_opacity(cx, 0.08),
+            style::secondary_text(cx),
+            cx.theme().foreground,
+        );
+        crate::highlights::tipped(
+            div()
+                .id(SharedString::from(id))
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(5.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(secondary)
+                .hover(move |s| s.bg(hover).text_color(fg)),
+            tip,
+        )
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
+        .child(icons::symbol(symbol).with_size(px(13.)))
+        .into_any_element()
     }
 
-    fn icon_button(&self, id: String, symbol: &'static str, tip: &'static str, cx: &mut Context<Self>, action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> AnyElement {
-        let (hover, secondary, fg) = (style::primary_opacity(cx, 0.08), style::secondary_text(cx), cx.theme().foreground);
-        crate::highlights::tipped(div().id(SharedString::from(id)).flex_none().size(px(22.)).rounded(px(5.)).flex().items_center().justify_center().cursor_pointer().text_color(secondary).hover(move |s| s.bg(hover).text_color(fg)), tip)
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
-            .child(icons::symbol(symbol).with_size(px(13.)))
-            .into_any_element()
+    fn icon_button(
+        &self,
+        id: String,
+        symbol: &'static str,
+        tip: &'static str,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let (hover, secondary, fg) = (
+            style::primary_opacity(cx, 0.08),
+            style::secondary_text(cx),
+            cx.theme().foreground,
+        );
+        crate::highlights::tipped(
+            div()
+                .id(SharedString::from(id))
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(5.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(secondary)
+                .hover(move |s| s.bg(hover).text_color(fg)),
+            tip,
+        )
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
+        .child(icons::symbol(symbol).with_size(px(13.)))
+        .into_any_element()
     }
 
-    fn switch(&self, id: &'static str, on: bool, tip: &'static str, cx: &mut Context<Self>, set: impl Fn(&mut Self, bool, &mut App) + 'static) -> AnyElement {
+    fn switch(
+        &self,
+        id: &'static str,
+        on: bool,
+        tip: &'static str,
+        cx: &mut Context<Self>,
+        set: impl Fn(&mut Self, bool, &mut App) + 'static,
+    ) -> AnyElement {
         self.switch_owned(id.to_owned(), on, tip.to_owned(), cx, set)
     }
 
-    fn switch_owned(&self, id: String, on: bool, tip: String, cx: &mut Context<Self>, set: impl Fn(&mut Self, bool, &mut App) + 'static) -> AnyElement {
+    fn switch_owned(
+        &self,
+        id: String,
+        on: bool,
+        tip: String,
+        cx: &mut Context<Self>,
+        set: impl Fn(&mut Self, bool, &mut App) + 'static,
+    ) -> AnyElement {
         let shown = tip.clone();
         let me = cx.entity().downgrade();
         let set = std::rc::Rc::new(set);
         div()
             .id(SharedString::from(format!("{id}-holder")))
             .test_support()
-            .a11y_role(Role::GenericContainer).aria_label(tip)
-            .tip(shown.clone())
+            .a11y_role(Role::GenericContainer)
+            .aria_label(tip)
+            .tip(shown)
             .flex_none()
-            .child(crate::mac_switch::MacSwitch::new(SharedString::from(id), on).on_change(move |on, _, cx| {
-                let set = set.clone();
-                me.update(cx, |this, cx| set(this, on, cx)).ok();
-            }))
+            .child(
+                crate::mac_switch::MacSwitch::new(SharedString::from(id), on).on_change(
+                    move |on, _, cx| {
+                        let set = set.clone();
+                        me.update(cx, |this, cx| set(this, on, cx)).ok();
+                    },
+                ),
+            )
             .into_any_element()
     }
 
     /// A pop-up menu: what's chosen, and the choices, each the change it
     /// sends (`settings.update`).
-    fn menu(&self, id: &'static str, label: String, face: Option<Icon>, tip: &'static str, choices: Vec<(String, bool, Value)>, cx: &mut Context<Self>) -> AnyElement {
+    fn menu(
+        &self,
+        id: &'static str,
+        label: String,
+        face: Option<Icon>,
+        tip: &'static str,
+        choices: Vec<(String, bool, Value)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         self.menu_owned(id.to_owned(), label, face, tip.to_owned(), choices, cx)
     }
 
     /// `menu`, for one whose id or tip is made up as it's drawn (a
     /// reviewer's row).
-    fn menu_owned(&self, id: String, label: String, face: Option<Icon>, tip: String, choices: Vec<(String, bool, Value)>, cx: &mut Context<Self>) -> AnyElement {
+    fn menu_owned(
+        &self,
+        id: String,
+        label: String,
+        face: Option<Icon>,
+        tip: String,
+        choices: Vec<(String, bool, Value)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let me = cx.entity().downgrade();
-        let mut button = Button::new(SharedString::from(id.clone())).label(label).small().secondary().dropdown_caret(true).tooltip(tip.clone());
+        let mut button = Button::new(SharedString::from(id.clone()))
+            .label(label)
+            .small()
+            .secondary()
+            .dropdown_caret(true)
+            .tooltip(tip.clone());
         if let Some(face) = face {
             button = button.icon(face);
         }
         div()
             .id(SharedString::from(format!("{id}-holder")))
             .test_support()
-            .a11y_role(Role::GenericContainer).aria_label(tip)
+            .a11y_role(Role::GenericContainer)
+            .aria_label(tip)
             .flex_none()
             .child(button.dropdown_menu(move |menu: PopupMenu, _, _| {
                 let mut menu = menu;
                 for (title, checked, change) in &choices {
                     let (me, change) = (me.clone(), change.clone());
-                    menu = menu.item(PopupMenuItem::new(title.clone()).checked(*checked).on_click(move |_, _, cx| {
-                        let change = change.clone();
-                        me.update(cx, |this, cx| this.update(change, cx)).ok();
-                    }));
+                    menu = menu.item(
+                        PopupMenuItem::new(title.clone())
+                            .checked(*checked)
+                            .on_click(move |_, _, cx| {
+                                let change = change.clone();
+                                me.update(cx, |this, cx| this.update(change, cx)).ok();
+                            }),
+                    );
                 }
                 menu
             }))
@@ -999,11 +1826,13 @@ impl SettingsWindow {
 
 /// Why there are no runner settings to show yet (`settingsWaiting`).
 fn waiting_text(app: &WeakEntity<Threadbear>, cx: &App) -> String {
-    let Some(app) = app.upgrade() else { return "Not connected to the runner.".into() };
+    let Some(app) = app.upgrade() else {
+        return "Not connected to the runner.".into();
+    };
     let t = app.read(cx);
     if t.settings_unsupported {
         "This runner is too old for settings. It gets them when it next updates.".into()
-    } else if !matches!(t.status, threadbear_client::runner::Status::Connected { .. }) {
+    } else if !t.connected() {
         "Not connected to the runner.".into()
     } else {
         "Loading…".into()
@@ -1013,12 +1842,19 @@ fn waiting_text(app: &WeakEntity<Threadbear>, cx: &App) -> String {
 /// `SettingsSection`: its title, with what it is and what to ask your agent
 /// behind the ⓘ, over its rows in a rounded group.
 // Full sync's ⓘ, kept here in one place so its wording is easy to change.
-// The benefit first, then what goes up and what doesn't (docs/full-convex.md).
+// The benefit first, then what goes up and what doesn't (docs/convex-backend.md, "Full sync").
 // The runner reads sync.full when it starts, hence the last sentence.
 const FULL_SYNC_ABOUT: &str = "Lets your phone, the website and your other machines show a thread's tool output and diffs, even when the machine that ran it is off.\n\nTool output, inputs and diffs go to your own Convex deployment, with secrets scrubbed out first, and are kept for 30 days. Screenshots, and tools reading things like .env files and keys, stay on this Mac. Scrubbing isn't a guarantee. A change takes effect when the runner next starts.";
 const FULL_SYNC_ASK: &str = "explain what goes up, or turn it on or off for you.";
 
-fn section(id: &'static str, title: &str, about: &str, ask: &str, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+fn section(
+    id: &'static str,
+    title: &str,
+    about: &str,
+    ask: &str,
+    rows: Vec<AnyElement>,
+    cx: &App,
+) -> AnyElement {
     section_with_body(id, title, about, ask, rows_with_dividers(rows, cx), cx)
 }
 
@@ -1042,8 +1878,14 @@ fn rows_with_dividers(rows: Vec<AnyElement>, cx: &App) -> AnyElement {
 /// headings from the window's: 10 points on macOS 27.
 const ROW_INSET: f32 = 10.;
 
-fn section_with_body(id: &'static str, title: &str, about: &str, ask: &str, body: AnyElement, cx: &App) -> AnyElement {
-    let info = format!("{about}\n\nAsk your agent to {ask}");
+fn section_with_body(
+    id: &'static str,
+    title: &str,
+    about: &str,
+    _ask: &str,
+    body: AnyElement,
+    cx: &App,
+) -> AnyElement {
     // As a grouped Form draws a section on macOS 27, measured from the Swift
     // window: the heading in line with the rows' words and 11 points over
     // the group, which has no edge, corners of 12 and a fill of 3% of the
@@ -1051,14 +1893,38 @@ fn section_with_body(id: &'static str, title: &str, about: &str, ask: &str, body
     v_flex()
         .id(id)
         .gap(px(11.))
-        .child(h_flex().gap(px(6.)).items_center().px(px(ROW_INSET)).child(div().text_size(px(13.)).line_height(px(16.)).font_semibold().child(title.to_owned())).child(info_tip(SharedString::from(format!("{id}-info")), info, cx)))
-        .child(div().rounded(px(12.)).bg(style::primary_opacity(cx, 0.03)).child(body))
+        .child(
+            h_flex()
+                .gap(px(6.))
+                .items_center()
+                .px(px(ROW_INSET))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .line_height(px(16.))
+                        .font_semibold()
+                        .child(title.to_owned()),
+                )
+                .child(section_info(id, title, about, cx))
+                .child(div().flex_1())
+                .child(thread_button(id, title, cx)),
+        )
+        .child(
+            div()
+                .rounded(px(12.))
+                .bg(style::primary_opacity(cx, 0.03))
+                .child(body),
+        )
         .into_any_element()
 }
 
 /// A row of a group: what it is on the left, its control on the right.
 fn row(label: &'static str, control: impl IntoElement, cx: &App) -> AnyElement {
-    row_with(div().child(label).into_any_element(), control.into_any_element(), cx)
+    row_with(
+        div().child(label).into_any_element(),
+        control.into_any_element(),
+        cx,
+    )
 }
 
 fn row_with(label: AnyElement, control: AnyElement, _cx: &App) -> AnyElement {
@@ -1075,9 +1941,223 @@ fn row_with(label: AnyElement, control: AnyElement, _cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// One of Appearance's pictures: a little window in that look, with the
+/// sidebar down its left and two lines of words, and the system's split down
+/// the middle. The picked one has a ring in the accent.
+fn look_tile(
+    choice: style::Appearance,
+    on: bool,
+    tip: &'static str,
+    cx: &App,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let ring = style::control_accent(cx);
+    let tint = style::control_accent(cx);
+    let half = |dark: bool| {
+        let (side, main, line) = if dark {
+            (rgb(0x262626), rgb(0x1c1c1c), rgb(0x4a4a4a))
+        } else {
+            (rgb(0xececec), rgb(0xffffff), rgb(0xcfcfcf))
+        };
+        (side, main, line)
+    };
+    let picture = |dark: bool| {
+        let (side, main, line) = half(dark);
+        h_flex()
+            .size_full()
+            .child(div().w(px(26.)).h_full().bg(side))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .h_full()
+                    .bg(main)
+                    .p(px(7.))
+                    .gap(px(5.))
+                    .child(div().h(px(5.)).w(px(44.)).rounded_full().bg(line))
+                    .child(div().h(px(5.)).w(px(30.)).rounded_full().bg(line))
+                    .child(div().flex_1())
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .child(div().h(px(6.)).w(px(20.)).rounded_full().bg(tint)),
+                    ),
+            )
+    };
+    let thumb = match choice {
+        style::Appearance::Light => picture(false).into_any_element(),
+        style::Appearance::Dark => picture(true).into_any_element(),
+        style::Appearance::System => h_flex()
+            .size_full()
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .bottom_0()
+                    .w(px(46.))
+                    .overflow_hidden()
+                    .child(div().w(px(92.)).h_full().child(picture(false))),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(46.))
+                    .overflow_hidden()
+                    .child(div().ml(px(-46.)).w(px(92.)).h_full().child(picture(true))),
+            )
+            .into_any_element(),
+    };
+    let (fg, faint) = (cx.theme().foreground, style::secondary_text(cx));
+    v_flex()
+        .id(SharedString::from(format!(
+            "settings-look-{}",
+            choice.name()
+        )))
+        .test_support()
+        .a11y_role(Role::Button)
+        .aria_label(tip)
+        .tip(tip)
+        .cursor_pointer()
+        .items_center()
+        .gap(px(6.))
+        .child(
+            div()
+                .w(px(96.))
+                .h(px(64.))
+                .rounded(px(9.))
+                .border(px(2.))
+                .border_color(if on {
+                    ring
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .p(px(2.))
+                .child(
+                    div()
+                        .size_full()
+                        .rounded(px(6.))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(style::primary_opacity(cx, 0.12))
+                        .child(thumb),
+                ),
+        )
+        .on_click(click)
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(if on { fg } else { faint })
+                .child(choice.title()),
+        )
+        .into_any_element()
+}
+
+/// One accent: a dot in its colour, ringed when it's the one picked. The
+/// system's is the Mac's accent where there is one, else the usual blue.
+fn accent_dot(
+    choice: style::Accent,
+    on: bool,
+    cx: &App,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let colour: Hsla = match choice.rgb() {
+        Some(hex) => rgb(hex).into(),
+        None => {
+            // What the system's would be: the Mac's accent, read at launch.
+            let picked = style::accent_choice();
+            if picked == style::Accent::System {
+                style::control_accent(cx)
+            } else {
+                rgb(0x0a84ff).into()
+            }
+        }
+    };
+    let tip: SharedString = match choice {
+        style::Accent::System if cfg!(target_os = "macos") => "Use the Mac's accent colour".into(),
+        style::Accent::System => "Use blue, the usual accent".into(),
+        _ => format!("Use {} as the accent", choice.title()).into(),
+    };
+    div()
+        .id(SharedString::from(format!(
+            "settings-accent-{}",
+            choice.name()
+        )))
+        .test_support()
+        .a11y_role(Role::Button)
+        .aria_label(tip.clone())
+        .tip(tip)
+        .cursor_pointer()
+        .size(px(24.))
+        .rounded_full()
+        .border(px(2.))
+        .border_color(if on {
+            style::primary_opacity(cx, 0.6)
+        } else {
+            gpui_kit::transparent_black()
+        })
+        .p(px(2.))
+        .on_click(click)
+        .child(div().size_full().rounded_full().bg(colour))
+        .into_any_element()
+}
+
+/// A choice in a row of them (`segmented`).
+struct Segment {
+    id: SharedString,
+    label: &'static str,
+    tip: &'static str,
+    on: bool,
+    click: Box<dyn Fn(&mut Window, &mut App)>,
+}
+
+/// A few choices side by side, the picked one lit, as a segmented control
+/// draws them.
+fn segmented<const N: usize>(choices: [Segment; N], cx: &App) -> AnyElement {
+    let (fg, faint, lit, track) = (
+        cx.theme().foreground,
+        style::secondary_text(cx),
+        style::primary_opacity(cx, 0.14),
+        style::primary_opacity(cx, 0.06),
+    );
+    h_flex()
+        .flex_none()
+        .p(px(2.))
+        .rounded(px(7.))
+        .bg(track)
+        .children(choices.into_iter().map(|c| {
+            let click = c.click;
+            div()
+                .id(c.id)
+                .test_support()
+                .a11y_role(Role::Button)
+                .aria_label(c.tip)
+                .tip(c.tip)
+                .cursor_pointer()
+                .px(px(11.))
+                .py(px(3.))
+                .rounded(px(5.))
+                .text_size(px(12.))
+                .when(c.on, |s| s.bg(lit).text_color(fg))
+                .when(!c.on, |s| s.text_color(faint))
+                .on_click(move |_, window, cx| click(window, cx))
+                .child(c.label)
+        }))
+        .into_any_element()
+}
+
 /// A line on its own in place of a section (`Section { Text(...) }`).
 fn plain_note(text: &str, cx: &App) -> AnyElement {
-    div().px(px(ROW_INSET)).text_size(px(13.)).line_height(px(17.)).text_color(style::secondary_text(cx)).child(text.to_owned()).into_any_element()
+    div()
+        .px(px(ROW_INSET))
+        .text_size(px(13.))
+        .line_height(px(17.))
+        .text_color(style::secondary_text(cx))
+        .child(text.to_owned())
+        .into_any_element()
 }
 
 impl Render for SettingsWindow {
@@ -1085,7 +2165,10 @@ impl Render for SettingsWindow {
         let (settings, error) = match self.app.upgrade() {
             Some(app) => {
                 let t = app.read(cx);
-                (t.runner_settings.as_ref().map(RunnerSettings::decode), t.settings_error.clone())
+                (
+                    t.runner_settings.as_ref().map(RunnerSettings::decode),
+                    t.settings_error.clone(),
+                )
             }
             None => (None, None),
         };
@@ -1100,7 +2183,14 @@ impl Render for SettingsWindow {
                 .bg(cx.theme().background)
                 .text_color(cx.theme().foreground)
                 .child(sidebar)
-                .child(div().id("settings-pane").flex_1().min_w_0().h_full().child(page))
+                .child(
+                    div()
+                        .id("settings-pane")
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(page),
+                )
                 .child(crate::tips::window_presses());
         }
         let mut sections = match self.tab {
@@ -1132,12 +2222,28 @@ impl Render for SettingsWindow {
             .text_color(cx.theme().foreground)
             .child(sidebar)
             .child(
-                div().id("settings-pane").flex_1().min_w_0().h_full().overflow_y_scroll().track_scroll(&self.scroll).child(
-                    // A grouped form stops its rows at about 700 points; wider
-                    // than that adds even sides. Its sections are 30 apart
-                    // (57 from one group to the next, with the heading).
-                    h_flex().w_full().justify_center().child(v_flex().w_full().max_w(px(700.)).px(px(20.)).pt(px(20.)).pb(px(24.)).gap(px(30.)).children(sections)),
-                ),
+                div()
+                    .id("settings-pane")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(
+                        // A grouped form stops its rows at about 700 points; wider
+                        // than that adds even sides. Its sections are 30 apart
+                        // (57 from one group to the next, with the heading).
+                        h_flex().w_full().justify_center().child(
+                            v_flex()
+                                .w_full()
+                                .max_w(px(700.))
+                                .px(px(20.))
+                                .pt(px(20.))
+                                .pb(px(24.))
+                                .gap(px(30.))
+                                .children(sections),
+                        ),
+                    ),
             )
             // Last: every press in the window, for the activity log (tips.rs).
             .child(crate::tips::window_presses())
@@ -1149,15 +2255,31 @@ impl Render for SettingsWindow {
 #[cfg(feature = "automation")]
 impl SettingsWindow {
     pub(crate) fn dump(&self, cx: &App) -> Value {
-        let settings = self.app.upgrade().and_then(|a| a.read(cx).runner_settings.as_ref().map(RunnerSettings::decode));
+        let settings = self.app.upgrade().and_then(|a| {
+            a.read(cx)
+                .runner_settings
+                .as_ref()
+                .map(RunnerSettings::decode)
+        });
         json!({
             "tab": self.tab.name(),
             "appearance": style::appearance().name(),
+            "accent": style::accent_choice().name(),
+            "compact": style::compact(),
+            "font": style::font_choice().name(),
             "defaultFolder": settings.as_ref().map(|s| s.default_cwd.clone()),
             "keepAwake": settings.as_ref().and_then(|s| s.keep_awake),
             "fullSync": settings.as_ref().and_then(|s| s.full_sync),
+            "spareWeek": settings.as_ref().and_then(|s| s.spare_week),
+            // Usage's switch for a model's own week, while a login has one.
+            "modelWeeks": self.app.upgrade().and_then(|a| {
+                let a = a.read(cx);
+                let titles = threadbear_core::usage::model_week_titles(&a.logins.accounts);
+                (!titles.is_empty()).then(|| json!({ "switch": threadbear_core::usage::model_weeks_switch(&titles), "on": a.usage.show_model_weeks }))
+            }),
             "labReview": settings.as_ref().map(|s| s.lab_review),
             "labReviewers": settings.as_ref().and_then(|s| s.lab_reviewers.as_ref()).map(|l| l.iter().map(|r| r.provider.clone()).collect::<Vec<_>>()),
+            "labPanel": settings.as_ref().and_then(|s| s.lab_panel.as_ref()).map(|l| l.iter().map(|r| r.provider.clone()).collect::<Vec<_>>()),
             "privateFolders": settings.as_ref().map(|s| s.private_folders.clone()),
             "smallJobsPool": settings.as_ref().and_then(|s| s.pool.clone()),
             // General's Web runtime row, as it reads.
@@ -1172,7 +2294,11 @@ impl SettingsWindow {
 /// The automation's `settings` command's actions on the sections, as the
 /// Swift command takes them (runners.rs, devices.rs), or None for none of them.
 #[cfg(feature = "automation")]
-pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, cx: &mut App) -> Result<Option<Value>, String> {
+pub(crate) fn automation(
+    app: &Entity<Threadbear>,
+    cmd: &Value,
+    cx: &mut App,
+) -> Result<Option<Value>, String> {
     if let Some(done) = runners::automation(app, cmd, cx)? {
         return Ok(Some(done));
     }
@@ -1187,8 +2313,16 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, cx: &mut App) ->
 /// False when it's in view already, or Settings isn't open.
 #[cfg(feature = "automation")]
 pub(crate) fn scroll_into_view(app: &Entity<Threadbear>, bounds: Bounds<Pixels>, cx: &App) -> bool {
-    let Some((_, view)) = app.read(cx).settings_window.as_ref() else { return false };
-    let scroll = &view.read(cx).scroll;
+    let Some((_, view)) = app.read(cx).settings_window.as_ref() else {
+        return false;
+    };
+    scroll_to(&view.read(cx).scroll, bounds)
+}
+
+/// Scrolls `scroll`'s pane so `bounds`, drawn wholly or partly out of
+/// sight in it, comes into view. False when it's in view already.
+#[cfg(feature = "automation")]
+pub(crate) fn scroll_to(scroll: &ScrollHandle, bounds: Bounds<Pixels>) -> bool {
     let (pane, offset, most) = (scroll.bounds(), scroll.offset(), scroll.max_offset());
     let margin = gpui_kit::px(12.);
     let y = if bounds.bottom() > pane.bottom() {
@@ -1200,7 +2334,13 @@ pub(crate) fn scroll_into_view(app: &Entity<Threadbear>, bounds: Bounds<Pixels>,
     };
     // The offset runs from 0 (the top) down to minus the most it can scroll.
     let lowest = gpui_kit::px(0.) - most.y;
-    let y = if y < lowest { lowest } else if y > gpui_kit::px(0.) { gpui_kit::px(0.) } else { y };
+    let y = if y < lowest {
+        lowest
+    } else if y > gpui_kit::px(0.) {
+        gpui_kit::px(0.)
+    } else {
+        y
+    };
     scroll.set_offset(point(offset.x, y));
     true
 }

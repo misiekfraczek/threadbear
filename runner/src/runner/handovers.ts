@@ -1,4 +1,4 @@
-// Handovers: draining this runner after a new release takes over, and adopting threads from the old one (docs/protocol.md, "Handovers").
+// Handovers: draining this runner after a new release takes over, and adopting threads from the old one (docs/protocol/updates.md, "Handovers").
 // Part of the Runner (runner.ts), split out on 4 Nov 2026 as a plain move so a
 // fork's change to one area doesn't clash with another's. Each method's `this`
 // is the Runner; runner.ts puts them on its prototype.
@@ -11,6 +11,7 @@ import { ErrorCode, RpcError } from '../protocol.ts';
 import type { ThreadRecord } from '../store.ts';
 import type { Drain, ThreadState } from '../runner.ts';
 import { DRAIN_AGENT_MS, DRAIN_BACKGROUND_MS, DRAIN_CHECK_MS, DRAIN_MAX_OLD_MS, DRAIN_SETTLE_MS, newRuntime } from '../runner.ts';
+import { runningSession } from '../cli-session.ts';
 
 // Runner.openCards: events read from a log at once, kept small as each
 // chunk is read and parsed in one go on a runner still running turns, and
@@ -48,7 +49,7 @@ export const handoversPart = {
       // (readyToHandOver): the new runner would wake it. And one going back
       // to an earlier message: letting it go mid-edit saved the record from
       // before the cut, after the files had been put back (13 Nov 2026).
-      keep: new Set([...keep, ...[...this.threads.values()].filter((st) => st.rt.cleaning || st.rt.preparing || st.rt.hooksRunning || st.rt.editing || st.rec.wakeWhen?.pending).map((st) => st.rec.id)].filter((id) => this.threads.has(id))),
+      keep: new Set([...keep, ...[...this.threads.values()].filter((st) => st.rt.cleaning !== undefined || st.rt.preparing !== undefined || st.rt.hooksRunning || st.rt.editing || st.rec.wakeWhen?.pending).map((st) => st.rec.id)].filter((id) => this.threads.has(id))),
       going: new Set(),
       gone: new Set(),
       onHandedOver: opts.onHandedOver,
@@ -60,6 +61,9 @@ export const handoversPart = {
       ready: opts.ready ?? (() => true),
     };
     this.draining = d;
+    // New threads start on the new runner, so a CLI started ahead of one here
+    // would never be used.
+    this.dropSpare('handing over');
     // Accounts are the primary's to watch now.
     this.rescanTimer?.cancel();
     this.accountsTimer?.cancel();
@@ -181,7 +185,7 @@ export const handoversPart = {
     rt.idleTimer?.cancel();
     rt.idleTimer = undefined;
     this.flushDeltas(st);
-    if (rt.session && !rt.closing) {
+    if (runningSession(rt)) {
       this.rememberStoppedWork(st);
       this.releaseSession(st);
     }
@@ -202,7 +206,7 @@ export const handoversPart = {
     if (rt.deleted) return;
     rt.deltaTimer?.cancel();
     rt.wakeTimer?.cancel();
-    rt.generation++;
+    this.cli(st, { kind: 'drop', forget: false });
     this.store.saveIfChanged(rec);
     rt.deleted = true;
     this.dirty.delete(rec.id);
@@ -218,6 +222,11 @@ export const handoversPart = {
   adopt(this: Runner, threadId: string, opts: { crashed?: boolean } = {}): ThreadSummary | undefined {
     const had = this.threads.get(threadId);
     if (had) return this.summary(had);
+    // A box takes in no thread but its own (box-mode.ts).
+    if (this.boxThread !== undefined && threadId !== this.boxThread) {
+      this.log.warn("box: won't take in a thread that isn't its own", { threadId });
+      return undefined;
+    }
     // A thread handed over while this runner is still connecting to the old
     // one comes before start: which worktrees are held is worked out first,
     // from every thread on disk, and before this one's record, if it can't
@@ -253,6 +262,7 @@ export const handoversPart = {
     // recovery, not the handover (Runner.recoveryFailed).
     try {
       if (rec.asked === undefined && !rec.archivedAt) this.backfillAsked(rec);
+      if (rec.request === undefined && !rec.archivedAt) this.backfillRequest(rec);
       this.recoverReviews(st);
       // Handed over before its worktree cleanup finished (letGo's limit).
       void this.settleLostCleanups([st], false);
@@ -266,6 +276,9 @@ export const handoversPart = {
       else if (rec.queue.length && this.bucket(rec) === 'inbox') {
         this.kickQueue(st);
       }
+      // Finished there, and let go before the guess at whether Mike needed
+      // to see it was made (runner/inbox-guess.ts).
+      this.catchUpInboxGuess(st);
     } catch (e) {
       this.recoveryFailed(st, e);
     }

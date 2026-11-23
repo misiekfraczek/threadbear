@@ -6,11 +6,11 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
 import { findWorktreePatch } from '../../src/patches.ts';
-import { cleanUpWorktree, git, land, landTargetFromGit, makeWorktree, overwrittenFiles } from '../../src/worktrees.ts';
+import { cleanUpWorktree, land, landTargetFromGit, makeWorktree, overwrittenFiles } from '../../src/worktrees.ts';
 import { RpcServer } from '../../src/rpc.ts';
 import { readToken } from '../../src/config.ts';
 import { nullLogger } from '../../src/log.ts';
-import { PATCH, addBorrowScript, capture, commit, harness, holdUntil, isLocked, lines, makeBranch, makeRepo, notes, runTb, sh, startTb, threadWithWorktree, until, write } from '../helpers/worktrees-harness.ts';
+import { PATCH, addBorrowScript, capture, commit, harness, holdUntil, isLocked, makeBranch, makeRepo, notes, runTb, sh, startTb, threadWithWorktree, until, write } from '../helpers/worktrees-harness.ts';
 
 // --------------------------------------------------------------- landing
 
@@ -80,34 +80,36 @@ test('land refuses a branch changed by the check instead of merging an unchecked
   assert.equal(sh(main, 'git rev-parse main'), before);
 });
 
-test('land releases its lock when a CLI is killed during the check', async () => {
+// The landing runs in a process of its own (land-detach.ts): on 18 Nov an
+// agent's two-hour limit killed a holder a few minutes into a group check of
+// nine, and all nine were lost. Killing the tb that was run, and everything in
+// its process group, now leaves the check to finish and land, then the lock
+// goes.
+test('a CLI killed during its check still lands, and the lock goes once it has', async () => {
   const { root, main } = makeRepo(PATCH(`{ check: "touch ../checking; ${holdUntil('../release')}" }`));
   const t = makeBranch(main);
   commit(t.path, { 'first.txt': 'first\n' }, 'First');
   const env = { THREADBEAR_HOME: path.join(root, 'no-runner'), THREADBEAR_THREAD_ID: undefined };
   const first = startTb(['land'], t.path, env);
+  let next: Promise<number> | undefined;
   try {
     await until(() => fs.existsSync(path.join(t.path, '../checking')), 'CLI checking');
+    // As a tool's time limit does: a signal first, then the whole group.
+    first.child.kill('SIGTERM');
+    const { code, out } = await first.done;
+    assert.equal(code, 143, out);
+    assert.match(out, /stopped \(SIGTERM\) during its check, which carries on in a process of its own/);
+    try { process.kill(-first.child.pid!, 'SIGKILL'); } catch { /* gone */ }
+    // Waits for it, then has nothing left to land.
+    const c = capture();
+    next = land(t, c.opts);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(!fs.existsSync(path.join(main, 'first.txt')), 'not landed before its check passes');
   } finally {
-    first.child.kill('SIGKILL');
-    await first.done;
-  }
-  // Acquire while the orphan check is still alive, so a pipe inherited
-  // by that check cannot make a leaked lock look like a passing test.
-  const next = land(t, capture().opts);
-  // The limit covers the whole landing (lockf, node, a rebase and a dozen
-  // git calls), not just the lock. A leaked lock waits for ever, so a long
-  // limit still catches it; 10s failed a release build on a busy Mac (9 Nov).
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    assert.equal(await Promise.race([next, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Killed CLI kept its landing lock')), 90_000);
-    })]), 0);
-  } finally {
-    clearTimeout(timer);
     write(path.dirname(t.path), { release: '' });
-    await next;
   }
+  assert.equal(await next, 0);
+  assert.ok(fs.existsSync(path.join(main, 'first.txt')), 'landed by the check the killed tb started');
   assert.equal(sh(main, 'git rev-parse main'), sh(t.path, 'git rev-parse HEAD'));
 });
 
@@ -334,7 +336,7 @@ test('tb land outside a thread goes by git: the thread/ branch, main\'s checkout
   assert.equal(elsewhere.out, `${main} is on main, not a thread/ branch. tb land runs in a thread's own worktree.\n`);
   const wrongFlag = await runTb(['land', '--json'], t.path, env);
   assert.equal(wrongFlag.code, 2);
-  assert.match(wrongFlag.out, /tb land doesn't take --json\. It takes --dry-run, --despite-red\./);
+  assert.match(wrongFlag.out, /tb land doesn't take --json\. It takes --dry-run, --despite-red, --allow-format\./);
 });
 
 test('borrow-worktree.sh hands out a thread/ branch tb land takes, and --give-back deletes it and makes a spare', async () => {
@@ -387,6 +389,32 @@ test('a borrowed spare is never given to a new thread until it is given back', a
   const after = await makeWorktree({ cwd: main, threadId: 'cccccccc-1', patch });
   assert.ok(after.ok);
   assert.equal(after.worktree.path, slot1, 'given back, it is a spare again');
+});
+
+// As on 17 Nov (slot-32): a group check in tb land rebases the branch again
+// before main moves, so main has the borrow's changes under new commit ids.
+test("--give-back takes a borrow landed under new ids, but not one with a commit main hasn't got", async () => {
+  const { main } = makeRepo();
+  addBorrowScript(main);
+  const wt = sh(main, './borrow-worktree.sh 2>/dev/null');
+  const branch = sh(wt, 'git rev-parse --abbrev-ref HEAD');
+  commit(wt, { 'runner/b.ts': '1\n' }, 'Add b');
+  commit(wt, { 'runner/c.ts': '1\n' }, 'Add c');
+  // Another landing went first, then the borrow's commits were replayed on it.
+  commit(main, { 'runner/other.ts': '1\n' }, 'Other landing');
+  sh(main, `git cherry-pick ${branch}~1 ${branch}`);
+  assert.equal(sh(wt, 'git cherry main HEAD'), sh(wt, 'git rev-list --reverse main..HEAD').split('\n').map((c) => `- ${c}`).join('\n'));
+
+  // One more commit that never landed: refused, and the branch is kept.
+  commit(wt, { 'runner/d.ts': '1\n' }, 'Add d');
+  assert.throws(() => sh(main, `./borrow-worktree.sh --give-back ${wt}`), /has commits that aren't on main/);
+  assert.equal(sh(wt, 'git rev-parse --abbrev-ref HEAD'), branch);
+  assert.ok(!isLocked(main, wt));
+
+  sh(wt, 'git reset -q --hard HEAD~1');
+  assert.match(sh(main, `./borrow-worktree.sh --give-back ${wt}`), /is a spare again/);
+  assert.equal(sh(main, `git branch --list '${branch}'`), '');
+  assert.ok(isLocked(main, wt));
 });
 
 test('a thread brought back never carries on in a borrowed worktree made where its own was', async () => {

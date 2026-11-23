@@ -162,6 +162,29 @@ import Testing
         #expect(AskAnswer.followUpMessage(["Check the nightly", "Refresh the cache"], extra: " quick \n") == "- Check the nightly\n- Refresh the cache\n\nquick")
     }
 
+    /// A message that answered asks is drawn as the Mac draws it (Mike, 18
+    /// Nov): the answers it starts with, then what he wrote; text that
+    /// doesn't start with them shows as it is.
+    @Test func answeredMessagesSplitIntoAnswersAndHisWords() throws {
+        let asks = [
+            PhoneAsk(action: "Merge it?", why: "Tests pass.", options: ["Merge", "Not yet"]),
+            PhoneAsk(action: "Add the key", why: "In Settings.", reply: "done"),
+        ]
+        let one = [AskAnswer(action: "Merge it?", answer: "Not yet")]
+        #expect(AskAnswer.extra(text: AskAnswer.message(asks: [asks[0]], picks: [0: 1]), answers: one) == "")
+        #expect(AskAnswer.extra(text: AskAnswer.message(asks: [asks[0]], picks: [0: 1], extra: "after lunch"), answers: one) == "after lunch")
+        let both = AskAnswer.answers(asks: asks, picks: [0: 0, 1: 0]).map(\.answer)
+        #expect(AskAnswer.extra(text: AskAnswer.message(asks: asks, picks: [0: 0, 1: 0], extra: "ta"), answers: both) == "ta")
+        #expect(AskAnswer.extra(text: "Merge it? Not yet", answers: one) == nil)
+        #expect(AskAnswer.extra(text: "Merge it?\nNot yet please", answers: one) == nil)
+        #expect(AskAnswer.extra(text: "anything", answers: []) == nil)
+        let row = #"{"seq":4.0,"role":"user","text":"Merge it?\nNot yet","answers":[{"action":"Merge it?","answer":"Not yet"}],"at":"2026-10-30T00:00:00.000Z"}"#
+        let message = try JSONDecoder().decode(PhoneMessage.self, from: Data(row.utf8))
+        #expect(message.answers == one)
+        let again = try JSONDecoder().decode(PhoneMessage.self, from: JSONEncoder().encode(message))
+        #expect(again.answers == one)
+    }
+
     @Test func threadRowsAndMessagesDecodeTheCard() throws {
         let row = #"""
         {"threadId":"t","runnerId":"r","title":"T","cwd":"/w","accountId":"a","provider":"claude","status":"idle","needsYou":true,"unread":true,"preview":"p","lastActivityAt":"2026-10-30T00:00:00.000Z","view":"inbox",
@@ -249,5 +272,61 @@ import Testing
         let json = #"{"messages":[{"seq":1,"role":"user","text":"Fix it","at":1762650000000},{"seq":2,"role":"note","text":"Moved to a: b hit its 5-hour limit.","at":1762650001000}],"hasMore":false}"#
         let page = try JSONDecoder().decode(MessagePage.self, from: Data(json.utf8))
         #expect(page.messages.map(\.role) == [.user, .note])
+    }
+}
+
+/// The cases Android and the website run too (shared/cases/turns.json):
+/// rows in, what's shown out, a folded turn as its title then its items.
+@Suite struct SharedTurnCasesTests {
+    struct Cases: Decodable {
+        struct Row: Decodable {
+            var seq: Int
+            var role: PhoneMessage.Role
+            var text: String
+            var at: Double
+            var origin: String?
+            var summary: Bool?
+            var plan: Bool?
+            var turn: String?
+            var wokeBy: [WokeTask]?
+        }
+        struct Input: Decodable {
+            var busy: Bool
+            var messages: [Row]
+        }
+        struct Case: Decodable {
+            var name: String
+            var input: Input
+            var expect: [String]
+            var differs: [String: String]?
+        }
+        var cases: [Case]
+    }
+
+    func shown(_ item: ThreadItem) -> String {
+        switch item {
+        case let .message(m): "m\(m.seq)"
+        case let .note(m): "note \(m.seq)"
+        case let .tools(items): "tools " + items.map { String($0.seq) }.joined(separator: " ")
+        case let .gap(g): "gap " + g.label
+        case let .worked(w): w.title + ": " + w.items.map(shown).joined(separator: ", ")
+        }
+    }
+
+    @Test func foldingFollowsTheSharedCases() throws {
+        // ios/ThreadbearKit/Tests/ThreadbearKitTests/ -> the repo.
+        let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let url = repo.appendingPathComponent("shared/cases/turns.json")
+        let cases = try JSONDecoder().decode(Cases.self, from: Data(contentsOf: url)).cases
+        #expect(cases.count >= 20)
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        for c in cases where c.differs?["ios"] == nil {
+            let rows = c.input.messages.map { r in
+                PhoneMessage(seq: r.seq, role: r.role, text: r.text, origin: r.origin, toolKind: r.role == .tool ? "command" : nil,
+                             summary: r.summary ?? false, plan: r.plan ?? false, turn: r.turn, wokeBy: r.wokeBy, at: t0.addingTimeInterval(r.at))
+            }
+            #expect(Turns.fold(rows, busy: c.input.busy).map(shown) == c.expect, "\(c.name)")
+        }
     }
 }

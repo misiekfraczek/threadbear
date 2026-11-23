@@ -174,8 +174,8 @@ of date.
 ## Restarts
 
 `runner.restart` (`tb restart`, and the deploy script's restart step)
-restarts the runner without cutting a turn short; `docs/protocol.md` has
-the details.
+restarts the runner without cutting a turn short; `docs/protocol/updates.md`
+has the details.
 
 - It waits until no thread is starting, running or waiting on an approval
   or a question, and no CLI is running background shells or subagents
@@ -211,6 +211,44 @@ the details.
   restart and send them when they come back, even when the snooze ended
   while the runner was down.
 
+After an uncaught exception or unhandled rejection the runner logs it
+(and reports it to Sentry where Sentry is on), then restarts the same way
+(`src/error-exits.ts`; Mike, 21 Nov 2026: after one the process may be
+half way through something). It asks `runner.restart` for an idle restart
+with the reason "An unexpected error (see the runner log)": with no thread
+busy it stops and exits 0, and with busy threads it hands over, so they
+finish their turns on this process while the new one takes the rest,
+exactly as after a deploy. Under the same release, as nothing changed.
+
+- Only a runner `launch.mjs` supervises restarts (every installed runner on
+  releases: launchd on a Mac, systemd on Linux, the Scheduled Task on
+  Windows), as only there something starts it again. A dev runner
+  (`THREADBEAR_DEV_RUNNER=1`, which `dev-runner.sh` sets) stops with exit
+  code 70 and `dev-runner.sh` doesn't start it again. Anything else (tests,
+  `npm start` by hand, a `--from-source` install) logs and carries on, as
+  before.
+- A loop guard: after 3 such restarts in 10 minutes (`run/error-exits.json`,
+  per release, so a fixed release starts clean) the next error is only
+  logged, a `runner.notice` warning goes to every client (and again after
+  each hello while it holds), and the log says "stopped restarting for
+  uncaught errors". An hour without an uncaught error clears it. If the
+  count can't be saved it carries on rather than restart uncounted.
+- It exits 0, as a planned restart, so `launch.mjs` starts it again in half
+  a second; a failing code would leave that to launchd, systemd or the
+  Scheduled Task (a minute on Windows), and lose the resumes a crash
+  rollback replays. So `launch.mjs` doesn't count these restarts, and the
+  guard stands in for its crash count: a release that hits an error in its
+  first minute every time restarts three times and then carries on, rather
+  than going back to the last good release.
+- Deadlines and second errors: the restart has 5 minutes to begin (a stop,
+  or a handover's new runner starting) before the runner stops instead, and
+  once the stop begins it has 30 s before the process exits anyway. A
+  second error while it's already restarting (this error's restart or a
+  deploy's), handing over or finishing kept turns is only logged: the new
+  runner already serves the rest, and stopping would cut those turns and
+  drop their queued messages. One while stopping arms the deadline. The
+  drain itself is a deploy's, with a deploy's limits.
+
 ## A dev runner
 
 `scripts/dev-runner.sh [--home DIR] [--port N] [--keep]` runs the working
@@ -220,7 +258,7 @@ and prints what to point `tb` and the app at:
 ```
   pid:  41234
 For tb:      /tmp/threadbear-dev.Ab12Cd/tb status
-For the app: ~/dev/me/threadbear/app/Tools/dev-app.sh start --home /tmp/threadbear-dev.Ab12Cd
+For the app: ~/dev/me/threadbear/desktop/scripts/dev-app.sh start --home /tmp/threadbear-dev.Ab12Cd
 Stop it:     kill 41234   (never pkill: the real runner runs src/main.ts too)
 ```
 
@@ -234,7 +272,8 @@ failed. Like launchd, the script starts the runner
 again when it exits 0 (`tb restart`), and stops when it exits with an
 error. It uses your real logins, so threads in it cost like any other. On a
 new data dir it writes a `runner.json` whose threads default to the folder
-`<home>/work`, account `claude-main` (or `TB_E2E_ACCOUNT`) and model `claude-haiku-5-5`, so a thread
+`<home>/work`, the first Claude login that isn't hidden, noted or plan-ended,
+else `claude-main` (`src/test-login.ts`; `TB_E2E_ACCOUNT` picks one), and model `claude-haiku-5-5`, so a thread
 a debug app's composer starts is a cheap one too (an account's own default
 can be Fable with a 1M context), and it prints a `tb new` line. Ctrl-C or the `kill` stops it and the CLIs it
 started. Run in the background from a thread, it is background work that
@@ -266,7 +305,7 @@ installed runner leaves it out; `scripts/dev-runner.sh` sets it.
 and restart onto main by itself (`docs/dev-tools.md`, "The runner updating
 itself"); `THREADBEAR_FOLLOW_MAIN=0` does the same for one run.
 `models` is for the runner's own small-model calls
-(`src/models/`, docs/protocol.md "Settings and models"): `pool`, the pool
+(`src/models/`, docs/protocol/settings.md "Settings and models"): `pool`, the pool
 whose Claude logins answer them through the CLI (default `"claude"`,
 `null` for none, which turns titles and the librarian off), and folders
 whose threads are never sent. The app's Settings window and `tb settings`
@@ -287,6 +326,8 @@ Environment variables, mainly for tests:
 | `THREADBEAR_DEBUG=1` | Log CLI stderr and other detail. |
 | `THREADBEAR_LOG_STDERR=1` | Also print the log to stderr. |
 | `THREADBEAR_NODE` | The Node binary the scripts use. The runner sets it in every thread to the Node it runs on. Unset, they take the `node` on PATH, else nvm's newest Node 24 or newer, else Homebrew's (`scripts/find-node.sh`). |
+| `THREADBEAR_DEV_RUNNER=1` | Set by `dev-runner.sh`: after an uncaught error the runner exits with 70 rather than restarting. Taken out of the environment at start, so CLIs don't inherit it. |
+| `THREADBEAR_TEST_THROW`, `THREADBEAR_TEST_THROW_MS` | Tests only: `exception` or `rejection` throws one that long after listening (default 500 ms). Ignored by a release and on the real data dir. |
 | `THREADBEAR_GOOD_AFTER_MS` | How long a release has to stay up before it is marked `lastGood` (default 60 s; the tests shorten it). |
 | `THREADBEAR_START_TIMEOUT_MS` | How long `launch.mjs` gives a release to start listening before stopping it (default 90 s). |
 | `THREADBEAR_LAUNCHCTL`, `THREADBEAR_LAUNCH_AGENTS_DIR` | Stand-ins for `launchctl` and `~/Library/LaunchAgents` in the install and deploy scripts (the deploy tests use both). |
@@ -309,6 +350,7 @@ What the runner gives the CLIs it starts is under Tools for agents below.
   run/runner.pid                the lock: pid and start time of the runner that
                                 owns this data dir
   run/resumes.json              when each thread was last resumed after a restart
+  run/error-exits.json          restarts after uncaught errors lately, for the loop guard
   trash/<threadId>-<time>/      deleted threads, kept until removed by hand
   threads/<threadId>/
     thread.json                 summary plus internal state, written atomically
@@ -361,7 +403,7 @@ bin/tb restart [--now [--force]] [--resume "text" | --no-resume] [--reason "text
 bin/tb restart --cancel         # withdraw a pending restart (--force: someone else's, from a terminal)
 bin/tb show <id> [--last N] [--tools]   # the thread as plain text, approvals with their ids
 bin/tb logs [-f] [-n 200] [--thread ID]
-bin/tb export <id> [--out DIR]  # a mock-runner fixture in app/.fixtures/threads/<id>
+bin/tb export <id> [--out DIR]  # a mock-runner fixture in .fixtures/threads/<id>
 bin/tb rpc <method> ['{"json": "params"}']
 ```
 
@@ -397,10 +439,10 @@ ignored), naming the ones it takes (never `--force`), and `tb <command> --help` 
 reads; with the runner down it reads `<home>/runner.log` for a dev runner or
 sandbox, and `--thread` includes the CLI's spawn and exit lines. `tb export`
 writes the thread as idle (a mid-turn export would otherwise look stuck)
-and prints the `app/Tools/dev-app.sh start --mock --fixtures` command for
+and prints the `desktop/scripts/dev-app.sh start --mock --fixtures` command for
 it (a debug app kept behind Mike's windows, with its own mock runner, which
 an agent can dump, screenshot and stop) and the `tb events` one; the mock no longer loads
-`app/.fixtures/threads/` by default, so exports never reach design
+`.fixtures/threads/` by default, so exports never reach design
 screenshots. A mistyped flag gets a message, not a stack trace. Messages
 print `tb` with its full path, and the one that was run: a dev runner's
 `<home>/tb`, or `THREADBEAR_HOME=<home>` in front when it was pointed away
@@ -423,7 +465,7 @@ name the same thread:
   thread.
 - **The environment.** `THREADBEAR_THREAD_ID`, `THREADBEAR_HOME`,
   `THREADBEAR_RUNNER_HOME` and `THREADBEAR_RUNNER_VERSION` (what each is
-  for is in `docs/protocol.md`), with the runner's own `bin/` at the front
+  for is in `docs/protocol/tools.md`), with the runner's own `bin/` at the front
   of `PATH`, so `tb self`, `tb restart` and the deploy script know which
   thread and runner they're in.
 
@@ -440,6 +482,8 @@ through the deploy script (Releases and deploys, above).
   else is read from it. Tokens stay in the Keychain. The CLI gets
   `CLAUDE_CONFIG_DIR` for `claude-N` logins and has it removed for
   `claude-main`.
+  runner.json `hiddenLogins` (e.g. `["claude-main"]`) leaves logins out
+  altogether: no Usage row, no sign-in warning, not offered for threads.
 - **One runner per data dir.** `run/runner.pid` is taken with an exclusive
   create before anything else happens. A second runner (say `npm start`
   while the LaunchAgent runs) exits with "Another runner (pid N) is already
@@ -457,7 +501,9 @@ through the deploy script (Releases and deploys, above).
   not released at the idle time; the countdown starts when the work ends.
   Snoozing, archiving or moving a thread with background work stops the CLI
   at once rather than waiting for it, and a system note lists what was
-  stopped.
+  stopped. A fresh CLI asked for at the end of a turn (another login or
+  folder, `/clear`) waits the same way for background shells and sub-agents
+  to finish; only snoozing, archiving or Mike's next message stops them.
 - **Live CLI cap.** Each live CLI is a `claude` process plus its own copy of
   the account's MCP servers, about 400 MB on these logins. When starting
   one would pass `maxLiveCLIs` (default 6), the one idle the longest is
@@ -568,6 +614,9 @@ through the deploy script (Releases and deploys, above).
 | `src/release.ts`, `src/restart.ts` | The release this runner is, `lastGood` and rollback notices; `runner.restart`, `runner.status` and the resume after a restart. |
 | `src/runner.ts` | The Runner: startup, threads, turns, the queue, the CLI's output, update and delete, events, summaries. |
 | `src/runner/*.ts` | The rest of the Runner's methods, one area a file (pools, worktrees, patches, approvals, reviews, handovers, hibernation and so on). Each is an object of methods whose `this` is the Runner; runner.ts merges their types into the class and puts them on its prototype. A new method for one of those areas goes in its file. |
+| `src/place.ts` | Where a thread is parked (inbox, snoozed, archived): the `Place` type, `movePlace`, and `parkRecord`, the only writer of those record fields (docs/lifecycles.md, "On the runner"). |
+| `src/cli-session.ts` | A thread's CLI (none, spare, starting, live, closing): the `Cli` type, `moveCli`, and `cliRuntime` (`Runner.cli`), the only writer of those Runtime fields, which drops what an older CLI says (docs/protocol/updates.md, "A thread's CLI"). |
+| `src/reply-phase.ts` | A turn's reply phase around `end_turn` (working, ended, replying, reopened, open): the `ReplyState` type, `moveReply`, and `replyTurn` (`Runner.reply`), the only writer of those Turn fields (docs/protocol/needs-you.md, "The reply phase"). |
 | `src/rpc.ts` | WebSocket JSON-RPC server, auth, subscriptions. |
 | `src/adapters/types.ts` | The adapter interface. Codex will be a second implementation. |
 | `src/adapters/claude/adapter.ts` | Claude Agent SDK session: options, input queue, `canUseTool`, interrupt, release. |
@@ -631,7 +680,8 @@ and on the thread it runs in).
 `docs/protocol.md` and is shared by both suites.
 
 The end-to-end suite starts the runner on a free port with a temp data dir
-and drives account `claude-main` (`TB_E2E_ACCOUNT`) on `claude-haiku-5-5` in a temp folder:
+and drives the same login a dev runner would (`TB_E2E_ACCOUNT`, else
+`src/test-login.ts`'s pick) on `claude-haiku-5-5` in a temp folder:
 streaming, a Read tool call, resume after idle release, interrupt, an
 ask-mode Write approval, AskUserQuestion, an image in and an image out, a
 folder change handoff, `tb`, archive, a background shell whose finish

@@ -31,6 +31,7 @@ struct InboxView: View {
     @State private var composing = false
     @State private var composeText = ""
     @State private var hibernateTarget: PhoneThread?
+    @State private var renameTarget: PhoneThread?
     @State private var query = ""
     @State private var olderArchived: [PhoneThread] = []
     @State private var pocketOpen = false
@@ -80,7 +81,8 @@ struct InboxView: View {
                     }
                     let sections = model.sections
                     if !query.trimmingCharacters(in: .whitespaces).isEmpty {
-                        results(ThreadSearch(query, sections: sections, hibernating: model.hibernating, archived: model.den, olderArchived: olderArchived))
+                        results(ThreadSearch(query, sections: sections, hibernating: model.searchable(model.hibernating), archived: model.searchable(model.den),
+                                            olderArchived: model.searchable(olderArchived)))
                     } else if !model.loaded.contains(.inbox) {
                         LoadingRows()
                     }
@@ -220,6 +222,7 @@ struct InboxView: View {
                     model.composeText = nil
                 }
                 .hibernateDialog(for: $hibernateTarget)
+                .renameDialog(for: $renameTarget)
                 // Its own pull to refresh rather than .refreshable, whose spinner
                 // holds back until the list's been pulled about 190 pt: the bear
                 // blinks at 80, as in the mockup Mike picked, and letting go there
@@ -468,7 +471,7 @@ struct InboxView: View {
         }
         .swipeActions(edge: .leading) {
             if asleep {
-                Button { Task { await perform(thread, .wake) } } label: { Label("Wake", systemImage: "sun.max") }
+                Button { perform(thread, .wake) } label: { Label("Wake", systemImage: "sun.max") }
                     .tint(.accentColor)
             } else {
                 Button { hibernateTarget = thread } label: { Label("Hibernate", systemImage: "moon.zzz") }
@@ -479,13 +482,14 @@ struct InboxView: View {
         .contextMenu {
             if model.canStar { starButton(thread) }
             if asleep {
-                Button { Task { await perform(thread, .wake) } } label: { Label("Wake", systemImage: "sun.max") }
+                Button { perform(thread, .wake) } label: { Label("Wake", systemImage: "sun.max") }
             } else {
                 Button { hibernateTarget = thread } label: { Label("Hibernate…", systemImage: "moon.zzz") }
             }
             Button { model.archive(thread.threadId) } label: { Label("Archive", systemImage: "archivebox") }
+            Button { renameTarget = thread } label: { Label("Rename…", systemImage: "pencil") }
             if thread.unread || thread.needsYou {
-                Button { Task { await perform(thread, .markSeen) } } label: { Label("Mark as read", systemImage: "envelope.open") }
+                Button { perform(thread, .markSeen) } label: { Label("Mark as read", systemImage: "envelope.open") }
             }
             Button { UIPasteboard.general.string = thread.threadId } label: { Label("Copy Thread ID", systemImage: "number") }
         }
@@ -493,14 +497,14 @@ struct InboxView: View {
 
     private func starButton(_ thread: PhoneThread) -> some View {
         let starred = thread.starredAt != nil
-        return Button { Task { await perform(thread, .star(!starred)) } } label: {
+        return Button { perform(thread, .star(!starred)) } label: {
             Label(starred ? "Remove Star" : "Star", systemImage: starred ? "star.slash" : "star")
         }
     }
 
-    private func perform(_ thread: PhoneThread, _ change: ThreadChange) async {
-        guard let backend = model.backend else { return }
-        do { _ = try await backend.update(threadId: thread.threadId, change: change) } catch { model.report(error) }
+    /// Shown at once (AppModel.shown), back with why if it's refused.
+    private func perform(_ thread: PhoneThread, _ change: ThreadChange) {
+        model.change(thread.threadId, change)
     }
 }
 
@@ -519,11 +523,8 @@ private struct BringBackSwipe: ViewModifier {
     func body(content: Content) -> some View {
         content.swipeActions(edge: .trailing) {
             Button {
-                Task {
-                    guard let backend = model.backend else { return }
-                    do { _ = try await backend.update(threadId: thread.threadId, change: view == .den ? .unarchive : .wake) }
-                    catch { model.report(error) }
-                }
+                // Gone from this list at once, back with why if it's refused.
+                model.change(thread.threadId, view == .den ? .unarchive : .wake)
             } label: {
                 Label(view == .den ? "Back to inbox" : "Wake", systemImage: view == .den ? "tray.and.arrow.up" : "sun.max")
             }
@@ -545,7 +546,7 @@ private struct StartingRow: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            ProjectTiles(projects: [])
+            ProjectTiles(projects: [], runnerId: "")
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.body)
@@ -611,7 +612,7 @@ struct ThreadRow: View {
     var body: some View {
         let kind = RowStatus.kind(thread)
         HStack(alignment: .center, spacing: 10) {
-            ProjectTiles(projects: thread.projects ?? [])
+            ProjectTiles(projects: thread.projects ?? [], runnerId: thread.runnerId)
                 .overlay(alignment: .leading) {
                     if model.landing.contains(thread.threadId) {
                         // On its way to a new heading: the mark pops in as it lands.
@@ -635,7 +636,7 @@ struct ThreadRow: View {
                     }
                 }
             VStack(alignment: .leading, spacing: 3) {
-                Text(thread.title.isEmpty ? "Untitled" : thread.title)
+                Text(model.title(of: thread))
                     .font(.body.weight(emphasised ? .semibold : .regular))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
@@ -900,6 +901,33 @@ private struct HibernateDialog: ViewModifier {
     private func change(_ thread: PhoneThread, _ change: ThreadChange) {
         model.hibernate(thread.threadId, change, leavingThread: leaving != nil)
         leaving?()
+    }
+}
+
+extension View {
+    /// Asks for a thread's new title, filled in with its current one.
+    func renameDialog(for target: Binding<PhoneThread?>) -> some View {
+        modifier(RenameDialog(target: target))
+    }
+}
+
+private struct RenameDialog: ViewModifier {
+    @Environment(AppModel.self) private var model
+    @Binding var target: PhoneThread?
+    @State private var text = ""
+
+    func body(content: Content) -> some View {
+        content
+            .alert("Rename thread", isPresented: Binding(get: { target != nil }, set: { if !$0 { target = nil } }), presenting: target) { thread in
+                TextField("Title", text: $text)
+                    .submitLabel(.done)
+                Button("Cancel", role: .cancel) {}
+                Button("Rename") { model.rename(thread.threadId, to: text) }
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .onChange(of: target?.threadId) {
+                if let thread = target { text = model.shown(thread).title }
+            }
     }
 }
 

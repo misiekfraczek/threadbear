@@ -16,6 +16,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpDir } from './fakes.ts';
+import { testSkippedOnWindows } from './platform.ts';
+
+// scripts/check-remote.sh copies a checkout to another machine with ssh and
+// rsync and names hosts with `hostname -s`: the check hosts are Macs and Linux.
+export const test = testSkippedOnWindows("check-remote.sh runs checks on another machine over ssh and rsync, and Windows' hostname has no -s");
 
 export const SCRIPT = path.join(import.meta.dirname, '..', '..', '..', 'scripts', 'check-remote.sh');
 
@@ -78,6 +83,18 @@ run_copy() {
       b="$d/home/.cache/threadbear-check"
       echo "log at $b/tmp-$id/threadbear-check.Ab12/step.log"
       echo "near $d/home/Xcache/threadbear-check/tmp-$id/threadbear-check.Ab12/step.log"
+    fi
+    # A host's "out-of-disk" file: its next that many checks fail, with the
+    # lowest the disk went during each (the sampler's file) under 1 GiB.
+    n="$(cat "$d/out-of-disk" 2>/dev/null || echo 0)"
+    if [ "$n" -gt 0 ]; then
+      echo $((n - 1)) >"$d/out-of-disk"
+      id="$(printf '%s' "$cmd" | grep -oE 'runs/[0-9]+-[0-9]+-[0-9]+/' | head -1 | cut -d/ -f2)"
+      mkdir -p "$d/home/.cache/threadbear-check/kept-$id"
+      printf '%015d' 104857 >"$d/home/.cache/threadbear-check/kept-$id/min-free-kb"
+      echo "FAIL  desktop app check       12s"
+      echo 'To run only what failed again: --only "desktop app check"'
+      exit 1
     fi
     # The check failing, and the disk as a host's "df-after" file has it then.
     if [ -n "$RUN_FAILS" ]; then
@@ -162,7 +179,7 @@ export const GiB = 1024 * 1024;
 
 // df: what the host's df prints (plenty free, if not given). dfAfter: what it
 // prints once a copy or a run has failed there. os: Linux, if not a Mac.
-type Host = { state: string; lose?: number; looksFree?: boolean; base?: string; df?: string; dfAfter?: string; os?: string; hang?: boolean; hangCopy?: boolean; drop?: boolean; dropDead?: boolean; stubborn?: boolean; queue?: number; loseAck?: boolean; freeAfter?: number; slow?: number };
+type Host = { state: string; lose?: number; looksFree?: boolean; base?: string; df?: string; dfAfter?: string; os?: string; hang?: boolean; hangCopy?: boolean; drop?: boolean; dropDead?: boolean; stubborn?: boolean; queue?: number; loseAck?: boolean; freeAfter?: number; slow?: number; outOfDisk?: number };
 export function setup(hosts: Record<string, Host>, opts: { home?: string } = {}) {
   const tmp = tmpDir('check-remote-');
   const home = opts.home ?? shortHome();
@@ -191,6 +208,7 @@ export function setup(hosts: Record<string, Host>, opts: { home?: string } = {})
     if (s.freeAfter !== undefined) fs.writeFileSync(path.join(fake, h, 'free-after'), String(s.freeAfter));
     if (s.loseAck) fs.writeFileSync(path.join(fake, h, 'lose-ack'), '');
     if (s.slow !== undefined) fs.writeFileSync(path.join(fake, h, 'slow'), String(s.slow));
+    if (s.outOfDisk !== undefined) fs.writeFileSync(path.join(fake, h, 'out-of-disk'), String(s.outOfDisk));
     if (s.hangCopy) fs.writeFileSync(path.join(fake, h, 'hang-copy'), '');
     if (s.dfAfter !== undefined) fs.writeFileSync(path.join(fake, h, 'df-after'), s.dfAfter);
     fs.writeFileSync(path.join(fake, h, 'df-out'), s.df ?? macDf(100 * GiB));
@@ -200,9 +218,10 @@ export function setup(hosts: Record<string, Host>, opts: { home?: string } = {})
   fs.copyFileSync(SCRIPT, path.join(repo, 'scripts', 'check-remote.sh'));
   // What it runs the check under on the host (hangup-guard.sh).
   for (const f of ['remote-guard-lib.sh', 'hangup-guard.sh']) fs.copyFileSync(path.join(path.dirname(SCRIPT), f), path.join(repo, 'scripts', f));
-  // What it reads to tell the Swift app's files from the GPUI app's in app/.
+  // What it reads to tell which changes run the Swift tests of the mock runner.
   fs.copyFileSync(path.join(path.dirname(SCRIPT), 'swift-freeze.sh'), path.join(repo, 'scripts', 'swift-freeze.sh'));
   fs.chmodSync(path.join(repo, 'scripts', 'swift-freeze.sh'), 0o755);
+  fs.copyFileSync(path.join(path.dirname(SCRIPT), 'fix-link-kinds.sh'), path.join(repo, 'scripts', 'fix-link-kinds.sh'));
   const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { stdio: 'ignore' });
   git('init', '-q', '-b', 'main');
   git('add', '-A');
@@ -214,12 +233,12 @@ export function setup(hosts: Record<string, Host>, opts: { home?: string } = {})
     tmpdir,
     // peek: a command run in the copy as its check starts, its output kept.
     // env: more for the script's environment (PRINT_LOG, RSYNC_PEEK).
-    run(hostList: string, staySecs: number, peek = '', env: Record<string, string> = {}) {
+    run(hostList: string, staySecs: number, peek = '', env: Record<string, string> = {}, flags: string[] = []) {
       const base: NodeJS.ProcessEnv = { ...process.env };
       delete base.XDG_CACHE_HOME;
       delete base.THREADBEAR_CHECK_PREFER;
       delete base.THREADBEAR_CHECK_GROUP;
-      const r = spawnSync('bash', [path.join(repo, 'scripts', 'check-remote.sh'), hostList, '--quick'], {
+      const r = spawnSync('bash', [path.join(repo, 'scripts', 'check-remote.sh'), hostList, '--quick', ...flags], {
         encoding: 'utf8',
         env: { ...base, HOME: home, TMPDIR: tmpdir, PATH: `${bin}:${process.env.PATH}`, FAKE: fake, PEEK: peek, THREADBEAR_CHECK_STAY_SECS: String(staySecs), ...env },
       });

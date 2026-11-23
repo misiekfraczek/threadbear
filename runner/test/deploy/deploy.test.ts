@@ -209,8 +209,12 @@ before(() => {
   agents = path.join(root, 'LaunchAgents');
   for (const d of ['scripts', 'src', 'bin']) fs.mkdirSync(path.join(rdir, d), { recursive: true });
   // The real scripts and launch.mjs, around a fake runner with no packages.
-  for (const f of ['deploy-runner.sh', 'find-node.sh', 'deploy.mjs', 'deploy-steps.mjs', 'rpc-client.mjs', 'install-runner.sh', 'deploy-backend.mjs']) {
-    fs.copyFileSync(path.join(RUNNER, 'scripts', f), path.join(rdir, 'scripts', f));
+  // Every script, not a list: deploy.mjs came to import windows-task.mjs (17
+  // Nov) and deploy-backend.mjs backend-stones.mjs (19 Nov), the list had
+  // neither, and every one of these failed, unseen as tb land runs --quick.
+  // Eight forks found it bringing in the 20 Nov release.
+  for (const f of fs.readdirSync(path.join(RUNNER, 'scripts'))) {
+    if (/\.(mjs|sh)$/.test(f)) fs.copyFileSync(path.join(RUNNER, 'scripts', f), path.join(rdir, 'scripts', f));
   }
   fs.copyFileSync(path.join(RUNNER, 'launch.mjs'), path.join(rdir, 'launch.mjs'));
   // The launcher app's sources, built by install-runner.sh into the sandbox.
@@ -274,7 +278,10 @@ test('install-runner.sh builds the first release and starts it through launch.mj
   // its child, so privacy prompts are attributed to the app.
   const launcherPid = Number(fs.readFileSync(path.join(launchd, 'child.pid'), 'utf8'));
   assert.equal(spawnSync('ps', ['-o', 'comm=', '-p', String(launcherPid)], { encoding: 'utf8' }).stdout.trim(), path.join(app, 'Contents', 'MacOS', 'Threadbear Runner'));
-  const supervisorPid = Number(spawnSync('pgrep', ['-P', String(launcherPid)], { encoding: 'utf8' }).stdout.trim());
+  // Its child by ps, not pgrep -P, which Homebrew's proctools takes as every
+  // process (scripts/hangup-guard.sh).
+  const kids = spawnSync('ps', ['-A', '-o', 'pid=', '-o', 'ppid='], { encoding: 'utf8' }).stdout.trim().split('\n').map((l) => l.trim().split(/\s+/).map(Number));
+  const supervisorPid = kids.find(([, ppid]) => ppid === launcherPid)?.[0] ?? NaN;
   assert.equal(spawnSync('ps', ['-o', 'command=', '-p', String(supervisorPid)], { encoding: 'utf8' }).stdout.trim(), `${NODE} ${path.join(home, 'runner', 'launch.mjs')}`);
   assert.equal(plist.WorkingDirectory, path.join(home, 'runner'));
   assert.equal(plist.EnvironmentVariables.THREADBEAR_HOME, home);
@@ -974,7 +981,7 @@ test('pruning keeps the release of a runner still finishing turns after a handov
   // The oldest release outside the newest 5: the next deploy would remove it.
   const doomed = releases().filter((id) => id !== state().lastGood && id !== died)[0];
   // A runner still finishing a turn on it, as a live process with the drain
-  // file a real one writes (docs/protocol.md, "Handovers").
+  // file a real one writes (docs/protocol/updates.md, "Handovers").
   const draining = spawn(NODE, ['-e', 'setTimeout(() => {}, 120_000)'], { stdio: 'ignore' });
   const drain = path.join(home, 'run', `drain-${draining.pid}.json`);
   fs.mkdirSync(path.dirname(drain), { recursive: true });
@@ -1069,7 +1076,7 @@ test('install-runner.sh pins a Homebrew Cellar Node as its opt/ link, which outl
     const newer = path.join(brew, 'Cellar', 'node', '27.0.0', 'bin');
     fs.mkdirSync(newer, { recursive: true });
     fs.symlinkSync(process.execPath, path.join(newer, 'node'));
-    fs.rmSync(path.join(brew, 'opt', 'node'));
+    fs.unlinkSync(path.join(brew, 'opt', 'node'));
     fs.symlinkSync(path.join('..', 'Cellar', 'node', '27.0.0'), path.join(brew, 'opt', 'node'));
     const other = sh('install-runner.sh', ['--home', home, '--label', LABEL, '--port', '0', '--path', '/usr/bin:/bin', '--print'], { THREADBEAR_NODE: path.join(cellarBin, 'node') });
     assert.equal(other.status, 0, out(other));

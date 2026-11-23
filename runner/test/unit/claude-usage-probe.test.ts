@@ -21,14 +21,14 @@ async function probe(limits: unknown) {
       close: () => { closed = true; },
     }) as never,
   });
-  const result = await adapter.usage(account);
+  const result = await adapter.readLimits(account);
   assert.ok(closed);
   return result;
 }
 
 test('an early Claude reset restores room even if Fable is exhausted', async () => {
   assert.deepEqual(await probe({ five_hour: meter(4), seven_day: meter(0), model_scoped: [{ display_name: 'Fable', ...meter(100) }] }), {
-    blocked: false, windows: [
+    kind: 'limits', blocked: false, windows: [
       { kind: 'five_hour', title: '5-hour', remainingPercent: 96, resetsAt: reset },
       { kind: 'weekly', title: 'Weekly', remainingPercent: 100, resetsAt: reset },
       { kind: 'weekly_model', title: 'Weekly Fable', remainingPercent: 0, resetsAt: reset },

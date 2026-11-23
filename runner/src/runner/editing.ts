@@ -6,7 +6,7 @@ import { COPIED_REFUSAL } from '../real-copy.ts';
 import { INSTRUCTIONS_REWOUND } from '../instructions.ts';
 import type { Runner } from '../runner.ts';
 import type { RunnerPart } from './part.ts';
-import type { Account, ImageRef, RewoundFiles } from '../protocol.ts';
+import type { ImageRef, RewoundFiles } from '../protocol.ts';
 import { ErrorCode, RpcError, sentByAgent } from '../protocol.ts';
 import type { RewindResult } from '../adapters/types.ts';
 import type { ThreadRecord } from '../store.ts';
@@ -19,7 +19,7 @@ import { providerName } from '../providers.ts';
 
 export const editingPart = {
   // Mike changes one of his earlier messages and carries on from there
-  // (docs/protocol.md, "Editing a message"): the turn stops, the native
+  // (docs/protocol/threads.md, "Editing a message"): the turn stops, the native
   // session is cut back to just before the message, the agent's file
   // changes since are put back, and the new text starts a turn.
   async editMessage(this: Runner, threadId: string, seq: number, text: string, images: ImageRef[] = [], opts: { stopBackground?: boolean } = {}): Promise<{ turnId: string; rewound: { seq: number; fromSeq: number; toSeq: number; files: RewoundFiles } }> {
@@ -34,6 +34,10 @@ export const editingPart = {
     if (!text && images.length === 0) throw new RpcError(ErrorCode.badParams, 'text or images required');
     checkImages(images);
     const target = this.editableMessage(st, seq);
+    // Held for a compaction (runner/cold-compact.ts), it isn't in the
+    // CLI's session yet, so there's nothing to go back to.
+    const held = rt.turn?.precompact;
+    if (held && rt.turn?.inputs?.get(held.msg.turnId) === seq) throw new RpcError(ErrorCode.busy, 'This message is waiting while the conversation compacts; edit it once that has finished.');
     const adapter = this.adapters[rec.provider];
     if (!adapter?.rewind) throw new RpcError(ErrorCode.badParams, `${providerName(rec.provider)} threads can't go back to an earlier message.`);
     const account = this.accounts.get(rec.accountId);

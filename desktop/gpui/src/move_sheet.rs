@@ -7,24 +7,28 @@
 use crate::a11y::A11yRole as _;
 use crate::app::Threadbear;
 use crate::call;
+use crate::spinner::Spinner;
 use crate::style::{self, size};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
-use crate::spinner::Spinner;
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Selectable, Sizable as _, StyledExt as _, WindowExt as _};
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Selectable, Sizable as _,
+    StyledExt as _, WindowExt as _,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use threadbear_core::inbox::ThreadSummary;
 // Shadows gpui's px, so sizes here follow the app's zoom (style.rs).
 use crate::style::px;
+use crate::tips::Tip as _;
 use serde_json::json;
 #[cfg(feature = "automation")]
 use serde_json::Value;
 use std::sync::Arc;
-use threadbear_client::runner::{Client, Status};
+use threadbear_client::runner::Client;
 use threadbear_core::remote::{MovePreview, RunnerInfo};
-use crate::tips::Tip as _;
 
 /// `AppModel.MoveRequest`: which thread, to which runner.
 #[derive(Clone)]
@@ -38,45 +42,88 @@ impl Threadbear {
     /// `moveTargets`: every runner but the one it's on, offline ones included
     /// so the menu can grey them.
     pub(crate) fn move_targets(&self, runner_id: Option<&str>) -> Vec<RunnerInfo> {
-        let self_id = self.remote.all_runners.iter().find(|r| r.is_self).map(|r| r.id.clone());
+        let self_id = self
+            .remote
+            .all_runners
+            .iter()
+            .find(|r| r.is_self)
+            .map(|r| r.id.clone());
         let here = runner_id.map(str::to_owned).or(self_id);
-        self.remote.all_runners.iter().filter(|r| Some(r.id.clone()) != here).cloned().collect()
+        self.remote
+            .all_runners
+            .iter()
+            .filter(|r| Some(r.id.clone()) != here)
+            .cloned()
+            .collect()
     }
 
     /// Move to ▸ a runner (`openMove`): it goes straight away when the target
     /// has a clean answer; the sheet is for a problem, or something that
     /// won't come. The row says "Moving to …" at once, and goes back if the
     /// sheet turns out to be needed or the runner turns the move down.
-    pub(crate) fn open_move(&mut self, request: MoveRequest, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_move(
+        &mut self,
+        request: MoveRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let before = self.threads.get(&request.thread_id).cloned();
-        if !matches!(self.status, Status::Connected { .. }) {
+        if !self.connected() {
             // The sheet opens too, and waits for a connection.
             self.show_move_sheet(request, None, window, cx);
             return;
         }
-        if let Some(t) = self.threads.get_mut(&request.thread_id).map(std::sync::Arc::make_mut) {
-            t.moving = Some(json!({ "moveId": "", "to": request.runner_id, "toName": request.runner_name, "state": "asking" }));
+        // Kept over any update of the row until the runner shows the move
+        // (starting_moves): the look below can take a quarter of a minute
+        // for another runner's thread, and the row used to drop it.
+        let (guess, token) =
+            self.starting_moves
+                .start(&request.thread_id, &request.runner_id, &request.runner_name);
+        if let Some(t) = self
+            .threads
+            .get_mut(&request.thread_id)
+            .map(std::sync::Arc::make_mut)
+        {
+            t.moving = Some(guess);
         }
         cx.notify();
         let client = self.client.clone();
         let params = json!({ "threadId": request.thread_id, "runnerId": request.runner_id });
-        let put_back = before.clone();
+        let put_back = before;
         let thread_id = request.thread_id.clone();
         cx.spawn_in(window, async move |this, cx| {
             let answer = call(client, "threads.movePreview", params).await;
             this.update_in(cx, |this, window, cx| {
+                // Cancelled while it looked: nothing more to do.
+                if this.starting_moves.take_cancelled(token) {
+                    return;
+                }
                 let preview = answer.as_ref().ok().map(MovePreview::decode);
-                if preview.as_ref().is_some_and(MovePreview::can_go_as_is) {
-                    this.start_move(request.clone(), None, None, cx);
+                if let Some(preview_id) = preview
+                    .as_ref()
+                    .filter(|p| p.can_go_as_is())
+                    .and_then(|p| p.preview_id.clone())
+                {
+                    this.send_move(
+                        request.clone(),
+                        None,
+                        None,
+                        Some(preview_id),
+                        token,
+                        put_back.clone(),
+                        cx,
+                    );
                 } else {
                     // The sheet comes up instead; the guess goes back until
                     // Move is pressed there.
-                    if let (Some(t), Some(before)) = (this.threads.get_mut(&thread_id).map(std::sync::Arc::make_mut), &put_back) {
-                        if t.moving.as_ref().is_some_and(|m| m["moveId"] == "") {
-                            t.moving = before.moving.clone();
-                        }
-                    }
-                    let shown = preview.or_else(|| answer.err().map(|e| MovePreview { problems: vec![e.message], ..Default::default() }));
+                    this.starting_moves.forget(&thread_id);
+                    this.put_move_back(&thread_id, put_back.as_ref());
+                    let shown = preview.or_else(|| {
+                        answer.err().map(|e| MovePreview {
+                            problems: vec![e.message],
+                            ..Default::default()
+                        })
+                    });
                     this.show_move_sheet(request.clone(), shown, window, cx);
                 }
             })
@@ -85,16 +132,77 @@ impl Threadbear {
         .detach();
     }
 
+    /// The row's move back to what the runner last said, never to the
+    /// app's own guess.
+    fn put_move_back(&mut self, thread_id: &str, before: Option<&std::sync::Arc<ThreadSummary>>) {
+        if let Some(t) = self
+            .threads
+            .get_mut(thread_id)
+            .map(std::sync::Arc::make_mut)
+        {
+            if t.moving
+                .as_ref()
+                .is_some_and(threadbear_core::starting_moves::is_guess)
+            {
+                t.moving = before
+                    .and_then(|b| b.moving.clone())
+                    .filter(|m| !threadbear_core::starting_moves::is_guess(m));
+            }
+        }
+    }
+
     /// `threads.move`, as Move in the sheet does; the row says it's going
-    /// at once and goes back if the runner turns it down.
-    pub(crate) fn start_move(&mut self, request: MoveRequest, cwd: Option<String>, account: Option<String>, cx: &mut Context<Self>) {
+    /// at once and goes back if the runner turns it down. `preview_id` is
+    /// the look Mike was shown (or the clean one that went by itself): the
+    /// move does what it showed or nothing (Daybreak 142).
+    pub(crate) fn start_move(
+        &mut self,
+        request: MoveRequest,
+        cwd: Option<String>,
+        account: Option<String>,
+        preview_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let before = self.threads.get(&request.thread_id).cloned();
-        if let Some(t) = self.threads.get_mut(&request.thread_id).map(std::sync::Arc::make_mut) {
-            if t.moving.is_none() {
-                t.moving = Some(json!({ "moveId": "", "to": request.runner_id, "toName": request.runner_name, "state": "asking" }));
+        let (guess, token) =
+            self.starting_moves
+                .start(&request.thread_id, &request.runner_id, &request.runner_name);
+        // A move already showing (its runner's own) stays; otherwise the
+        // guess, kept until the runner shows it (starting_moves).
+        if let Some(t) = self
+            .threads
+            .get_mut(&request.thread_id)
+            .map(std::sync::Arc::make_mut)
+        {
+            if t.moving_line().is_none()
+                || t.moving
+                    .as_ref()
+                    .is_some_and(threadbear_core::starting_moves::is_guess)
+            {
+                t.moving = Some(guess);
             }
         }
         cx.notify();
+        self.send_move(request, cwd, account, preview_id, token, before, cx);
+    }
+
+    /// `threads.move` for the pick `token`. Its answer starts the short wait
+    /// for the runner to show the move (starting_moves), and a pick Mike
+    /// cancelled meanwhile is cancelled on the runner as soon as it has one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "baselined when the lint was turned on (20 Nov 2026); take it off when this is next split up"
+    )]
+    fn send_move(
+        &mut self,
+        request: MoveRequest,
+        cwd: Option<String>,
+        account: Option<String>,
+        preview_id: Option<String>,
+        token: u64,
+        before: Option<std::sync::Arc<ThreadSummary>>,
+        cx: &mut Context<Self>,
+    ) {
         let client = self.client.clone();
         let mut params = json!({ "threadId": request.thread_id, "runnerId": request.runner_id });
         if let Some(cwd) = cwd {
@@ -103,19 +211,87 @@ impl Threadbear {
         if let Some(account) = account {
             params["accountId"] = json!(account);
         }
-        let thread_id = request.thread_id.clone();
+        if let Some(preview_id) = preview_id {
+            params["previewId"] = json!(preview_id);
+        }
+        let thread_id = request.thread_id;
         cx.spawn(async move |this, cx| {
             let res = call(client, "threads.move", params).await;
-            this.update(cx, |this, cx| {
-                if let Err(e) = res {
-                    this.show_error(e.message, cx);
-                    if let (Some(t), Some(before)) = (this.threads.get_mut(&thread_id).map(std::sync::Arc::make_mut), &before) {
-                        if t.moving.as_ref().is_some_and(|m| m["moveId"] == "") {
-                            t.moving = before.moving.clone();
+            let started = this
+                .update(cx, |this, cx| {
+                    let cancelled = this.starting_moves.take_cancelled(token);
+                    match res {
+                        Ok(v) if cancelled => {
+                            // Cancel Move came before the runner had a move
+                            // to cancel: it has one now. Named, so a newer
+                            // move started since is left alone.
+                            let move_id =
+                                v.get("moveId").and_then(|m| m.as_str()).map(str::to_owned);
+                            if move_id.is_some() {
+                                this.cancel_on_runner(thread_id.clone(), move_id, cx);
+                            }
+                            false
+                        }
+                        Ok(v) => {
+                            let before_row = this.threads.get(&thread_id).cloned();
+                            match this.starting_moves.started(
+                                &thread_id,
+                                token,
+                                v.get("moveId").and_then(|m| m.as_str()),
+                                crate::now_ms(),
+                            ) {
+                                // It had already failed or been cancelled.
+                                Some(ended) => {
+                                    if let Some(t) = this
+                                        .threads
+                                        .get_mut(&thread_id)
+                                        .map(std::sync::Arc::make_mut)
+                                    {
+                                        t.moving = Some(ended);
+                                    }
+                                    if let Some(now) = this.threads.get(&thread_id).cloned() {
+                                        this.note_failed_move(before_row.as_deref(), &now, cx);
+                                    }
+                                    cx.notify();
+                                    false
+                                }
+                                // Still the guess's to show (not yet taken
+                                // over by the runner): its wait starts.
+                                None => this.starting_moves.is_current(&thread_id, token),
+                            }
+                        }
+                        Err(e) => {
+                            if !cancelled {
+                                this.show_error(e.message, cx);
+                            }
+                            if this.starting_moves.is_current(&thread_id, token) {
+                                this.starting_moves.forget(&thread_id);
+                                this.put_move_back(&thread_id, before.as_ref());
+                                cx.notify();
+                            }
+                            false
                         }
                     }
+                })
+                .unwrap_or(false);
+            if !started {
+                return;
+            }
+            // The guess goes by itself if the runner never shows the move,
+            // rather than only when the row next comes in (Codex's review).
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(
+                    threadbear_core::starting_moves::SHOWN_AFTER_START_MS as u64 + 250,
+                ))
+                .await;
+            this.update(cx, |this, cx| {
+                if this
+                    .starting_moves
+                    .expire(&thread_id, token, crate::now_ms())
+                {
+                    this.put_move_back(&thread_id, None);
+                    cx.notify();
                 }
-                cx.notify();
             })
             .ok();
         })
@@ -126,16 +302,45 @@ impl Threadbear {
     /// The banner says so until the runner answers, as the click came from
     /// a menu, and a second Cancel meanwhile does nothing (`whileBusy(note:)`).
     pub(crate) fn cancel_move(&mut self, thread_id: String, cx: &mut Context<Self>) {
+        // Still being worked out (the look, or threads.move on its way): the
+        // runner has no move to cancel yet, so the app drops the pick, and
+        // send_move cancels it on the runner if one starts after all.
+        if self.starting_moves.cancel_pending(&thread_id) {
+            self.put_move_back(&thread_id, None);
+            cx.notify();
+            return;
+        }
+        // Started: the runner speaks for it from here.
+        self.starting_moves.forget(&thread_id);
+        self.cancel_on_runner(thread_id, None, cx);
+    }
+
+    /// `threads.moveCancel`, with "Cancelling the move…" in the banner until
+    /// it answers.
+    /// `move_id`: only that move (one cancelled before its answer came).
+    fn cancel_on_runner(
+        &mut self,
+        thread_id: String,
+        move_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let key = format!("moveThread/{thread_id}");
         if !self.begin_note(&key, "Cancelling the move…", cx) {
             return;
         }
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let res = call(client, "threads.moveCancel", json!({ "threadId": thread_id })).await;
+            let named = move_id.is_some();
+            let mut params = json!({ "threadId": thread_id });
+            if let Some(move_id) = move_id {
+                params["moveId"] = json!(move_id);
+            }
+            let res = call(client, "threads.moveCancel", params).await;
             this.update(cx, |this, cx| {
                 this.end_note(&key, cx);
-                if let Err(e) = res {
+                // A named move refused is one already over (it failed, or
+                // ended, before the late cancel came): nothing to say.
+                if let (Err(e), false) = (res, named) {
                     this.show_error(e.message, cx);
                 }
                 cx.notify();
@@ -146,16 +351,29 @@ impl Threadbear {
     }
 
     /// The sheet, filled from what the runner answered (nil: it asks itself).
-    fn show_move_sheet(&mut self, request: MoveRequest, answer: Option<MovePreview>, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self.threads.get(&request.thread_id).map_or_else(String::new, |t| t.title.clone());
-        let busy = self.threads.get(&request.thread_id).is_some_and(|t| t.busy());
+    fn show_move_sheet(
+        &mut self,
+        request: MoveRequest,
+        answer: Option<MovePreview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = self
+            .threads
+            .get(&request.thread_id)
+            .map_or_else(String::new, |t| t.title.clone());
+        let busy = self
+            .threads
+            .get(&request.thread_id)
+            .is_some_and(|t| t.busy());
         let app = cx.entity().downgrade();
         let app_for_close = app.clone();
         // Handed the client: the sheet asks the runner as it's made, inside
         // this update, and reading it back from the app then is a double
         // lease (Move to while the runner was away crashed the app).
         let client = self.client.clone();
-        let view = cx.new(|cx| MoveSheet::new(app, client, request, title, busy, answer, window, cx));
+        let view =
+            cx.new(|cx| MoveSheet::new(app, client, request, title, busy, answer, window, cx));
         self.move_sheet = Some(view.clone());
         cx.notify();
         window.open_dialog(cx, move |dialog, _, _| {
@@ -195,19 +413,52 @@ pub(crate) struct MoveSheet {
     filled: bool,
     /// The newest check; an answer to an older one is ignored.
     asks: u64,
+    /// The folder and login `preview` was asked with, so Move passes its
+    /// `previewId` only for those same picks.
+    previewed_with: (Option<String>, Option<String>),
     _subs: Vec<Subscription>,
 }
 
 impl MoveSheet {
-    #[allow(clippy::too_many_arguments)]
-    fn new(app: WeakEntity<Threadbear>, client: Arc<Client>, request: MoveRequest, title: String, busy: bool, answer: Option<MovePreview>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let folder = cx.new(|cx| InputState::new(window, cx).placeholder(format!("Folder on {}", request.runner_name)));
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "baselined when the lint was turned on (20 Nov 2026); take it off when this is next split up"
+    )]
+    fn new(
+        app: WeakEntity<Threadbear>,
+        client: Arc<Client>,
+        request: MoveRequest,
+        title: String,
+        busy: bool,
+        answer: Option<MovePreview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let folder = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(format!("Folder on {}", request.runner_name))
+        });
         let sub = cx.subscribe_in(&folder, window, |this, _, ev: &InputEvent, window, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) {
                 this.ask(window, cx);
             }
         });
-        let mut sheet = MoveSheet { app, client, request, title, busy, preview: None, asking: false, folder, login: String::new(), guessed_folder: String::new(), guessed_login: String::new(), filled: false, asks: 0, _subs: vec![sub] };
+        let mut sheet = MoveSheet {
+            app,
+            client,
+            request,
+            title,
+            busy,
+            preview: None,
+            asking: false,
+            folder,
+            login: String::new(),
+            guessed_folder: String::new(),
+            guessed_login: String::new(),
+            filled: false,
+            asks: 0,
+            previewed_with: (None, None),
+            _subs: vec![sub],
+        };
         match answer {
             // Opened with the runner's answer in hand (`request.answer`).
             Some(known) => sheet.apply(known, None, None, window, cx),
@@ -217,7 +468,7 @@ impl MoveSheet {
     }
 
     fn connected(&self, cx: &App) -> bool {
-        self.app.upgrade().is_some_and(|a| matches!(a.read(cx).status, Status::Connected { .. }))
+        self.app.upgrade().is_some_and(|a| a.read(cx).connected())
     }
 
     /// Asks again for what the fields say, leaving out whatever is still the
@@ -226,8 +477,12 @@ impl MoveSheet {
         self.asks += 1;
         let ask = self.asks;
         let folder = self.folder.read(cx).value().to_string();
-        let (cwd, account) = ((folder != self.guessed_folder).then_some(folder), (self.login != self.guessed_login).then(|| self.login.clone()));
-        let mut params = json!({ "threadId": self.request.thread_id, "runnerId": self.request.runner_id });
+        let (cwd, account) = (
+            (folder != self.guessed_folder).then_some(folder),
+            (self.login != self.guessed_login).then(|| self.login.clone()),
+        );
+        let mut params =
+            json!({ "threadId": self.request.thread_id, "runnerId": self.request.runner_id });
         if let Some(cwd) = &cwd {
             params["cwd"] = json!(cwd);
         }
@@ -247,7 +502,12 @@ impl MoveSheet {
                 match answer {
                     Ok(value) => this.apply(MovePreview::decode(&value), cwd, account, window, cx),
                     // Not an answer about the move: said here until asked again.
-                    Err(e) => this.preview = Some(MovePreview { problems: vec![e.message], ..Default::default() }),
+                    Err(e) => {
+                        this.preview = Some(MovePreview {
+                            problems: vec![e.message],
+                            ..Default::default()
+                        })
+                    }
                 }
                 cx.notify();
             })
@@ -258,12 +518,20 @@ impl MoveSheet {
 
     /// A field still on the guess follows it; one Mike has changed since
     /// asking is left alone.
-    fn apply(&mut self, answer: MovePreview, cwd: Option<String>, account: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply(
+        &mut self,
+        answer: MovePreview,
+        cwd: Option<String>,
+        account: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if cwd.is_none() {
             if let Some(guess) = answer.cwd.clone() {
                 let current = self.folder.read(cx).value().to_string();
                 if current == self.guessed_folder {
-                    self.folder.update(cx, |f, cx| f.set_value(guess.clone(), window, cx));
+                    self.folder
+                        .update(cx, |f, cx| f.set_value(guess.clone(), window, cx));
                 }
                 self.guessed_folder = guess;
             }
@@ -276,6 +544,7 @@ impl MoveSheet {
                 self.guessed_login = guess;
             }
         }
+        self.previewed_with = (cwd, account);
         self.preview = Some(answer);
         self.filled = true;
         cx.notify();
@@ -283,7 +552,11 @@ impl MoveSheet {
 
     fn can_move(&self, cx: &App) -> bool {
         let folder = self.folder.read(cx).value();
-        !self.asking && self.connected(cx) && !self.login.is_empty() && !folder.is_empty() && self.preview.as_ref().is_some_and(|p| p.problems.is_empty())
+        !self.asking
+            && self.connected(cx)
+            && !self.login.is_empty()
+            && !folder.is_empty()
+            && self.preview.as_ref().is_some_and(|p| p.problems.is_empty())
     }
 
     fn set_login(&mut self, login: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -312,10 +585,24 @@ impl MoveSheet {
             return;
         }
         let folder = self.folder.read(cx).value().to_string();
-        let (cwd, account) = ((folder != self.guessed_folder).then_some(folder), (self.login != self.guessed_login).then(|| self.login.clone()));
+        let (cwd, account) = (
+            (folder != self.guessed_folder).then_some(folder),
+            (self.login != self.guessed_login).then(|| self.login.clone()),
+        );
+        // Move starts only the look the sheet shows, which the runner binds
+        // the move to. A folder typed since (without Return) is looked at
+        // first, and shown, rather than moving without a look the sheet
+        // never showed (security review, 17 Nov 2026).
+        if self.previewed_with != (cwd.clone(), account.clone()) {
+            self.ask(window, cx);
+            return;
+        }
         let request = self.request.clone();
+        let preview_id = self.preview.as_ref().and_then(|p| p.preview_id.clone());
         if let Some(app) = self.app.upgrade() {
-            app.update(cx, |app, cx| app.start_move(request, cwd, account, cx));
+            app.update(cx, |app, cx| {
+                app.start_move(request, cwd, account, preview_id, cx)
+            });
         }
         self.close(window, cx);
     }
@@ -325,7 +612,11 @@ impl MoveSheet {
     pub(crate) fn dump(&self, cx: &App) -> Value {
         let preview = self.preview.clone().unwrap_or_default();
         let subtitle = self.subtitle();
-        let header = format!("Move \u{201C}{}\u{201D} to {}", self.display_title(), self.request.runner_name);
+        let header = format!(
+            "Move \u{201C}{}\u{201D} to {}",
+            self.display_title(),
+            self.request.runner_name
+        );
         json!({
             "title": header,
             "subtitle": subtitle,
@@ -334,6 +625,7 @@ impl MoveSheet {
             "problems": preview.problems,
             "leftBehind": preview.left_behind,
             "clone": preview.clone,
+            "cloneFrom": preview.clone_from,
             "asking": self.asking,
             "canMove": self.can_move(cx),
         })
@@ -357,28 +649,42 @@ impl MoveSheet {
 
     /// The Login picker: the runner's logins, the chosen one ticked.
     fn render_login_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let accounts = self.preview.as_ref().map(|p| p.accounts.clone()).unwrap_or_default();
-        let current = accounts.iter().find(|a| a.id == self.login).map_or_else(|| self.login.clone(), |a| a.label());
+        let accounts = self
+            .preview
+            .as_ref()
+            .map(|p| p.accounts.clone())
+            .unwrap_or_default();
+        let current = accounts
+            .iter()
+            .find(|a| a.id == self.login)
+            .map_or_else(|| self.login.clone(), |a| a.label());
         let sheet = cx.entity().downgrade();
         style::menu::popover(Popover::new("move-login"), cx)
             .anchor(Anchor::BottomLeft)
-            .trigger(MoveLoginTrigger { label: current.into() })
+            .trigger(MoveLoginTrigger {
+                label: current.into(),
+            })
             .content(move |_, _window, cx| {
                 let popover = cx.entity();
                 // A menu, drawn as the app's are (style::menu).
-                v_flex().w(gpui_kit::px(300.)).children(accounts.iter().enumerate().map(|(i, account)| {
-                    let (popover, sheet, id) = (popover.clone(), sheet.clone(), account.id.clone());
-                    let on = sheet.upgrade().is_some_and(|s| s.read(cx).login == account.id);
-                    style::menu::row(("move-login", i), None, cx)
-                        .on_click(move |_, window, cx| {
-                            popover.update(cx, |s, cx| s.dismiss(window, cx));
-                            if let Some(sheet) = sheet.upgrade() {
-                                sheet.update(cx, |s, cx| s.set_login(id.clone(), window, cx));
-                            }
-                        })
-                        .child(div().flex_1().min_w_0().truncate().child(account.label()))
-                        .when(on, |s| s.child(style::menu::tick(cx)))
-                }))
+                v_flex()
+                    .w(gpui_kit::px(300.))
+                    .children(accounts.iter().enumerate().map(|(i, account)| {
+                        let (popover, sheet, id) =
+                            (popover.clone(), sheet.clone(), account.id.clone());
+                        let on = sheet
+                            .upgrade()
+                            .is_some_and(|s| s.read(cx).login == account.id);
+                        style::menu::row(("move-login", i), None, cx)
+                            .on_click(move |_, window, cx| {
+                                popover.update(cx, |s, cx| s.dismiss(window, cx));
+                                if let Some(sheet) = sheet.upgrade() {
+                                    sheet.update(cx, |s, cx| s.set_login(id.clone(), window, cx));
+                                }
+                            })
+                            .child(div().flex_1().min_w_0().truncate().child(account.label()))
+                            .when(on, |s| s.child(style::menu::tick(cx)))
+                    }))
             })
     }
 }
@@ -412,8 +718,19 @@ impl RenderOnce for MoveLoginTrigger {
             .bg(style::button_fill(cx))
             .cursor_pointer()
             .tip("The login it carries on with there")
-            .child(div().flex_1().min_w_0().truncate().text_size(px(size::LABEL)).child(self.label))
-            .child(Icon::from(gpui_kit::assets::IconName::ChevronDown).with_size(px(11.)).text_color(style::faint_icon(cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(size::LABEL))
+                    .child(self.label),
+            )
+            .child(
+                Icon::from(gpui_kit::assets::IconName::ChevronDown)
+                    .with_size(px(11.))
+                    .text_color(style::faint_icon(cx)),
+            )
     }
 }
 
@@ -425,10 +742,25 @@ impl Render for MoveSheet {
         let can_move = self.can_move(cx);
         let connected = self.connected(cx);
         let waiting = self.asking || !connected;
-        let (problems, left_behind, clone, worktree) = preview.map_or((vec![], vec![], None, false), |p| (p.problems, p.left_behind, p.clone, p.worktree));
-        let folder_tip = if worktree { format!("The repo on {name} it gets a new worktree of its own in. Press Return to check another folder.") } else { format!("Where it runs on {name}. Press Return to check another folder.") };
+        let (problems, left_behind, clone, clone_from, worktree) = preview
+            .map_or((vec![], vec![], None, None, false), |p| {
+                (p.problems, p.left_behind, p.clone, p.clone_from, p.worktree)
+            });
+        let folder_tip = if worktree {
+            format!("The repo on {name} it gets a new worktree of its own in. Press Return to check another folder.")
+        } else {
+            format!("Where it runs on {name}. Press Return to check another folder.")
+        };
         let login_picker = self.render_login_picker(cx);
-        let label = |text: &'static str| div().w(px(52.)).flex_none().text_right().text_size(px(size::LABEL)).text_color(style::secondary_text(cx)).child(text);
+        let label = |text: &'static str| {
+            div()
+                .w(px(52.))
+                .flex_none()
+                .text_right()
+                .text_size(px(size::LABEL))
+                .text_color(style::secondary_text(cx))
+                .child(text)
+        };
         v_flex()
             .gap(px(12.))
             .child(
@@ -445,12 +777,18 @@ impl Render for MoveSheet {
                             .gap(px(10.))
                             .items_center()
                             .child(label("Folder"))
-                            .child(div().id("move-folder").flex_1().min_w_0().tip(folder_tip.clone()).child(Input::new(&self.folder).small().font_family(cx.theme().mono_font_family.clone()))),
+                            .child(div().id("move-folder").flex_1().min_w_0().tip(folder_tip).child(Input::new(&self.folder).small().font_family(cx.theme().mono_font_family.clone()))),
                     )
                     .child(h_flex().gap(px(10.)).items_center().child(label("Login")).child(div().flex_1().min_w_0().child(login_picker))),
             )
             .children(problems.into_iter().map(|line| h_flex().gap(px(6.)).items_start().text_size(px(size::LABEL)).text_color(style::failed(cx)).child(Icon::from(gpui_kit::assets::IconName::OctagonX).with_size(px(13.))).child(div().flex_1().child(line))))
-            .when_some(clone, |s, clone| s.child(div().text_size(px(size::LABEL)).text_color(style::secondary_text(cx)).child(format!("{name} has no copy of its repo, so it's cloned to {clone} first."))))
+            .when_some(clone, |s, clone| {
+                let line = match &clone_from {
+                    Some(from) => format!("{name} has no copy of its repo, so it's cloned from {from} to {clone} first."),
+                    None => format!("{name} has no copy of its repo, so it's cloned to {clone} first."),
+                };
+                s.child(div().text_size(px(size::LABEL)).text_color(style::secondary_text(cx)).child(line))
+            })
             .children(left_behind.into_iter().map(|line| div().text_size(px(size::LABEL)).text_color(style::needs_you_text(cx)).child(format!("Won't come: {line}"))))
             .child(
                 h_flex()
@@ -483,7 +821,25 @@ impl Render for MoveSheet {
 
 /// The `move` script command: as Move to ▸ a runner, by its name or id.
 #[cfg(feature = "automation")]
-pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Window, cx: &mut App) -> Result<Value, String> {
+pub(crate) fn automation(
+    app: &Entity<Threadbear>,
+    cmd: &Value,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<Value, String> {
+    // `folder`: typed into the open sheet's folder field, without Return.
+    if let Some(folder) = cmd["folder"].as_str() {
+        let sheet = app
+            .read(cx)
+            .move_sheet
+            .clone()
+            .ok_or("no move sheet open")?;
+        let folder = folder.to_owned();
+        sheet.update(cx, |s, cx| {
+            s.folder.update(cx, |f, cx| f.set_value(folder, window, cx))
+        });
+        return Ok(json!("ok"));
+    }
     let thread_id = match cmd["id"].as_str() {
         Some(id) => app.read(cx).thread_id_from(id)?,
         None => app.read(cx).selected.clone().ok_or("no thread open")?,
@@ -494,9 +850,22 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Win
         return Ok(json!(format!("ok {thread_id}")));
     }
     let want = cmd["runner"].as_str().unwrap_or("").to_lowercase();
-    let runner_id_of_thread = app.read(cx).threads.get(&thread_id).and_then(|t| t.runner_id.clone());
-    let runner = app.read(cx).move_targets(runner_id_of_thread.as_deref()).into_iter().find(|r| r.name.to_lowercase() == want || r.id == want).ok_or_else(|| format!("no runner {want} to move it to"))?;
-    let request = MoveRequest { thread_id: thread_id.clone(), runner_id: runner.id, runner_name: runner.name };
+    let runner_id_of_thread = app
+        .read(cx)
+        .threads
+        .get(&thread_id)
+        .and_then(|t| t.runner_id.clone());
+    let runner = app
+        .read(cx)
+        .move_targets(runner_id_of_thread.as_deref())
+        .into_iter()
+        .find(|r| r.name.to_lowercase() == want || r.id == want)
+        .ok_or_else(|| format!("no runner {want} to move it to"))?;
+    let request = MoveRequest {
+        thread_id: thread_id.clone(),
+        runner_id: runner.id,
+        runner_name: runner.name,
+    };
     app.update(cx, |t, cx| t.open_move(request, window, cx));
     Ok(json!(format!("ok {thread_id}")))
 }

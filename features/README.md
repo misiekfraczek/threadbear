@@ -43,7 +43,7 @@ code, and make it fail first when you can.
   thread (`support/long-thread.ts`), for what only shows on more than a page
   of events. `@remote-threads` turns on the mock's other-Mac threads
   (`mini_*`), which it leaves out otherwise.
-- `@subscription-logins` adds the mock's Grok and Google (Antigravity) logins,
+- `@subscription-logins` adds the mock's Grok and Gemini logins,
   which it leaves out otherwise.
 - `@browserbear` gives the app a stand-in BrowserBear (`support/browserbear.ts`):
   its folder through `BROWSERBEAR_HOME`, with `agent/tabs.json` and its socket.
@@ -59,11 +59,13 @@ Each scenario starts its own app on its own mock runner, about 6 seconds apiece.
 ```bash
 npm ci                                  # once, in this folder
 npm run check                           # steps line up, no apps needed
+npm run typecheck                       # the steps, support and tools (tsconfig.json)
 
 # Build the app first, then:
 TB_APP=gpui  node_modules/.bin/cucumber-js        # or swift
 TB_TAGS='@sidebar.search' ...                     # just these
 TB_INCLUDE_PENDING=1 ...                          # to see what's left
+TB_SHARD=2/2 ...                                  # half the files, as CI's second Linux job does
 TB_REDUCE_MOTION=on ...                           # GPUI with Reduce Motion (off otherwise, whatever the Mac says)
 ```
 
@@ -86,6 +88,31 @@ Use `TB_REAL_SCREEN=1` only on Tinker Desk through `remote.sh --desk`, with
 no recording running there. Never run them on the Mac Mike is using. The
 picture-promise case starts its own source window and checks it is in front
 before dragging into its own test app.
+
+### Real screen
+
+Anything needing the real pointer, keys or a window in front (AGENTS.md,
+"Tests that need the real screen") runs on Tinker Desk's desktop from a
+throwaway copy, through `ssh tinker-desk '~/.local/bin/desk "<cmd>"'`, and the
+copy is removed after. Debug apps on Mike's Mac are kept behind everything, so
+there stick to `dev-app.sh`'s automation commands.
+
+- Trackpad gestures: made-up events handed to a handler never meet a scroll
+  view, and a scroll view that gets any of a gesture takes the rest itself, so
+  swipes passed every test and failed on Mike's trackpad twice (7 Nov).
+  `features/tools/post-gesture.swift` sends them through the window server.
+- A scripted drag starts from a window of your own. It can't start from a
+  screenshot's floating thumbnail, so that one still takes a person.
+- Someone else may be using that desktop: first check nothing's recording it
+  (the `recording()` guard in `tools/real-screen.ts` checks executable names,
+  including variants) and that your window really is in front (`front`, then
+  a look at the screen). Wake its screen with `caffeinate -u`, or the events go
+  nowhere.
+- A spec or tool that installs the web runtime puts it in `runtimeParent()`
+  (`support/web-runtime.ts`), never straight in the temp folder: remote.sh's
+  temp folder is on Tinker Desk's external SSD, and Chromium's helpers run from
+  there asked macOS for that disk on every new build, with nobody at the screen
+  to answer (19 Nov).
 
 `tools/idle-perf.ts` measures the app process's CPU time and wakeups on Tinker
 Desk, without polling the app during the interval. GPUI builds with the thread
@@ -172,7 +199,11 @@ runs are queued ahead, again every five minutes. The holder is in
 `~/.cache/threadbear-perf.lock.waiting`. Read that file, not `lsof`, to see who holds it: every waiter has the
 lock file open too, so a waiter at 0% CPU looks like a stuck holder. A thread
 killed its own queued run that way on 14 Nov. Other
-checkouts and landing checks cannot build over a measurement. Cargo and Swift
+checkouts and landing checks cannot build over a measurement. Plain builds
+(`remote.sh --build`) may share a host that allows it
+(`~/.cache/threadbear-check/builds-at-once` there; `scripts/perf-lock.pl`
+says how), never with a measurement: a measurement started inside one
+refuses, so measure through `remote.sh` without `--build`. Cargo and Swift
 build executables run at background priority; the benchmark keeps normal
 priority. Cancellation keeps the locks until the remote command has stopped.
 
@@ -232,3 +263,30 @@ checkout cannot reuse the other checkout's binary. The marker returns only
 after Cargo succeeds. A cleanup that cannot yet observe killed work stopping
 keeps the host locked and writes `~/.cache/threadbear-check/perf-cleanup.log`
 after 30 seconds; it does not let another measurement start over that work.
+
+## Hunting bugs on purpose
+
+Three tools look for bugs nobody wrote a scenario for. They grew out of a
+fuzzing experiment on 18 Nov 2026 (write-ups in `~/dev/me/misc/threadbear-fuzz`
+on Mike's Mac) and run each night on Tinker Desk (`scripts/nightly-fuzz.sh`).
+All three use a debug build with `automation` on the mock runner's demo
+threads, never real data, and keep their output under
+`~/.cache/threadbear-check`. Run them through `desktop/scripts/remote.sh
+tinker-desk --desk -- ...`, never on Mike's Mac.
+
+- `tools/stress.mjs --cond slow+dark --shard 2/8` reruns these specs under
+  shaken conditions (a slow runner answering out of order, window sizes, dark,
+  Reduce Motion, random order) and records each scenario's result. The slow
+  runner is what found real races: a scenario that fails only under a
+  condition is worth reading, after checking it passes on plain main.
+- `tools/fuzz-monkey.sh <seed> [minutes] [--mock-weight 40]` is a seeded
+  random walk that checks the app stays alive, answers, doesn't stall its main
+  thread and keeps a consistent state. A failure keeps its trace, which
+  `fuzz-monkey.ts --replay <trace> --shrink` cuts down. No model, so it's
+  cheap, but it can't see what merely looks wrong.
+- `tools/fuzz-agent-desk.sh <model> <minutes> [area...]` has a cheap model
+  (`opencode:<free model>` or `claude:claude-haiku-5-5`) use the app like a
+  person and report what looks broken, with the commands to repeat it. It
+  finds what the other two can't (Escape not closing a menu, two controls with
+  one screen-reader name), and most of its reports are false alarms, so
+  repeat each one before believing it.

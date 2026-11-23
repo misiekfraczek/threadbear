@@ -18,12 +18,14 @@ class FakeTransport : ConvexTransport {
     val calls = mutableListOf<Pair<String, Map<String, JsonElement>>>()
     var queries: (String, Map<String, JsonElement>) -> String = { _, _ -> "null" }
     var mutations: (String, Map<String, JsonElement>) -> String = { _, _ -> "\"cmd1\"" }
+    var actions: (String, Map<String, JsonElement>) -> String = { _, _ -> "null" }
     var subscriptions: (String, Map<String, JsonElement>) -> List<String> = { _, _ -> emptyList() }
     var subscriptionError: TransportError? = null
     override val connected: StateFlow<Boolean> = MutableStateFlow(true)
 
     override suspend fun query(name: String, args: Map<String, JsonElement>): String { calls += name to args; return queries(name, args) }
     override suspend fun mutation(name: String, args: Map<String, JsonElement>): String { calls += name to args; return mutations(name, args) }
+    override suspend fun action(name: String, args: Map<String, JsonElement>): String { calls += name to args; return actions(name, args) }
     override fun subscribe(name: String, args: Map<String, JsonElement>): Flow<String> = flow {
         calls += name to args
         subscriptions(name, args).forEach { emit(it) }
@@ -46,6 +48,22 @@ class BackendTest {
         assertEquals(setOf("token", "threadId", "text"), t.calls[0].second.keys)
         b.send("t1", "yes", answers = listOf(AskAnswer("Merge?", "Merge")))
         assertEquals("""[{"action":"Merge?","answer":"Merge"}]""", t.calls.last().second["answers"].toString())
+    }
+
+    /** Notes (backend API 79) are asked for only when the backend knows the argument. */
+    @Test fun messagesAskForNotesOnlyWhenTold() = runTest {
+        val t = FakeTransport()
+        t.queries = { _, _ -> """{"messages":[],"hasMore":false}""" }
+        val b = PhoneBackend(t, "x")
+        b.messages("t1", 50).toList()
+        b.messages("t1", 50, notes = true).toList()
+        b.olderMessages("t1", 9, 50)
+        b.olderMessages("t1", 9, 50, notes = true)
+        assertNull(t.calls[0].second["notes"])
+        assertEquals("true", t.calls[1].second["notes"].toString())
+        assertNull(t.calls[2].second["notes"])
+        assertEquals("true", t.calls[3].second["notes"].toString())
+        assertEquals("9", t.calls[3].second["beforeSeq"].toString())
     }
 
     @Test fun aThreadThatIsntThereIsNull() = runTest {

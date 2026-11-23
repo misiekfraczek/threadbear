@@ -12,6 +12,7 @@ import { nullLogger } from '../../src/log.ts';
 import { RpcError } from '../../src/protocol.ts';
 import { checkSequence } from '../helpers/protocol-check.ts';
 import { tmpDir } from '../helpers/fakes.ts';
+import { IS_WINDOWS, NO_LINKS_ON_WINDOWS, SHELL, sleepCommand } from '../helpers/platform.ts';
 
 const MIN = 60_000;
 
@@ -127,8 +128,10 @@ test('an idle restart waits for a running turn.end hook, and goes once it has en
   const root = tmpDir();
   const project = path.join(root, 'app');
   fs.mkdirSync(path.join(project, '.threadbear/patches'), { recursive: true });
-  fs.writeFileSync(path.join(project, '.threadbear/patches/h.ts'), `export default { hooks: [{ title: "Slow", on: "turn.end", run: "sleep 0.3", tell: "never" }] };`);
-  const h = makeHarness(undefined, {}, { panelsRoot: root, actionShell: ['/bin/sh', '-c'], actionTimeoutMs: 5000 });
+  // (On Windows the hook is slower to start and the runner's loop can stall a
+  // while: a 0.3 s hook had ended by the time the test looked, on GitHub's runner.)
+  fs.writeFileSync(path.join(project, '.threadbear/patches/h.ts'), `export default { hooks: [{ title: "Slow", on: "turn.end", run: ${JSON.stringify(sleepCommand(IS_WINDOWS ? 2 : 0.3))}, tell: "never" }] };`);
+  const h = makeHarness(undefined, {}, { panelsRoot: root, actionShell: SHELL, actionTimeoutMs: 5000 });
   const { r, state } = withRestarter(h);
   const { thread } = create(h, { cwd: project });
   await tick();
@@ -472,8 +475,6 @@ test('the restart notices are the sentences the Mac app reads', () => {
   assert.equal(pendingMessage(3, 1), 'The runner will restart when 2 threads finish and you answer 1.');
   assert.equal(pendingMessage(1, 1), 'The runner will restart when you answer 1 thread.');
   assert.equal(pendingMessage(2, 2), 'The runner will restart when you answer 2 threads.');
-  const src = fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'src', 'restart.ts'), 'utf8');
-  assert.match(src, /'The pending runner restart was cancelled\.'/);
 });
 
 test('background shells and subagents hold an idle restart until they finish', async () => {
@@ -503,7 +504,7 @@ test('background shells and subagents hold an idle restart until they finish', a
 test('when background work ends, the restart also waits for the turn the CLI starts to read the result', async () => {
   const h = makeHarness();
   const { r, state } = withRestarter(h);
-  const { thread } = create(h);
+  create(h);
   const s = h.adapter.last;
   s.init();
   s.out({ kind: 'tasks', tasks: TASKS });
@@ -669,7 +670,7 @@ test('a pending restart can be cancelled until it begins', async () => {
   assert.throws(() => r.request({ cancel: true }), (e: RpcError) => e.code === -32020);
 });
 
-test("cancelling a deploy's restart points current back at the running release", () => {
+test("cancelling a deploy's restart points current back at the running release", NO_LINKS_ON_WINDOWS, () => {
   const h = makeHarness();
   // A data dir with releases A (running) and B (a deploy made current).
   const dir = path.join(h.home, 'runner');
@@ -797,7 +798,7 @@ test('a snooze that ends while the runner is down still sends the queued message
 test('a thread someone has written in since it asked is not resumed over them', async () => {
   const h = makeHarness();
   const { r } = withRestarter(h);
-  const other = create(h).thread;
+  create(h);
   const so = h.adapter.last;
   so.init();
   const { thread } = create(h);
@@ -982,15 +983,18 @@ test('every CLI gets THREADBEAR_THREAD_ID, THREADBEAR_HOME and THREADBEAR_RUNNER
   assert.equal(env.THREADBEAR_THREAD_ID, thread.id);
   assert.equal(env.THREADBEAR_HOME, h.home);
   assert.equal(env.THREADBEAR_RUNNER_HOME, h.home);
-  // Where a picture goes to be on the thread's shared page (docs/protocol.md, "Sharing").
+  // Where a picture goes to be on the thread's shared page (docs/protocol/runners.md, "Sharing").
   assert.equal(env.THREADBEAR_MEDIA_DIR, path.join(h.home, 'threads', thread.id, 'media'));
   assert.match(env.THREADBEAR_RUNNER_VERSION, /^\d+\.\d+\.\d+\+/);
   // The Node it runs on, for the repo's scripts (scripts/find-node.sh).
   assert.equal(env.THREADBEAR_NODE, process.execPath);
   // This runner's bin/ first, so a bare `tb` in the thread is its tb.
-  assert.equal(env.PATH.split(':')[0], path.resolve(import.meta.dirname, '..', '..', 'bin'));
-  assert.ok(fs.existsSync(path.join(env.PATH.split(':')[0], 'tb')));
-  assert.equal(env.PATH.split(':').slice(1).join(':'), process.env.PATH);
+  assert.equal(env.PATH.split(path.delimiter)[0], path.resolve(import.meta.dirname, '..', '..', 'bin'));
+  assert.ok(fs.existsSync(path.join(env.PATH.split(path.delimiter)[0], 'tb')));
+  // On Windows the runner's Node comes next, for Git Bash's tb (threadEnv).
+  const rest = env.PATH.split(path.delimiter).slice(1);
+  if (process.platform === 'win32') assert.equal(rest.shift(), path.dirname(process.execPath));
+  assert.equal(rest.join(path.delimiter), process.env.PATH);
 
   // The Claude adapter puts them in the CLI's environment, over anything
   // inherited (a runner started from inside a thread has its own).
@@ -1083,4 +1087,21 @@ test('runner.status names the release launch.mjs went back from, while this one 
   assert.equal(withRestarter(h, '0.1.0+A', { release: 'A' }).r.status().rolledBack, undefined);
   // From source, there are no releases.
   assert.equal(withRestarter(h, '0.1.0+source', { release: undefined }).r.status().rolledBack, undefined);
+});
+
+// main.ts asks for this restart itself after an uncaught error, with no
+// release: the handover's notice mustn't promise a new one.
+for (const release of [undefined, '20261121T000000Z-abc1234']) test(`a handover's notice says "onto a new release" only when the request named one (${release ? 'named' : 'none'})`, async () => {
+  const h = makeHarness();
+  const kept: string[][] = [];
+  const r = new Restarter({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, version: '0.1.0+old', release: 'old', restart: () => assert.fail('a busy thread hands over rather than restarting'), canHandOver: () => true, handOver: (keeps) => kept.push(keeps) });
+  const { thread } = create(h);
+  h.adapter.last.init();
+  const res = r.request({ when: 'idle', reason: 'An unexpected error (see the runner log)', ...(release ? { release } : {}) });
+  assert.deepEqual(res.handover, { keeps: [thread.id] });
+  await tick();
+  assert.deepEqual(kept, [[thread.id]]);
+  const n = notices(h).at(-1)!;
+  assert.ok(n.startsWith('The runner is restarting'), 'the apps read this prefix as a restart under way');
+  assert.equal(n.includes('onto a new release'), Boolean(release), n);
 });

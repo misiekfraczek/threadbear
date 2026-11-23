@@ -191,22 +191,22 @@ test('settings: update saves to runner.json, applies at once, and a bad field ch
 test('settings: experiments lists each with its switch, and update saves only known ids', () => {
   const s = settingsSetup();
   const file = path.join(s.home, 'runner.json');
-  fs.writeFileSync(file, JSON.stringify({ experiments: { looseEnds: true } }));
+  fs.writeFileSync(file, JSON.stringify({ experiments: { warmStart: true } }));
   const listed = s.svc.get().experiments;
   assert.ok(listed.length > 0);
   // Every experiment file shows, so a new one needs nothing in the app.
   assert.deepEqual(listed.map((x) => x.id), EXPERIMENTS.map((x) => x.id));
-  assert.equal(listed.find((x) => x.id === 'looseEnds')?.on, true);
-  assert.equal(listed.find((x) => x.id === 'cardReviewer')?.on, false);
+  assert.equal(listed.find((x) => x.id === 'warmStart')?.on, true);
+  assert.equal(listed.find((x) => x.id === 'inboxGuess')?.on, false);
   assert.ok(listed.every((x) => x.name && x.does), 'each has a name and what it does');
-  const r = s.methods['settings.update']({ experiments: { cardReviewer: true } }) as { settings: any };
-  assert.equal(r.settings.experiments.find((x: any) => x.id === 'cardReviewer').on, true);
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { looseEnds: true, cardReviewer: true }, 'the others are kept');
+  const r = s.methods['settings.update']({ experiments: { inboxGuess: true } }) as { settings: any };
+  assert.equal(r.settings.experiments.find((x: any) => x.id === 'inboxGuess').on, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { warmStart: true, inboxGuess: true }, 'the others are kept');
   assert.equal(s.published.at(-1)?.method, 'settings.updated');
-  for (const bad of [{ experiments: { nope: true } }, { experiments: { cardReviewer: 'yes' } }, { experiments: [] }, { experiments: null }]) {
+  for (const bad of [{ experiments: { nope: true } }, { experiments: { inboxGuess: 'yes' } }, { experiments: [] }, { experiments: null }]) {
     assert.throws(() => s.methods['settings.update'](bad), (e: RpcError) => e.code === ErrorCode.badParams, JSON.stringify(bad));
   }
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { looseEnds: true, cardReviewer: true }, 'a refused update changed nothing');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { warmStart: true, inboxGuess: true }, 'a refused update changed nothing');
 });
 
 test('settings: keeping the Mac awake is on until turned off, and only a Mac shows it', () => {
@@ -233,6 +233,15 @@ test('settings: full sync is off until answered, and either answer is saved in r
     assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sync, { url: 'https://x.convex.cloud', name: 'Mac', full: v });
   }
   assert.throws(() => s.methods['settings.update']({ fullSync: 'yes' }), (e: RpcError) => e.code === ErrorCode.badParams);
+});
+
+test("settings: spareWeek is on until turned off, and saved as runner.json's spareWeek", () => {
+  const s = settingsSetup();
+  assert.equal(s.svc.get().spareWeek, true);
+  const r = s.methods['settings.update']({ spareWeek: false }) as { settings: any };
+  assert.equal(r.settings.spareWeek, false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(s.home, 'runner.json'), 'utf8')).spareWeek, false);
+  assert.throws(() => s.methods['settings.update']({ spareWeek: 'no' }), (e: RpcError) => e.code === ErrorCode.badParams);
 });
 
 test("settings: bringIn is every 5 days until changed, and keeps the rest of runner.json's releases", () => {
@@ -280,7 +289,7 @@ test('titles: a model title replaces the first line, unless one was set meanwhil
 
   // Named by hand before the model answered: the hand wins.
   let release!: () => void;
-  const slow = { generate: (p: any) => new Promise<any>((r) => (release = () => r({ ok: true, value: 'Model title', model: HAIKU }))) };
+  const slow = { generate: (_p: any) => new Promise<any>((r) => (release = () => r({ ok: true, value: 'Model title', model: HAIKU }))) };
   const h2 = makeHarness(undefined, {}, { models: slow });
   const t2 = h2.runner.create({ text: 'something', accountId: 'claude-3' }).thread;
   h2.runner.update({ threadId: t2.id, title: 'Mine' });
@@ -367,7 +376,7 @@ test('titles: naming an older thread also sends the start of its first reply', a
   const asked: any[] = [];
   const models = { generate: async (p: any) => (asked.push(p), { ok: false as const, reason: 'no-pool' as const, message: '' }) };
   const h = makeHarness(undefined, {}, { models });
-  const id = h.runner.create({ text: 'Explain thread count', accountId: 'claude-3' }).thread.id;
+  h.runner.create({ text: 'Explain thread count', accountId: 'claude-3' });
   await tick();
   const s = h.adapter.last;
   s.init();

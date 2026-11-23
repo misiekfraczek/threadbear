@@ -1,6 +1,6 @@
 // For the tools that use the real screen and pointer, which run only on a
 // machine nobody's using (Tinker Desk's desktop, AGENTS.md): where a window is
-// on screen, and the Swift helpers in app/Tools that post real events.
+// on screen, and the Swift helpers beside this file that post real events.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,10 +11,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 export const work = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'tb-real-screen-'));
 process.on('exit', () => fs.rmSync(work, { recursive: true, force: true }));
 
-/** app/Tools/<name>.swift, compiled once into a temp folder. */
+/** features/tools/<name>.swift, compiled once into a temp folder. */
 export function swiftTool(name: string): string {
   const out = path.join(work, name);
-  if (!fs.existsSync(out)) execFileSync('swiftc', ['-O', path.join(root, 'app/Tools', `${name}.swift`), '-o', out]);
+  if (!fs.existsSync(out)) execFileSync('swiftc', ['-O', path.join(root, 'features/tools', `${name}.swift`), '-o', out]);
   return out;
 }
 
@@ -140,6 +140,7 @@ export function windowAt(x: number, y: number): { pid: number; owner: string } |
  * the test window on Tinker Desk, and the drags went to them instead.
  */
 export function assertInFront(pid: number, points: [number, number][]): void {
+  assertOwnScreen();
   for (const [x, y] of points) {
     const top = windowAt(x, y);
     if (top?.pid !== pid) {
@@ -222,6 +223,38 @@ export function executableProcesses(read = processSnapshot): { pid: number; name
   return found;
 }
 
+/** One login's session, as the window server lists them (IOConsoleUsers). */
+export interface ConsoleSession { user: string; onConsole: boolean; locked: boolean }
+
+/** Every login's session on this Mac, from the window server's list. */
+export function consoleSessions(): ConsoleSession[] {
+  const plist = execFileSync('ioreg', ['-n', 'Root', '-d1', '-a']);
+  const json = JSON.parse(execFileSync('plutil', ['-convert', 'json', '-o', '-', '-'], { input: plist }).toString()) as { IOConsoleUsers?: Record<string, unknown>[] };
+  return (json.IOConsoleUsers ?? []).map((u) => ({ user: String(u.kCGSSessionUserNameKey ?? ''), onConsole: u.kCGSSessionOnConsoleKey === true, locked: u.CGSSessionScreenIsLocked === true }));
+}
+
+/**
+ * Why events posted from `me`'s session wouldn't reach its windows, or empty
+ * when they would: another login has the screen (fast user switching leaves
+ * this one drawing off screen, and posted keys go to the other's), or the
+ * screen is locked. On 19 Nov ademark's locked session had Tinker Desk's
+ * screen, real-typing's ⌘N went to its lock screen, and the test failed as
+ * if the app were broken.
+ */
+export function sessionProblem(sessions: ConsoleSession[], me: string): string {
+  const on = sessions.find((s) => s.onConsole);
+  if (!on) return 'Nobody has the screen (the login window is up)';
+  if (on.user !== me) return `${on.user}'s login has the screen${on.locked ? ' (locked)' : ''}, not ${me}'s: switch Tinker Desk back to ${me}`;
+  if (on.locked) return `${me}'s screen is locked`;
+  return '';
+}
+
+/** Throws unless this login has the screen, unlocked. */
+export function assertOwnScreen(read = consoleSessions): void {
+  const problem = sessionProblem(read(), os.userInfo().username);
+  if (problem) throw new Error(`${problem}. No events were posted.`);
+}
+
 /** Encoder PIDs and names, or empty when none are running. Lookup failures throw. */
 export function recording(read = executableProcesses): string {
   const found = new Map<number, string>();
@@ -273,8 +306,10 @@ export interface Screen {
   windowUnder(pid: number, x: number, y: number): WindowRow | null;
   displays(): number[][];
   recording(): string;
+  /** Throws unless this login has the screen (assertOwnScreen); left out of made-up screens. */
+  ownScreen?(): void;
 }
-export const realScreen: Screen = { windowAt, windowFrame, windowsAbove, windowUnder: (pid, x, y) => windowUnder(pid, x, y), displays, recording };
+export const realScreen: Screen = { windowAt, windowFrame, windowsAbove, windowUnder: (pid, x, y) => windowUnder(pid, x, y), displays, recording, ownScreen: () => assertOwnScreen() };
 
 /**
  * How far in from a display's edge a point an event lands on must be: the
@@ -293,6 +328,7 @@ const inside = ([x, y]: Point, [dx, dy, dw, dh]: number[], inset = 0) => x >= dx
  * and a drag can move the app (10 and 13 Nov).
  */
 export function guardInput(pid: number, points: Point[], screen: Screen = realScreen): void {
+  screen.ownScreen?.();
   const busy = screen.recording();
   if (busy) throw new Error(`Something is recording the screen (${busy.split('\n')[0]}). No events were posted.`);
   const shown = screen.displays();

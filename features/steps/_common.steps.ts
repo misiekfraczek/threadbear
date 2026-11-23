@@ -63,7 +63,7 @@ When('I press {string} in the {word} panel', async function (this: ThreadbearWor
 });
 
 // What the mock runner says about the gateway and its own update
-// (mock.connectors and mock.updates, app/Tools/mock-runner/server.mjs).
+// (mock.connectors and mock.updates, mock-runner/server.mjs).
 
 When("the gateway can't be reached", async function (this: ThreadbearWorld) {
   await this.app.do({ cmd: 'mock', method: 'connectors', params: { state: 'unreachable', error: 'timed out' } });
@@ -84,4 +84,9 @@ When("the runner says Threadbear Runner.app is behind main", async function (thi
 
 When('the runner says it is updating Threadbear Runner by itself', async function (this: ThreadbearWorld) {
   await this.app.do({ cmd: 'mock', method: 'updates', params: { state: 'idle', launcherChanged: true, reinstall: { state: 'waiting', auto: true } } });
+});
+
+// The keyboard to the message box, typing nothing.
+When('I put the cursor in the composer', async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'type', text: '' });
 });

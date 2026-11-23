@@ -55,7 +55,11 @@ APP_ROOT="$(cd "$TOOLS_DIR/.." && pwd)"
 # The checkout an instance was built from, and the thread that started it.
 CHECKOUT="$(cd "$APP_ROOT/.." && pwd -P)"
 OWNER_THREAD="${THREADBEAR_THREAD_ID:-}"
-TMP_ROOT="${TMPDIR:-/tmp}"
+# TMPDIR, else macOS's own temp folder for this account, else one in /tmp
+# with the account's uid in its name: never a name another account on the
+# Mac may own already (Tinker Desk's second account couldn't start the app,
+# 19 Nov 2026). features/support/swift.ts finds the same folder.
+TMP_ROOT="${TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "/tmp/threadbear-$(id -u)")}"
 mkdir -p "${TMP_ROOT%/}/threadbear-dev-app"
 # With symlinks resolved (/var is /private/var): it's how the app's own
 # path reads in ps and pgrep.
@@ -505,14 +509,14 @@ cmd_start() {
     data="$dir/data"
     mkdir -p "$data"
     local node; node="$(node_bin)"
-    if [ ! -d "$TOOLS_DIR/mock-runner/node_modules" ]; then
-      (cd "$TOOLS_DIR/mock-runner" && PATH="$(dirname "$node"):$PATH" npm install --silent)
+    if [ ! -d "$TOOLS_DIR/../../mock-runner/node_modules" ]; then
+      (cd "$TOOLS_DIR/../../mock-runner" && PATH="$(dirname "$node"):$PATH" npm install --silent)
     fi
     # The demo threads unless fixtures were given: the private ones in
     # app/.fixtures are real conversations and stay out of screenshots
     # unless asked for.
     local args=()
-    if [ ${#fixtures[@]} -eq 0 ]; then fixtures=("$TOOLS_DIR/mock-runner/fixtures"); fi
+    if [ ${#fixtures[@]} -eq 0 ]; then fixtures=("$TOOLS_DIR/../../mock-runner/fixtures"); fi
     for fixture in "${fixtures[@]}"; do args+=(--fixtures "$fixture"); done
     # It exits once the app has quit (app.pid), so an instance that's
     # never stopped doesn't leave a mock running. It runs in a session of
@@ -529,7 +533,7 @@ cmd_start() {
       print $f $$;
       close $f;
       exec @ARGV or die "exec: $!";
-    ' "$dir/mock.pid" "$node" "$TOOLS_DIR/mock-runner/server.mjs" --data-dir "$data" "${args[@]}" --ready-file "$dir/mock.port" \
+    ' "$dir/mock.pid" "$node" "$TOOLS_DIR/../../mock-runner/server.mjs" --data-dir "$data" "${args[@]}" --ready-file "$dir/mock.port" \
       --exit-with-pid-file "$dir/app.pid" >"$dir/mock.log" 2>&1 </dev/null
     local i
     for i in $(seq 1 200); do [ -s "$dir/mock.pid" ] && break; sleep 0.05; done

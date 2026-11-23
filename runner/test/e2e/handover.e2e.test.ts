@@ -1,4 +1,4 @@
-// A real handover (docs/protocol.md, "Handovers"): launch.mjs supervises
+// A real handover (docs/protocol/updates.md, "Handovers"): launch.mjs supervises
 // the runner from a temp data dir, a real Claude turn on the cheapest model
 // is busy when an idle restart is asked for, and the new runner takes over
 // at once while the old one finishes that turn and hands the thread across.
@@ -11,8 +11,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { RunnerClient } from '../../src/client.ts';
+import { testLogin } from '../../src/test-login.ts';
 
-const ACCOUNT = process.env.TB_E2E_ACCOUNT ?? 'claude-main';
+const ACCOUNT = testLogin();
 const MODEL = process.env.TB_E2E_MODEL ?? 'claude-haiku-5-5';
 const RUNNER_DIR = path.join(import.meta.dirname, '..', '..');
 

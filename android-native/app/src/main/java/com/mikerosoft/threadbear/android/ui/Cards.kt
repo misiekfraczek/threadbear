@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -32,6 +33,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -43,8 +45,10 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.mikerosoft.threadbear.kit.ApprovalOption
+import com.mikerosoft.threadbear.kit.LooseEnds
 import com.mikerosoft.threadbear.kit.PendingApproval
 import com.mikerosoft.threadbear.kit.PhoneAsk
+import com.mikerosoft.threadbear.kit.PhoneLooseEnd
 import com.mikerosoft.threadbear.kit.Question
 import com.mikerosoft.threadbear.kit.RunnerKeyPins
 
@@ -107,6 +111,59 @@ fun Pill(
                     fontWeight = if (note != null) FontWeight.SemiBold else FontWeight.Medium)
             }
             if (note != null) Text(note, style = MaterialTheme.typography.bodySmall, color = if (filled) Color.White.copy(alpha = 0.85f) else colors.onSurfaceVariant)
+        }
+    }
+}
+
+/** A link in a card: accent text with an arrow, no outline. */
+@Composable
+private fun TextLink(title: String, onClick: () -> Unit) {
+    val accent = LocalSignals.current.accent
+    Row(Modifier.clip(RoundedCornerShape(6.dp)).clickable(onClick = onClick).padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Icon(Line.ArrowUpRight, null, Modifier.size(15.dp), tint = accent)
+        Spacer(Modifier.width(5.dp))
+        Text(title, style = MaterialTheme.typography.bodyMedium, color = accent)
+    }
+}
+
+/**
+ * One answer in an ask's grouped list: the answer, what it does under it,
+ * and a chevron (a spinner once it's on its way). Picked, it fills accent.
+ */
+@Composable
+private fun AnswerRow(label: String, note: String, onClick: () -> Unit, picked: Boolean, star: Boolean, spinning: Boolean, faded: Boolean, enabled: Boolean) {
+    val colors = MaterialTheme.colorScheme
+    val accent = LocalSignals.current.accent
+    val fg = if (picked) Color.White else colors.onSurface
+    val haptics = LocalHapticFeedback.current
+    Row(
+        Modifier.fillMaxWidth().background(if (picked) accent else Color.Transparent)
+            .clickable(enabled = enabled) { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove); onClick() }
+            .alpha(if (faded) 0.4f else 1f)
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(label, style = MaterialTheme.typography.labelLarge, color = fg, fontWeight = FontWeight.SemiBold)
+                // The agent's pick: a small gold star and "Recommended", as on the iPhone and Mac.
+                if (star && !picked) {
+                    Spacer(Modifier.width(6.dp))
+                    Icon(Line.StarFilled, null, Modifier.size(11.dp), tint = Color(0xFFDBB354))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Recommended", style = MaterialTheme.typography.labelSmall, color = colors.onSurfaceVariant)
+                }
+            }
+            if (note.isNotEmpty()) Text(note, style = MaterialTheme.typography.bodySmall, color = if (picked) Color.White.copy(alpha = 0.85f) else colors.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(10.dp))
+        Box(Modifier.size(18.dp), contentAlignment = Alignment.Center) {
+            when {
+                spinning -> CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 1.5.dp, color = Color.White)
+                picked -> Icon(Line.Check, "Picked", Modifier.size(16.dp), tint = Color.White)
+                else -> Icon(Line.ChevronRight, null, Modifier.size(16.dp), tint = colors.onSurfaceVariant.copy(alpha = 0.6f))
+            }
         }
     }
 }
@@ -254,14 +311,20 @@ fun AsksCard(
                         if (asks.size == 1) { pick(index, choice); send() } else pick(index, if (picks[index] == choice) null else choice)
                     }
                     if (ask.hasNotes) {
-                        if (links.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            links.forEach { l -> Pill(l.title, { open(l.url, null) }, icon = Line.External) }
+                        // Plain accent links, so they don't read as one of the answers.
+                        if (links.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                            links.forEach { l -> TextLink(l.title) { open(l.url, null) } }
                         }
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        // One grouped block with hairlines between, as the iPhone
+                        // draws it: outlined pills on two-line answers looked
+                        // heavy (Mike picked this from three mockups, 16 Nov).
+                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(colors.surfaceContainerHigh)) {
                             ask.choices.forEachIndexed { choice, label ->
+                                if (choice > 0) Box(Modifier.padding(start = 14.dp).fillMaxWidth().height(0.5.dp).background(colors.outlineVariant))
                                 val picked = picks[index] == choice
-                                Pill(label, { choose(choice) }, Modifier.fillMaxWidth(), filled = picked, note = ask.note(choice),
-                                    star = ask.suggestedIndex == choice, spinning = picked && busy && asks.size == 1, enabled = !busy || picked)
+                                AnswerRow(label, ask.note(choice) ?: "", { choose(choice) }, picked = picked,
+                                    star = ask.suggestedIndex == choice, spinning = picked && busy && asks.size == 1,
+                                    faded = busy && !picked, enabled = !busy)
                             }
                         }
                     } else if (links.isNotEmpty() || ask.choices.isNotEmpty()) {
@@ -283,9 +346,17 @@ fun AsksCard(
     }
 }
 
-/** A finished turn that needs nothing: archive it, or tick follow-ups to carry on. */
+/**
+ * A finished turn that needs nothing: archive it, or tick follow-ups to
+ * carry on. What the runner found still open (loose ends) goes between,
+ * under "Still open", or "Coming back" when it's only booked check-ins, as
+ * on the Mac and the iPhone: plain lines, and a thread one opens that thread.
+ */
 @Composable
-fun DoneCard(next: List<String>, ticked: Set<Int>, busy: Boolean, tick: (Int) -> Unit, send: () -> Unit, archive: () -> Unit) {
+fun DoneCard(
+    next: List<String>, ticked: Set<Int>, busy: Boolean, tick: (Int) -> Unit, send: () -> Unit, archive: () -> Unit,
+    looseEnds: List<PhoneLooseEnd> = emptyList(), openThread: (String) -> Unit = {},
+) {
     val colors = MaterialTheme.colorScheme
     val accent = LocalSignals.current.accent
     CardFrame {
@@ -295,6 +366,26 @@ fun DoneCard(next: List<String>, ticked: Set<Int>, busy: Boolean, tick: (Int) ->
             Text("Done", style = MaterialTheme.typography.titleSmall, color = colors.onSurfaceVariant)
             Spacer(Modifier.weight(1f))
             Pill("Archive", archive, icon = Line.Archive)
+        }
+        LooseEnds.heading(looseEnds)?.let { heading ->
+            val signals = LocalSignals.current
+            Text(heading, style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant)
+            for (end in LooseEnds.ordered(looseEnds)) {
+                val thread = end.threadId?.takeIf { it.isNotEmpty() }
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                        .then(if (thread != null) Modifier.clickable(onClickLabel = "Open the thread") { openThread(thread) } else Modifier)
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    Icon(
+                        if (end.isBooked) Line.Clock else Line.AlertCircle, if (end.isBooked) "Booked" else "Still open",
+                        Modifier.padding(top = 2.dp).size(18.dp), tint = if (end.isBooked) colors.onSurfaceVariant else signals.needsYou,
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(LooseEnds.line(end), style = MaterialTheme.typography.bodyLarge, color = if (thread != null) signals.accent else colors.onSurface)
+                }
+            }
         }
         if (next.isNotEmpty()) {
             Text("Or carry on", style = MaterialTheme.typography.labelMedium, color = colors.onSurfaceVariant)

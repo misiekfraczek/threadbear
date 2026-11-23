@@ -191,10 +191,6 @@ Given('the model picker has a mixed provider pool', async function (this: Thread
   } });
 });
 
-When('I browse {string} models in the picker', async function (this: ThreadbearWorld, provider: string) {
-  await this.app.do({ cmd: 'click', tip: `Browse ${provider} models` });
-});
-
 Then('the selected model chip contains {string}', async function (this: ThreadbearWorld, model: string) {
   await this.until(`selected model ${model}`, d => (d.composer as { chip?: string }).chip?.includes(model));
 });
@@ -207,4 +203,9 @@ Then('the model picker uses the {string} login', async function (this: Threadbea
     await sleep(150);
   }
   assert.fail(`login did not change to ${provider}: ${lines.join('\n')}`);
+});
+
+// The thumbnail's × over the box, clicked through the window.
+When('I remove picture {int} with its ×', async function (this: ThreadbearWorld, picture: number) {
+  assert.equal(await this.app.do({ cmd: 'composer-peek', strip: picture - 1, remove: true }), 'ok removed');
 });

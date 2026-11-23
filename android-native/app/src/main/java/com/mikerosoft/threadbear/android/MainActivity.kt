@@ -61,7 +61,7 @@ class MainActivity : ComponentActivity() {
         // Notifications allowed in Settings since the prompt was turned down:
         // register now rather than on the next launch.
         model.registerPush()
-        // A newer release on GitHub (at most every six hours, release builds only).
+        // A newer release on GitHub (at most every six hours, github release builds only).
         Updates.check(lifecycleScope)
     }
 
@@ -76,6 +76,12 @@ class MainActivity : ComponentActivity() {
         // app can still name this activity outright: refused, saying to scan.
         if (data != null && data.startsWith("threadbear://pair")) {
             if (!model.ask(data, PairingSource.OPENED)) model.note("That isn't a pairing link Threadbear can use.")
+        }
+        // The parity run's emulator (debug builds only; AppModel.pairForParity).
+        if (BuildConfig.ALLOW_LOCAL) {
+            val url = intent?.getStringExtra("parityUrl")
+            val token = intent?.getStringExtra("parityToken")
+            if (url != null && token != null) model.pairForParity(url, token)
         }
         Push.validThreadId(intent?.getStringExtra("threadId"))?.let { openThread.value = it }
     }
@@ -178,7 +184,7 @@ private fun AskForNotifications(model: AppModel) {
     ) { granted -> if (granted) model.registerPush() }
     LaunchedEffect(identity) {
         val id = identity ?: return@LaunchedEffect
-        if (!Push.available || !id.sendsNotifications || Push.permitted(context)) return@LaunchedEffect
+        if (!Push.available(context) || !Push.sentBy(id) || Push.permitted(context)) return@LaunchedEffect
         val prefs = context.getSharedPreferences("app", android.content.Context.MODE_PRIVATE)
         if (prefs.getBoolean("askedNotifications", false)) return@LaunchedEffect
         prefs.edit().putBoolean("askedNotifications", true).apply()

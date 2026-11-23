@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { makeHarness, tick } from '../helpers/fakes.ts';
 import { makePng } from '../helpers/png.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
 import { stills, withCharset } from '../../src/review-media.ts';
-import { PASSED_OVER_TAIL } from '../../src/reviews.ts';
+import { PASSED_OVER_TAIL, fitReview, keepPictureMarkers, webLinksOnly } from '../../src/reviews.ts';
 
 function fixture() {
   const h = makeHarness();
@@ -111,6 +112,19 @@ test('show_options uses the calling thread and returns a review ID without waiti
   assert.equal(result.isError,undefined);
   assert.match(JSON.stringify(result),/review|choice|later/i);
   assert.equal(h.runner.get(thread.id).pendingReviews,1);
+});
+
+test('show_options tells the agent which shots are too tall for the app to draw in full', async () => {
+  const {h,thread,input}=fixture();
+  const tall=path.join(h.home,'phone.png');
+  fs.writeFileSync(tall,makePng(2,17000));
+  const tool=buildThreadbearTools(h.runner,thread.id).find(t=>t.name==='show_options')!;
+  const fine=JSON.stringify(await tool.handler(input as any,{} as any));
+  assert.doesNotMatch(fine,/shrunk/);
+  const withTall={...input,options:input.options.map(o=>o.id==='B'?{...o,shots:[{path:tall}]}:o)};
+  const warned=JSON.stringify(await tool.handler(withTall as any,{} as any));
+  assert.match(warned,/B shot 2 \(2 x 17000\)/);
+  assert.match(warned,/split each into shots no more than 16384 px/);
 });
 
 test('failed atomic save keeps a review pending, and an accepted outbox repairs a missing card after restart', async () => {
@@ -418,4 +432,308 @@ test('the Mac, phone and GPUI bubbles know the passed-over line', () => {
   const root=path.join(import.meta.dirname,'../../..');
   for (const file of ['app/Sources/ThreadbearCore/Protocol/DesignReview.swift','ios/ThreadbearKit/Sources/ThreadbearKit/ReviewAnswer.swift','desktop/core/src/reducer/event.rs'])
     assert.ok(fs.readFileSync(path.join(root,file),'utf8').includes(JSON.stringify(PASSED_OVER_TAIL)),file);
+});
+
+// Mike, 17 Nov: a picture pasted in the review window went in as its file
+// path. A reply carries pictures as a message does, [Picture N] in its words.
+test('a reply can carry pictures: kept with the review, sent with the answer, only from inbox/', async () => {
+  const {h,thread,source,input}=fixture();
+  const {review}=h.runner.createReview(thread.id,input);
+  const pasted=h.runner.importMedia(source).image;
+  const saved=h.runner.saveReview(thread.id,review.id,0,{pickedId:'A',notes:{},reply:'Is the apple cut off? [Picture 1]',images:[pasted]}).review;
+  const kept=saved.draft.images![0];
+  assert.notEqual(kept.path,pasted.path,'copied in beside the review, so inbox/ can be cleaned');
+  assert.match(kept.path,new RegExp(`reviews[\\\\/]${review.id}[\\\\/]reply[\\\\/]`));
+  assert.equal(kept.mediaType,'image/png');
+  // Saved again as the window has it now: the same copy, not another.
+  const again=h.runner.saveReview(thread.id,review.id,saved.revision,{...saved.draft}).review;
+  assert.equal(again.draft.images![0].path,kept.path);
+  assert.equal(fs.readdirSync(path.dirname(kept.path)).length,1);
+  // Any other file is refused, a link into inbox/ too.
+  assert.throws(()=>h.runner.saveReview(thread.id,review.id,again.revision,{notes:{},images:[{path:source,mediaType:'image/png'}]}),/media.import/);
+  const link=path.join(path.dirname(pasted.path),'link.png');
+  fs.symlinkSync(source,link);
+  assert.throws(()=>h.runner.saveReview(thread.id,review.id,again.revision,{notes:{},images:[{path:link,mediaType:'image/png'}]}),/not found/i);
+  assert.throws(()=>h.runner.saveReview(thread.id,review.id,again.revision,{notes:{},images:'x'} as any),/list/);
+  // Pictures alone are an answer; a retry naming the inbox copy is the same one.
+  const second=h.runner.createReview(thread.id,input).review;
+  const answer={notes:{},images:[pasted]};
+  const sent=h.runner.respondReview(thread.id,second.id,0,answer);
+  assert.deepEqual(h.runner.respondReview(thread.id,second.id,0,answer),sent);
+  const answered=h.runner.respondReview(thread.id,review.id,again.revision,{pickedId:'A',notes:{},reply:'Is the apple cut off? [Picture 1]',images:[pasted]});
+  assert.equal(answered.review.status,'answered');
+  h.adapter.last.result(); await tick();
+  h.adapter.last.result(); await tick();
+  const message=h.runner.events(thread.id,{limit:1000}).events.find(e=>e.type==='user.message'&&e.reviewId===review.id) as any;
+  assert.ok(message,'the answer went to the agent');
+  assert.equal(message.images.length,1);
+  assert.match(message.text,/Picked A\. First\.\n\nIs the apple cut off\? \[Picture 1\]/);
+  // Its copy outlives inbox/.
+  fs.rmSync(pasted.path);
+  assert.ok(fs.existsSync(message.images[0].path));
+});
+
+test('a client from before reply pictures keeps them; a moved review brings none', () => {
+  const {h,thread,source,input}=fixture();
+  const {review}=h.runner.createReview(thread.id,input);
+  const pasted=h.runner.importMedia(source).image;
+  const saved=h.runner.saveReview(thread.id,review.id,0,{notes:{},reply:'[Picture 1]',images:[pasted]}).review;
+  // The Swift app's draft has no images: the saved one stays with its marker.
+  const older=h.runner.saveReview(thread.id,review.id,saved.revision,{pickedId:'A',notes:{},reply:'[Picture 1]'}).review;
+  assert.deepEqual(older.draft.images,saved.draft.images);
+  // images: [] takes it away.
+  assert.equal(h.runner.saveReview(thread.id,review.id,older.revision,{notes:{},images:[]}).review.draft.images,undefined);
+  // Another runner's pictures name its files, which could be any file here.
+  const own={threadId:thread.id,now:h.store.mediaDir(thread.id),final:h.store.mediaDir(thread.id)};
+  const moved=fitReview({...review,status:'answered',replyTurnId:'t',response:{notes:{},images:[{path:'/Users/someone/private.png',mediaType:'image/png'}]},draft:{notes:{},images:[{path:'/etc/hosts',mediaType:'image/png'}]}},own)!;
+  assert.equal(moved.response!.images,undefined);
+  assert.equal(moved.draft.images,undefined);
+  // Recovered from the log, as a moved thread's own events are: only this
+  // review's own copies stay.
+  const st=(h.runner as any).threads.get(thread.id);
+  const kept=older.draft.images![0];
+  const link=path.join(path.dirname(kept.path),'link.png');
+  fs.symlinkSync(source,link);
+  const fitted=h.runner.ownReplyImages(st,{...review,draft:{notes:{},images:[kept,{path:'/etc/hosts',mediaType:'image/png'},{path:link,mediaType:'image/png'}]},response:{notes:{},images:[{path:source,mediaType:'image/png'}]}});
+  assert.deepEqual(fitted.draft.images,[kept]);
+  assert.equal(fitted.response!.images,undefined);
+  // An id that climbs out of the reviews folder owns nothing, even pictures that are real copies.
+  const climbing=path.relative(path.join(h.store.mediaDir(thread.id),'reviews'),path.dirname(path.dirname(kept.path)));
+  assert.equal(h.runner.ownReplyImage(st,`../reviews/${climbing}`,kept),false);
+  assert.equal(h.runner.ownReplyImage(st,review.id,kept),true);
+  // A queued answer keeps only its own pictures through recovery.
+  st.rec.queue.push({turnId:'t-q',text:'x',images:[kept,{path:source,mediaType:'image/png'}],reviewId:review.id,reviewResponse:{notes:{},images:[{path:source,mediaType:'image/png'}]}});
+  h.runner.recoverReviews(st);
+  const queued=st.rec.queue.find((q:any)=>q.turnId==='t-q');
+  assert.deepEqual(queued.images,[kept]);
+  assert.deepEqual(queued.reviewResponse.images,[]);
+  // A malformed one can't make the check fail open.
+  st.rec.queue.push({turnId:'t-bad',text:'x',images:[{path:source,mediaType:'image/png'}, null],reviewId:review.id,reviewResponse:{notes:{},images:{}}} as any);
+  h.runner.recoverReviews(st);
+  const bad=st.rec.queue.find((q:any)=>q.turnId==='t-bad');
+  assert.deepEqual(bad.images,[]);
+  assert.deepEqual(bad.reviewResponse.images,[]);
+  // Nor can a log event that isn't a review: the queue is checked first.
+  st.rec.queue.push({turnId:'t-log',text:'x',images:[{path:source,mediaType:'image/png'}],reviewId:review.id} as any);
+  const log=h.store.log(thread.id);
+  log.append({seq:log.lastSeq+1,ts:new Date().toISOString(),type:'review.updated',review:null} as any);
+  h.runner.recoverReviews(st);
+  assert.deepEqual(st.rec.queue.find((q:any)=>q.turnId==='t-log').images,[]);
+});
+
+// Codex's review, 17 Nov: a moved thread's queue is another runner's word,
+// and a recovery step that throws on it left its pictures unchecked, to be
+// sent next. Whatever path a queued message took, only the thread's own
+// pictures (its media folder, a review's reply copies) reach the agent.
+// Daybreak 159 (21 Nov 2026): a moved review's files are the other runner's
+// word, and the review window reads them as this Mac's once the thread is
+// here. Only the ones that came with the move stay, as this thread's copies.
+test('a moved review keeps only the files that came with it, as this thread\'s copies', () => {
+  const root=fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()),'tb-moved-review-'));
+  const id='0f9e8d7c-1111-4222-8333-444455556666';
+  const rid='5a4b3c2d-aaaa-4bbb-8ccc-ddddeeeeffff';
+  const now=path.join(root,'stage','thread','media');
+  const final=path.join(root,'threads',id,'media');
+  const media={threadId:id,now,final};
+  // What came with the move: a picture, a video's still and copy, a page in its folder.
+  fs.mkdirSync(path.join(now,'reviews',rid,'pagedir'),{recursive:true});
+  for (const f of ['a.png','still.png']) fs.writeFileSync(path.join(now,'reviews',rid,f),makePng(12,8));
+  fs.writeFileSync(path.join(now,'reviews',rid,'clip.mp4'),fakeMp4());
+  fs.writeFileSync(path.join(now,'reviews',rid,'pagedir/index.html'),'<p>page</p>');
+  // A page the other runner calls a video, and a file that's neither.
+  fs.writeFileSync(path.join(now,'reviews',rid,'payload.html'),'<script>x()</script>');
+  fs.writeFileSync(path.join(now,'reviews',rid,'payload.bin'),'x');
+  // A video's first bytes under names that aren't a video's, and a picture's
+  // under a page's name (Codex's and Gemini's second reviews).
+  fs.writeFileSync(path.join(now,'reviews',rid,'clip.svg'),Buffer.concat([fakeMp4(),Buffer.from('<svg onload="x()"/>')]));
+  fs.writeFileSync(path.join(now,'reviews',rid,'clip.pdf'),Buffer.concat([fakeMp4(),Buffer.from('%PDF-1.4')]));
+  fs.writeFileSync(path.join(now,'reviews',rid,'still.html'),makePng(12,8));
+  // This Mac's own files, at paths the other runner named.
+  const local=path.join(root,'mine');
+  fs.mkdirSync(local);
+  for (const f of ['secret.png','home.mp4','notes.html']) fs.writeFileSync(path.join(local,f),'x');
+  // A link that came along as if packed (an older runner placed it).
+  fs.symlinkSync(path.join(local,'secret.png'),path.join(now,'reviews',rid,'link.png'));
+  const theirs=(rest:string)=>({path:`/home/someone/.threadbear/threads/${id}/media/reviews/${rid}/${rest}`,mediaType:'image/png'});
+  const raw={id:rid,title:'T',status:'pending',revision:1,createdAt:'c',updatedAt:'c',recommended:'gone',
+    note:'See [the file](/etc/passwd) or [the site](https://example.com/x) and \\[kept](./x)',
+    options:[
+      {id:'ok',title:'Came',note:'[open](file:///Users/m/secret.png)',url:'file:///etc/passwd',image:theirs('a.png'),shots:[
+        {image:theirs('a.png')},
+        {image:theirs('still.png'),media:{...theirs('clip.mp4'),mediaType:'video/mp4'}},
+        {image:theirs('still.png'),media:{...theirs('pagedir/index.html'),mediaType:'text/html'}},
+        {image:{path:path.join(local,'secret.png'),mediaType:'image/png'}},
+        {image:theirs('still.png'),media:{path:path.join(local,'home.mp4'),mediaType:'video/mp4'}},
+        {image:theirs('link.png')},
+        {image:theirs('../../../../../mine/secret.png')},
+        {image:theirs('still.png'),media:{...theirs('payload.html'),mediaType:'video/mp4'}},
+      ]},
+      {id:'gone',title:'Local only',image:{path:path.join(local,'secret.png'),mediaType:'image/png'},shots:[{image:{path:path.join(local,'notes.html'),mediaType:'text/html'}}]},
+      {id:'other',title:'Another review\'s',image:{path:`/x/${id}/media/reviews/other-review/a.png`,mediaType:'image/png'}},
+      {id:'fallback',title:'First shot stands in',image:{path:path.join(local,'secret.png'),mediaType:'image/png'},shots:[{image:theirs('a.png')},{image:theirs('still.png'),media:{...theirs('payload.bin'),mediaType:'video/mp4'}},{image:{...theirs('payload.bin'),width:99999,height:1}},{image:theirs('still.png'),media:{...theirs('clip.svg'),mediaType:'video/mp4'}},{image:theirs('still.png'),media:{...theirs('clip.pdf'),mediaType:'video/mp4'}},{image:theirs('still.html')}]},
+    ],
+    draft:{notes:{ok:'fine',gone:'gone too'},pickedIds:['ok','gone'],pickedId:'gone'}};
+  const fitted=fitReview(raw,media)!;
+  const here=(rest:string)=>path.join(final,'reviews',rid,...rest.split('/'));
+  assert.deepEqual(fitted.options.map(o=>o.id),['ok','fallback'],'options with nothing that came go');
+  const ok=fitted.options[0]!;
+  assert.equal(ok.image.path,here('a.png'));
+  assert.deepEqual(ok.shots!.map(s=>[s.image.path,s.media?.path]),[
+    [here('a.png'),undefined],
+    [here('still.png'),here('clip.mp4')],
+    [here('still.png'),here('pagedir/index.html')],
+    // Its video wasn't one that came: the still alone.
+    [here('still.png'),undefined],
+    // A page is a page, whatever it was called.
+    [here('still.png'),here('payload.html')],
+  ]);
+  assert.deepEqual(ok.shots!.map(s=>s.media?.mediaType),[undefined,'video/mp4','text/html',undefined,'text/html']);
+  // Neither a video nor a picture: its video goes, and the shot whose picture it was.
+  assert.deepEqual(fitted.options[1]!.shots!.map(s=>[s.image.path,s.media?.path]),[[here('a.png'),undefined],[here('still.png'),undefined],[here('still.png'),undefined],[here('still.png'),undefined]]);
+  assert.deepEqual([ok.image.mediaType,ok.image.width,ok.image.height],['image/png',12,8],'its type and size are the file\'s');
+  assert.equal(ok.url,undefined,'Open live is for web pages only');
+  assert.equal(fitted.options[1]!.image.path,here('a.png'));
+  const every=JSON.stringify(fitted);
+  assert.ok(!every.includes(local),every);
+  assert.ok(!every.includes('/home/someone'),every);
+  assert.equal(fitted.recommended,undefined);
+  assert.deepEqual({...fitted.draft.notes},{ok:'fine'});
+  assert.deepEqual(fitted.draft.pickedIds,['ok']);
+  assert.equal(fitted.draft.pickedId,undefined);
+  // A note's links but web pages are only words, and doing it again changes nothing.
+  assert.equal(fitted.note,'See [the file]\\(/etc/passwd) or [the site](https://example.com/x) and \\[kept]\\(./x)');
+  assert.equal(ok.note,'[open]\\(file:///Users/m/secret.png)');
+  assert.deepEqual(fitReview(fitted,{threadId:id,now:final,final:final}) ?? 'gone','gone','the copies are where now will be, not there yet');
+  fs.mkdirSync(path.dirname(final),{recursive:true});
+  fs.renameSync(now,final);
+  assert.deepEqual(fitReview(fitted,{threadId:id,now:final,final}),fitted,'again, once adopted');
+  // The window's parser makes a link only from a ]( and takes the address
+  // to the next parenthesis: none is left but before a web address alone.
+  // The second is Codex's and Gemini's: a code span the parser ends inside a
+  // web link's address.
+  for (const note of ['[[x](https://a.b)](/etc/passwd)','`[x](https://example.test/`[open)](/Users/victim/private.md)','\\\\[x](/etc)','`a\\`[x](/etc)`','[a [b] c](/etc)','[x]( /etc )','[x](https://a.b/(y))','[x](https://a b)','[x](\nhttps://a.b)','[open](\uFEFFhttps://x/../../private.png)','[open](\u00A0https://x)','[open](https://x\u3000)','plain']) {
+    const out=webLinksOnly(note);
+    assert.equal(webLinksOnly(out),out,note);
+    // Only ASCII spaces round the address, which Rust's trim takes too.
+    for (let i=out.indexOf(']('); i>=0; i=out.indexOf('](',i+1)) assert.match(out.slice(i+1),/^\([ \t\r\n]*https?:\/\/[!-'*-~]*[ \t\r\n]*\)/i,out);
+    assert.equal(out.replaceAll(']\\(','](') ,note.replaceAll(']\\(','](') ,'the words stay');
+  }
+  // A draft and response in shapes the runner works with (Gemini's third review).
+  const here2={threadId:id,now:final,final};
+  const shaped=fitReview({...raw,draft:null,response:{reply:'ok'}},here2)!;
+  assert.deepEqual(shaped.draft,{notes:{}});
+  assert.deepEqual(shaped.response,{reply:'ok',notes:{}});
+  assert.equal(fitReview({...raw,response:'x'},here2)!.response,undefined);
+  // A review with nothing that came isn't a review here.
+  assert.equal(fitReview({...raw,options:[raw.options[1]]},media),undefined);
+  fs.rmSync(root,{recursive:true,force:true});
+});
+
+// Daybreak 159: the moved log's review.updated events are the other runner's
+// word too, and recoverReviews takes a later revision from the log.
+test('a review recovered from the log keeps only this thread\'s own copies', () => {
+  const {h,thread,input}=fixture();
+  const {review}=h.runner.createReview(thread.id,input);
+  const secret=path.join(h.home,'secret.png');
+  fs.writeFileSync(secret,makePng(10,10));
+  const st=(h.runner as any).threads.get(thread.id);
+  const log=h.store.log(thread.id);
+  const evil={...review,revision:99,note:'[x](/etc/passwd)',options:review.options.map((o,i)=>i===0?{...o,image:{path:secret,mediaType:'image/png'},shots:undefined}:o)};
+  log.append({seq:log.lastSeq+1,ts:new Date().toISOString(),type:'review.updated',review:evil} as any);
+  const nothing={...review,id:'11111111-2222-4333-8444-555566667777',revision:5,options:[{...review.options[0],image:{path:secret,mediaType:'image/png'}}]};
+  log.append({seq:log.lastSeq+1,ts:new Date().toISOString(),type:'review.updated',review:nothing} as any);
+  h.runner.recoverReviews(st);
+  const got=st.rec.reviews.find((r:any)=>r.id===review.id);
+  assert.equal(got.revision,99,'the later revision is recovered');
+  assert.deepEqual(got.options.map((o:any)=>o.id),['B','D'],'without the option naming a file of this Mac\'s');
+  assert.ok(!JSON.stringify(st.rec.reviews).includes(secret));
+  // Its words as they were: a log of this Mac's own (a moved one is fitted as it's placed).
+  assert.equal(got.note,'[x](/etc/passwd)');
+  assert.equal(st.rec.reviews.some((r:any)=>r.id===nothing.id),false,'one with nothing of its own is not recovered');
+});
+
+// Gemini's second review: a thread whose record is rebuilt from its log
+// took each review.updated as it was.
+test('a review rebuilt from the log keeps only this thread\'s own copies', () => {
+  const {h,thread,input}=fixture();
+  const {review}=h.runner.createReview(thread.id,input);
+  const secret=path.join(h.home,'secret.png');
+  fs.writeFileSync(secret,makePng(10,10));
+  const log=h.store.log(thread.id);
+  const other={...review,id:'21111111-2222-4333-8444-555566667777',options:[{...review.options[0],image:{path:secret,mediaType:'image/png'}}]};
+  log.append({seq:log.lastSeq+1,ts:new Date().toISOString(),type:'review.updated',review:other} as any);
+  log.append({seq:log.lastSeq+1,ts:new Date().toISOString(),type:'review.updated',review:null} as any);
+  const rec=h.runner.rebuild(thread.id)!;
+  assert.deepEqual(rec.reviews!.map(r=>r.id),[review.id]);
+  assert.ok(!JSON.stringify(rec.reviews).includes(secret));
+});
+
+test('a queued message only sends the thread\'s own pictures', async () => {
+  const {h,thread,source,input}=fixture();
+  const {review}=h.runner.createReview(thread.id,input);
+  const pasted=h.runner.importMedia(source).image;
+  const kept=h.runner.saveReview(thread.id,review.id,0,{notes:{},reply:'[Picture 1]',images:[pasted]}).review.draft.images![0];
+  h.adapter.last.result(); await tick();
+  const st=(h.runner as any).threads.get(thread.id);
+  const media=h.store.mediaDir(thread.id);
+  fs.mkdirSync(media,{recursive:true});
+  const own=path.join(media,'own.png');
+  fs.copyFileSync(source,own);
+  const link=path.join(media,'link.png');
+  fs.symlinkSync(source,link);
+  const sentBefore=h.adapter.last.sent.length;
+  st.rec.queue.push({turnId:'q-own',text:'look [Picture 1] [Picture 2] [Picture 3] [Picture 4]',images:[{path:source,mediaType:'image/png'},{path:own,mediaType:'image/png'},{path:link,mediaType:'image/png'},{path:kept.path,mediaType:'image/png'}]});
+  h.runner.kickQueue(st);
+  await tick();
+  const sent=h.adapter.last.sent.slice(sentBefore).find((m:any)=>m.id==='q-own') as any;
+  assert.ok(sent,'the message still goes');
+  assert.deepEqual(sent.images.map((i:any)=>path.basename(i.path)),['own.png',path.basename(kept.path)]);
+  const logged=h.runner.events(thread.id,{limit:1000}).events.find((e:any)=>e.type==='user.message'&&e.turnId==='q-own') as any;
+  assert.equal(logged.images.length,2,'the transcript shows what went');
+});
+
+// Codex's review of that, 17 Nov: a retry after the session went re-sent a
+// logged message's pictures unchecked; a list that isn't one stalled the
+// queue for good; and a picture left out moved the next one onto its marker.
+test('every send to the CLI checks its pictures, keeps the markers right, and a bad list never stalls the queue', async () => {
+  const {h,thread,source}=fixture();
+  h.adapter.last.result(); await tick();
+  const st=(h.runner as any).threads.get(thread.id);
+  const media=h.store.mediaDir(thread.id);
+  fs.mkdirSync(media,{recursive:true});
+  const own=path.join(media,'own.png');
+  fs.copyFileSync(source,own);
+  // Straight to the session, as the retry after a lost session sends.
+  const before=h.adapter.last.sent.length;
+  st.rt.session.send({id:'direct',text:'Before [Picture 1], after [Picture 2]',images:[{path:source,mediaType:'image/png'},{path:own,mediaType:'image/png'}]});
+  const direct=h.adapter.last.sent[before] as any;
+  assert.deepEqual(direct.images.map((i:any)=>path.basename(i.path)),['own.png']);
+  assert.equal(direct.text,'Before [Picture 1 unavailable], after [Picture 1]');
+  h.adapter.last.result(); await tick();
+  // A queued message whose images aren't a list goes, with none.
+  st.rec.queue.push({turnId:'q-bad',text:'hello',images:{}} as any);
+  st.rec.queue.push({turnId:'q-next',text:'after it',images:[]});
+  h.runner.kickQueue(st); await tick();
+  const sent=h.adapter.last.sent.find((m:any)=>m.id==='q-bad') as any;
+  assert.ok(sent,'it went rather than stalling');
+  assert.deepEqual(sent.images,[]);
+});
+
+test('markers follow the pictures kept', () => {
+  assert.equal(keepPictureMarkers('A [Picture 1], B [Picture 2], C [Picture 3] [Picture 9]',[false,true,true]),'A [Picture 1 unavailable], B [Picture 1], C [Picture 2] [Picture 9]');
+  assert.equal(keepPictureMarkers('same [Picture 1]',[true]),'same [Picture 1]');
+});
+
+// Each option's note is read in the review window, under its pictures at
+// reading size, so the agent is told not to write the options out again in
+// its reply (Mike, 20 and 21 Nov).
+test('show_options tells the agent not to repeat the options in its reply', async () => {
+  const {h,thread,input}=fixture();
+  const tool=buildThreadbearTools(h.runner,thread.id).find(t=>t.name==='show_options')!;
+  // Typed as what the tool is handed, whichever tool the list's type says.
+  const show=tool.handler as unknown as (options: object, extra: object)=>Promise<unknown>;
+  const said=JSON.stringify(await show(input,{}));
+  assert.match(said,/reads each option's note under its pictures in the review window/);
+  assert.match(said,/don't list or describe the options again in your reply/);
+  assert.match(said,/review:[0-9a-f-]{36}/);
 });

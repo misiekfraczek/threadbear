@@ -1,10 +1,14 @@
 // The phones registered for push (phone:registerDevice), as push.ts
 // needs them, and the thread a push is about.
-import { v } from 'convex/values';
-import { internalMutation, internalQuery } from './_generated/server';
+import { ConvexError, v } from 'convex/values';
+import { internalMutation, internalQuery, type MutationCtx } from './_generated/server';
+import type { Id } from './_generated/dataModel';
+import { relayInstall } from './machines';
+import { RELAY_FRESH_MS, RELAY_REGISTER_TIMEOUT_MS, RELAY_VERIFY_SPARE_MS } from './relayInstallStates';
 import { hasLiveToken } from './pushTargets';
 import { runnerName } from './sync';
-import { hasLiveKey, PRESENCE_FRESH_MS } from './lib';
+import { internal } from './_generated/api';
+import { hasLiveKey, PRESENCE_FRESH_MS, presentAt } from './lib';
 import { nextHealth } from './pushHealth';
 
 // Only phones whose token is still good (pushTargets.ts): revoking deletes
@@ -12,14 +16,14 @@ import { nextHealth } from './pushHealth';
 // with no tokenId (from before 5 Nov 2026), is skipped here.
 export const targets = internalQuery({
   args: {},
-  returns: v.array(v.object({ apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), notify: v.union(v.literal('away'), v.literal('always'), v.literal('off')), pushKey: v.optional(v.string()), platform: v.optional(v.literal('android')) })),
+  returns: v.array(v.object({ apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), notify: v.union(v.literal('away'), v.literal('always'), v.literal('off')), pushKey: v.optional(v.string()), platform: v.optional(v.union(v.literal('android'), v.literal('webpush'))), webPush: v.optional(v.object({ p256dh: v.string(), auth: v.string() })) })),
   handler: async (ctx) => {
     const now = Date.now();
     const tokens = await ctx.db.query('tokens').collect();
     const out = [];
     for await (const d of ctx.db.query('devices')) {
       if (!hasLiveToken(d, tokens, now)) continue;
-      out.push({ apnsToken: d.apnsToken, environment: d.environment, notify: d.notify ?? ('away' as const), ...(d.pushKey ? { pushKey: d.pushKey } : {}), ...(d.platform ? { platform: d.platform } : {}) });
+      out.push({ apnsToken: d.apnsToken, environment: d.environment, notify: d.notify ?? ('away' as const), ...(d.pushKey ? { pushKey: d.pushKey } : {}), ...(d.platform ? { platform: d.platform } : {}), ...(d.webPush ? { webPush: d.webPush } : {}) });
     }
     return out;
   },
@@ -42,37 +46,115 @@ export const dropUnlinked = internalMutation({
   },
 });
 
-export const relayInstall = internalQuery({
-  args: { url: v.string() },
-  returns: v.union(v.null(), v.object({ installId: v.string(), installKey: v.string() })),
-  handler: async (ctx, { url }) => {
-    const row = await ctx.db.query('relayInstall').first();
-    return row && row.url === url ? { installId: row.installId, installKey: row.installKey } : null;
+// This deployment's install with the push relay (relayInstallMachine.ts),
+// for a send about to go through it (push.ts relayInstall): its id and key to
+// use, or `register` (this send registers, with `attempt` as its id), or
+// `wait` (another send is registering: ask again shortly, and use its key).
+// `refused`: the attempt whose key the relay just refused, which is cleared
+// only if it's still the one held, so a newer key another send saved since
+// is used rather than replaced.
+const vInstall = v.object({ attempt: v.string(), installId: v.string(), installKey: v.string() });
+export const takeRelayInstall = internalMutation({
+  args: { url: v.string(), attempt: v.string(), refused: v.optional(v.string()) },
+  // failed: the relay turned the last registration down, and the next may only go after a while.
+  returns: v.union(v.object({ use: vInstall }), v.object({ register: v.literal(true) }), v.object({ wait: v.literal(true) }), v.object({ failed: v.literal(true) })),
+  handler: async (ctx, { url, attempt, refused }) => {
+    let row = await relayRegistration(ctx, url);
+    if (!row) {
+      // The first send since relayRegistrations: an install saved before it
+      // is taken over rather than registered again, and the old rows go.
+      const before = await ctx.db.query('relayInstall').take(10);
+      const had = before.find((r) => r.url === url);
+      for (const r of before) await ctx.db.delete('relayInstall', r._id);
+      const made = await relayInstall.create(ctx, { url } as never, had ? { type: 'ADOPT', attempt, installId: had.installId, installKey: had.installKey } : { type: 'REGISTER', attempt });
+      if (made.status !== 'done') throw new ConvexError({ kind: 'conflict', message: `the relay install couldn't be started: ${made.reasons.join(' ')}` });
+      if (!had) return { register: true as const };
+      row = await ctx.db.get('relayRegistrations', made.id as Id<'relayRegistrations'>);
+      if (!row) throw new ConvexError({ kind: 'conflict', message: 'the relay install went missing' });
+    }
+    const state = row.installState;
+    if (state.kind === 'registered') {
+      if (refused !== state.attempt) return { use: { attempt: state.attempt, installId: state.installId, installKey: state.installKey } };
+      await relayInstall.send(ctx, row._id, { type: 'REFUSED', attempt: refused });
+      // Refused as soon as it was given: the relay refuses new keys, and the install waits (RELAY_FRESH_MS).
+      if (Date.now() - state.at < RELAY_FRESH_MS) return { failed: true as const };
+    } else if (state.kind === 'registering' && state.giveUpAt > Date.now()) return { wait: true as const };
+    else if (state.kind === 'unregistered' && state.retryAt > Date.now()) return { failed: true as const };
+    const r = await relayInstall.send(ctx, row._id, { type: 'REGISTER', attempt });
+    if (r.status !== 'done') throw new ConvexError({ kind: 'conflict', message: `couldn't register with the relay: ${r.reasons.join(' ')}` });
+    return { register: true as const };
   },
 });
 
-// Replaces any earlier registration (a new relay URL, or one it forgot).
-export const saveRelayInstall = internalMutation({
-  args: { installId: v.string(), installKey: v.string(), url: v.string() },
+// A registration's answer: the relay's id and key, kept only if this
+// registration (`attempt`) still holds the install. False: another send
+// took over after RELAY_REGISTER_MS, and its answer is the one kept.
+export const relayRegistered = internalMutation({
+  args: { url: v.string(), attempt: v.string(), installId: v.string(), installKey: v.string() },
+  returns: v.boolean(),
+  handler: async (ctx, { url, ...event }) => {
+    const row = await relayRegistration(ctx, url);
+    if (row?.installState.kind !== 'registering' || row.installState.attempt !== event.attempt) return false;
+    return (await relayInstall.send(ctx, row._id, { type: 'REGISTERED', ...event })).status === 'done';
+  },
+});
+
+// A registration the relay turned down: the next send tries again after
+// RELAY_FAILED_RETRY_MS.
+export const relayRegisterFailed = internalMutation({
+  args: { url: v.string(), attempt: v.string() },
   returns: v.null(),
-  handler: async (ctx, a) => {
-    for await (const row of ctx.db.query('relayInstall')) await ctx.db.delete(row._id);
-    await ctx.db.insert('relayInstall', { ...a, createdAt: Date.now() });
+  handler: async (ctx, { url, attempt }) => {
+    const row = await relayRegistration(ctx, url);
+    if (row?.installState.kind === 'registering' && row.installState.attempt === attempt) await relayInstall.send(ctx, row._id, { type: 'FAILED', attempt });
     return null;
   },
 });
+
+// The relay refused a key again after a send registered: cleared, if it's
+// still the one held, so the next send registers (after RELAY_RETRY_MS if
+// the key was new).
+export const relayRefused = internalMutation({
+  args: { url: v.string(), attempt: v.string() },
+  returns: v.null(),
+  handler: async (ctx, { url, attempt }) => {
+    const row = await relayRegistration(ctx, url);
+    if (row?.installState.kind === 'registered' && row.installState.attempt === attempt) await relayInstall.send(ctx, row._id, { type: 'REFUSED', attempt });
+    return null;
+  },
+});
+
+async function relayRegistration(ctx: MutationCtx, url: string) {
+  return await ctx.db.query('relayRegistrations').withIndex('by_url', (q) => q.eq('url', url)).first();
+}
 
 // A registration with the relay starting (push.ts relayInstall). Clears
 // any left from earlier ones that never finished.
+// `attempt` (push.ts register): false, and nothing made, unless that
+// registration holds the install with time for its whole wait and
+// RELAY_VERIFY_SPARE_MS to spare (relayInstallStates.ts).
 export const startRelayCheck = internalMutation({
-  args: { nonce: v.string() },
-  returns: v.null(),
-  handler: async (ctx, { nonce }) => {
+  args: { nonce: v.string(), attempt: v.optional(v.string()) },
+  returns: v.union(v.null(), v.boolean()),
+  handler: async (ctx, { nonce, attempt }) => {
     for await (const row of ctx.db.query('relayChecks')) if (Date.now() - row.createdAt > RELAY_CHECK_MS) await ctx.db.delete(row._id);
-    await ctx.db.insert('relayChecks', { nonce, createdAt: Date.now() });
-    return null;
+    if (attempt !== undefined) {
+      const s = await registeringFor(ctx, attempt);
+      if (!s || s.giveUpAt - Date.now() < RELAY_REGISTER_TIMEOUT_MS + RELAY_VERIFY_SPARE_MS) return false;
+    }
+    await ctx.db.insert('relayChecks', { nonce, createdAt: Date.now(), ...(attempt ? { attempt } : {}) });
+    return true;
   },
 });
+
+// The install's state while `attempt` is registering it, if it is.
+async function registeringFor(ctx: MutationCtx, attempt: string) {
+  for await (const r of ctx.db.query('relayRegistrations')) {
+    const s = r.installState;
+    if (s.kind === 'registering' && s.attempt === attempt) return s;
+  }
+  return null;
+}
 
 // The relay's check (http.ts /relay/verify): true once for a nonce this
 // deployment made in the last few minutes, false for anything else.
@@ -86,20 +168,16 @@ export const takeRelayCheck = internalMutation({
       .first();
     if (!row) return false;
     await ctx.db.delete(row._id);
-    return Date.now() - row.createdAt <= RELAY_CHECK_MS;
+    if (Date.now() - row.createdAt > RELAY_CHECK_MS) return false;
+    if (row.attempt === undefined) return true;
+    // Only while its send still waits for the answer, and still holds the
+    // install: one given up on mustn't replace the key of the registration
+    // that takes over (RELAY_VERIFY_SPARE_MS).
+    return Date.now() - row.createdAt <= RELAY_REGISTER_TIMEOUT_MS && (await registeringFor(ctx, row.attempt)) !== null;
   },
 });
 
 const RELAY_CHECK_MS = 5 * 60_000;
-
-export const clearRelayInstall = internalMutation({
-  args: {},
-  returns: v.null(),
-  handler: async (ctx) => {
-    for await (const row of ctx.db.query('relayInstall')) await ctx.db.delete(row._id);
-    return null;
-  },
-});
 
 // After each send (push.ts sendAlert): whether any got through
 // (pushHealth.ts), for the owner runner's heartbeat to report.
@@ -119,16 +197,25 @@ export const pushOutcome = internalMutation({
 });
 
 // Marks a thread's push as held for "away" phones while Mike is at the Mac;
-// sync:setPresence sends it when he leaves.
+// sync:setPresence sends it when he leaves. push.notify read that he was
+// there, but he may have left since, and the drain his leaving started may
+// be over: a push held now would wait for his next leave, maybe for good
+// (Codex's review of Daybreak 148). So it asks again here, in the same
+// transaction as the write, and sends it to the away phones instead. Once:
+// a push that comes back here away again (`retried`, a runner flipping its
+// presence between notify's read and this) is held, so no flipping can keep
+// one push bouncing between notify and here (verify-fix on that change).
 export const holdPush = internalMutation({
-  args: { threadId: v.string() },
+  args: { threadId: v.string(), retried: v.optional(v.boolean()) },
   returns: v.null(),
-  handler: async (ctx, { threadId }) => {
+  handler: async (ctx, { threadId, retried }) => {
     const t = await ctx.db
       .query('threads')
       .withIndex('by_threadId', (q) => q.eq('threadId', threadId))
       .unique();
-    if (t && t.needsYou) await ctx.db.patch(t._id, { pushHeldAt: Date.now() });
+    if (!t || !t.needsYou) return null;
+    if (retried || (await presentAt(ctx, t.runnerId))) await ctx.db.patch(t._id, { pushHeldAt: Date.now() });
+    else await ctx.scheduler.runAfter(0, internal.push.notify, { threadId, held: true, retried: true });
     return null;
   },
 });
@@ -177,5 +264,28 @@ export const list = internalQuery({
     const out = [];
     for await (const d of ctx.db.query('devices')) out.push({ platform: d.platform ?? 'apple', environment: d.environment, tokenName: d.tokenName, updatedAt: new Date(d.updatedAt).toISOString(), tokenTail: d.apnsToken.slice(-6), notify: d.notify ?? 'away' });
     return out;
+  },
+});
+
+// This deployment's VAPID key (API 93, webPush.ts): the one that's there, or
+// `candidate` (made by the caller, as a mutation can't make keys) when there's
+// none yet. Two callers racing both get whichever was saved first.
+export const vapidKey = internalQuery({
+  args: {},
+  returns: v.union(v.null(), v.object({ x: v.string(), y: v.string(), d: v.string() })),
+  handler: async (ctx) => {
+    const row = await ctx.db.query('webPushVapid').first();
+    return row ? { x: row.x, y: row.y, d: row.d } : null;
+  },
+});
+
+export const putVapidKey = internalMutation({
+  args: { x: v.string(), y: v.string(), d: v.string() },
+  returns: v.object({ x: v.string(), y: v.string(), d: v.string() }),
+  handler: async (ctx, candidate) => {
+    const row = await ctx.db.query('webPushVapid').first();
+    if (row) return { x: row.x, y: row.y, d: row.d };
+    await ctx.db.insert('webPushVapid', { ...candidate, createdAt: Date.now() });
+    return candidate;
   },
 });

@@ -6,9 +6,9 @@
 // until then, with Not now. Until it's installed, diagrams and pages show
 // their source and panels offer the browser, so the app works without it.
 use crate::push_button::PushButton;
+use crate::spinner::Spinner;
 use crate::style::{self, px};
 use futures::StreamExt as _;
-use crate::spinner::Spinner;
 use gpui_kit::component::{h_flex, v_flex, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -22,6 +22,9 @@ use threadbear_core::web_runtime::{self as core, InstallError, Layout, State};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Engine {
     Off,
+    /// Another process has Chromium's profile (this pid): the copy of the
+    /// app being handed over from, until it quits. Started once it lets go.
+    Waiting(u32),
     Starting,
     Running,
     Failed(String),
@@ -37,7 +40,19 @@ pub(crate) struct WebRuntime {
     pub(crate) cancelling: bool,
     cancel: Arc<AtomicBool>,
     pub(crate) engine: Engine,
+    /// Waited `HOLDER_WAIT` for the profile's holder already this run: the
+    /// next start goes ahead, and Chromium says if it's still in use.
+    waited: bool,
+    /// Try again asked for a restart, which hasn't happened yet.
+    restarting: bool,
 }
+
+/// How long a start waits for another process to let go of the profile. A
+/// handover's old copy quits within a few seconds of the new one showing
+/// (20 s at most, handover.rs); past this it's something else (a second
+/// copy on the same data folder, a lock whose pid was reused), and Chromium
+/// is left to say.
+const HOLDER_WAIT: Duration = Duration::from_secs(45);
 
 struct Shared(Entity<WebRuntime>);
 impl Global for Shared {}
@@ -56,7 +71,16 @@ pub(crate) fn init(cx: &mut App) {
         (Some(_), Some(_)) if cfg!(target_os = "macos") => State::Missing,
         _ => State::Unavailable,
     };
-    let entity = cx.new(|_| WebRuntime { layout, state, not_now: false, cancelling: false, cancel: Arc::new(AtomicBool::new(false)), engine: Engine::Off });
+    let entity = cx.new(|_| WebRuntime {
+        layout,
+        state,
+        not_now: false,
+        cancelling: false,
+        cancel: Arc::new(AtomicBool::new(false)),
+        engine: Engine::Off,
+        waited: false,
+        restarting: false,
+    });
     cx.set_global(Shared(entity));
 }
 
@@ -68,8 +92,12 @@ pub(crate) fn runtime(cx: &App) -> Option<Entity<WebRuntime>> {
 /// its bundle (desktop/scripts/install-app.sh puts it there) or a cargo
 /// target folder.
 fn helper_binary() -> Result<std::path::PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("couldn't find the app's own binary: {e}"))?;
-    let helper = exe.parent().ok_or("the app's binary has no folder")?.join("threadbear-web-helper");
+    let exe =
+        std::env::current_exe().map_err(|e| format!("couldn't find the app's own binary: {e}"))?;
+    let helper = exe
+        .parent()
+        .ok_or("the app's binary has no folder")?
+        .join("threadbear-web-helper");
     if helper.is_file() {
         Ok(helper)
     } else {
@@ -86,23 +114,42 @@ impl WebRuntime {
 
     /// `local`: an archive already on disk (only the scripted control passes
     /// one), held to the same pinned hash as a download.
-    pub(crate) fn install_from(&mut self, local: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+    pub(crate) fn install_from(
+        &mut self,
+        local: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.busy() || matches!(self.state, State::Ready | State::Unavailable) {
             return;
         }
-        let (Some(archive), Some(layout)) = (core::this_archive(), self.layout.clone()) else { return };
+        let (Some(archive), Some(layout)) = (core::this_archive(), self.layout.clone()) else {
+            return;
+        };
         self.cancel.store(false, Ordering::Release);
         self.cancelling = false;
         self.not_now = false;
-        self.state = State::Downloading { received: 0, total: archive.bytes };
+        self.state = State::Downloading {
+            received: 0,
+            total: archive.bytes,
+        };
         cx.notify();
         let cancel = self.cancel.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<Update>();
-        let started = std::thread::Builder::new().name("web-runtime-install".into()).spawn(move || {
-            let progress = tx.clone();
-            let result = threadbear_web::download::install(archive, &layout, local.as_deref(), &mut |p| { let _ = progress.unbounded_send(Update::Progress(p)); }, &cancel);
-            let _ = tx.unbounded_send(Update::Done(result));
-        });
+        let started = std::thread::Builder::new()
+            .name("web-runtime-install".into())
+            .spawn(move || {
+                let progress = tx.clone();
+                let result = threadbear_web::download::install(
+                    archive,
+                    &layout,
+                    local.as_deref(),
+                    &mut |p| {
+                        let _ = progress.unbounded_send(Update::Progress(p));
+                    },
+                    &cancel,
+                );
+                let _ = tx.unbounded_send(Update::Done(result));
+            });
         if let Err(e) = started {
             self.state = State::Failed(format!("couldn't start the download ({e})"));
             cx.notify();
@@ -113,11 +160,18 @@ impl WebRuntime {
                 let done = matches!(update, Update::Done(_));
                 let alive = this.update(cx, |this, cx| {
                     match update {
-                        Update::Progress(threadbear_web::Progress::Downloading { received, total }) => this.state = State::Downloading { received, total },
-                        Update::Progress(threadbear_web::Progress::Unpacking) => this.state = State::Unpacking,
+                        Update::Progress(threadbear_web::Progress::Downloading {
+                            received,
+                            total,
+                        }) => this.state = State::Downloading { received, total },
+                        Update::Progress(threadbear_web::Progress::Unpacking) => {
+                            this.state = State::Unpacking
+                        }
                         Update::Done(Ok(())) => this.state = State::Ready,
                         Update::Done(Err(InstallError::Cancelled)) => this.state = State::Missing,
-                        Update::Done(Err(InstallError::Failed(why))) => this.state = State::Failed(why),
+                        Update::Done(Err(InstallError::Failed(why))) => {
+                            this.state = State::Failed(why)
+                        }
                     }
                     if done {
                         this.cancelling = false;
@@ -149,7 +203,8 @@ impl WebRuntime {
     /// Whether whatever needs the runtime should ask: not installed, not
     /// turned down this run, and possible here.
     pub(crate) fn asks(&self) -> bool {
-        !self.not_now && matches!(self.state, State::Missing | State::Failed(_)) || self.state.busy()
+        !self.not_now && matches!(self.state, State::Missing | State::Failed(_))
+            || self.state.busy()
     }
 
     /// Starts Chromium if it's installed and isn't running yet, and says
@@ -158,17 +213,37 @@ impl WebRuntime {
     pub(crate) fn ensure_engine(&mut self, cx: &mut Context<Self>) -> bool {
         match &self.engine {
             Engine::Running => return true,
-            Engine::Starting | Engine::Failed(_) => return false,
+            Engine::Waiting(_) | Engine::Starting | Engine::Failed(_) => return false,
             Engine::Off => {}
         }
         if self.state != State::Ready {
             return false;
         }
-        let Some(layout) = self.layout.clone() else { return false };
+        let Some(layout) = self.layout.clone() else {
+            return false;
+        };
+        // Chromium refuses a profile another process has, and a refused
+        // start is final for this process (CEF: exit without calling it
+        // again). A handover's new copy draws its panels while the old one
+        // still has Chromium running (16 Nov: every web panel said "didn't
+        // start" until a restart), so it waits for that one to let go.
+        if !self.waited {
+            if let Some(pid) = core::profile_holder(&layout.profile()) {
+                self.wait_for_holder(pid, layout.profile(), cx);
+                return false;
+            }
+        }
         let started = helper_binary().and_then(|helper| {
-            let bundle = threadbear_web::bundle_identifier().unwrap_or_else(|| "threadbear.desktop.dev".into());
+            let bundle = threadbear_web::bundle_identifier()
+                .unwrap_or_else(|| "threadbear.desktop.dev".into());
             let helper = core::make_helpers(&layout, &helper, &bundle)?;
-            threadbear_web::start(threadbear_web::Launch { bundle: layout.runtime_bundle(), framework: layout.framework(), helper, profile: layout.profile(), log_file: layout.log_file() })
+            threadbear_web::start(threadbear_web::Launch {
+                bundle: layout.runtime_bundle(),
+                framework: layout.framework(),
+                helper,
+                profile: layout.profile(),
+                log_file: layout.log_file(),
+            })
         });
         match started {
             Ok(()) => {
@@ -178,11 +253,15 @@ impl WebRuntime {
                     // means something's wrong.
                     let since = std::time::Instant::now();
                     loop {
-                        cx.background_executor().timer(Duration::from_millis(50)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
                         let engine = match threadbear_web::status() {
                             threadbear_web::Status::Ready => Engine::Running,
                             threadbear_web::Status::Failed(why) => Engine::Failed(why),
-                            _ if since.elapsed() > Duration::from_secs(60) => Engine::Failed("Chromium didn't start within a minute".into()),
+                            _ if since.elapsed() > Duration::from_secs(60) => {
+                                Engine::Failed("Chromium didn't start within a minute".into())
+                            }
                             _ => continue,
                         };
                         let _ = this.update(cx, |this, cx| {
@@ -200,6 +279,95 @@ impl WebRuntime {
         false
     }
 
+    fn wait_for_holder(&mut self, pid: u32, profile: std::path::PathBuf, cx: &mut Context<Self>) {
+        threadbear_client::log::write(
+            "web-runtime",
+            &format!("profile in use by pid {pid}; waiting for it to let go"),
+        );
+        self.engine = Engine::Waiting(pid);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let since = std::time::Instant::now();
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let holder = core::profile_holder(&profile);
+                if holder.is_none() || since.elapsed() > HOLDER_WAIT {
+                    threadbear_client::log::write(
+                        "web-runtime",
+                        &match holder {
+                            None => format!(
+                                "pid {pid} let go of the profile after {:.1} s; starting",
+                                since.elapsed().as_secs_f32()
+                            ),
+                            Some(still) => format!(
+                                "pid {still} still has the profile after {} s; starting anyway",
+                                HOLDER_WAIT.as_secs()
+                            ),
+                        },
+                    );
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                if matches!(this.engine, Engine::Waiting(_)) {
+                    this.engine = Engine::Off;
+                    this.waited = true;
+                    this.ensure_engine(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Whether Try again can start Chromium in this run of the app. Once
+    /// Chromium's own start has run and failed, only a new process can.
+    pub(crate) fn retry_here(&self) -> bool {
+        matches!(self.engine, Engine::Failed(_)) && !threadbear_web::initialize_called()
+    }
+
+    /// Try again after a failed start: here if it can be, else by
+    /// restarting the app (`RestartApp`), which keeps the window and the
+    /// place as Restart to Update does.
+    pub(crate) fn try_again(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.engine, Engine::Failed(_)) {
+            return;
+        }
+        if self.retry_here() && threadbear_web::retry() {
+            self.engine = Engine::Off;
+            self.waited = false;
+            self.ensure_engine(cx);
+            cx.notify();
+        } else {
+            // To the main window, whose handlers take it (shell.rs), from
+            // wherever the click was (Settings has none), once this update
+            // is over: the click may be in the main window itself.
+            let Some(main) = crate::window_menu::main_window(cx) else {
+                return;
+            };
+            self.restarting = true;
+            cx.notify();
+            cx.defer(move |cx| {
+                let _ = main.update(cx, |_, window, cx| {
+                    window.dispatch_action(Box::new(crate::shell::RestartApp), cx)
+                });
+            });
+            // A restart quits this copy within seconds. One that was refused
+            // or never happened gives the button back.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.restarting = false;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
     pub(crate) fn dump(&self) -> Value {
         json!({
             "state": self.state.name(),
@@ -207,14 +375,46 @@ impl WebRuntime {
             "percent": self.state.percent(),
             "notNow": self.not_now,
             "cancelling": self.cancelling,
+            "restarting": self.restarting,
+            "retryHere": self.retry_here(),
             "engine": match &self.engine {
                 Engine::Off => "off".to_owned(),
+                Engine::Waiting(pid) => format!("waiting for pid {pid}"),
                 Engine::Starting => "starting".to_owned(),
                 Engine::Running => "running".to_owned(),
                 Engine::Failed(why) => format!("failed: {why}"),
             },
         })
     }
+}
+
+/// Try again, under a failed start's words (a web panel's, Settings'): it
+/// starts Chromium again where it can, or else restarts the app, as Chromium
+/// starts only once per process. None when it hasn't failed, or when only a
+/// restart would do and this isn't the installed app (which restarts itself).
+pub(crate) fn try_again_button(id: &str, cx: &App) -> Option<AnyElement> {
+    let runtime = runtime(cx)?;
+    let r = runtime.read(cx);
+    if !matches!(r.engine, Engine::Failed(_)) {
+        return None;
+    }
+    let here = r.retry_here();
+    if !here && !crate::installed::launch().installed {
+        return None;
+    }
+    let (label, tip) = if here {
+        ("Try again", "Start the web runtime again")
+    } else {
+        ("Restart Threadbear", "The web runtime can only start once per run of the app, so it tries again in a new one. The window and what you've typed stay.")
+    };
+    let id = SharedString::from(id.to_owned());
+    Some(
+        PushButton::new(id, label, tip)
+            .busy(r.restarting)
+            .render(cx, move |_, _, cx| {
+                runtime.update(cx, |r, cx| r.try_again(cx))
+            }),
+    )
 }
 
 /// The dump's `webRuntime`.
@@ -240,28 +440,84 @@ pub(crate) fn prompt(id: &str, wants: &str, cx: &App) -> Option<AnyElement> {
         return None;
     }
     let (secondary, label) = (style::secondary_text(cx), style::label_text(cx));
-    let words = |text: String| div().text_size(px(style::size::DETAIL)).line_height(px(17.)).text_color(secondary).child(text);
+    let words = |text: String| {
+        div()
+            .text_size(px(style::size::DETAIL))
+            .line_height(px(17.))
+            .text_color(secondary)
+            .child(text)
+    };
     let row = h_flex().gap(px(8.)).items_center().flex_wrap();
     let id = SharedString::from(id.to_owned());
     let body = match &r.state {
         State::Downloading { received, total } => {
-            let done = if *total > 0 { (*received as f32 / *total as f32).clamp(0., 1.) } else { 0. };
-            let bar = div().w(px(160.)).h(px(4.)).rounded(px(2.)).bg(style::primary_opacity(cx, 0.12)).child(div().h_full().w(relative(done)).rounded(px(2.)).bg(style::accent(cx)));
+            let done = if *total > 0 {
+                (*received as f32 / *total as f32).clamp(0., 1.)
+            } else {
+                0.
+            };
+            let bar = div()
+                .w(px(160.))
+                .h(px(4.))
+                .rounded(px(2.))
+                .bg(style::primary_opacity(cx, 0.12))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(done))
+                        .rounded(px(2.))
+                        .bg(style::accent(cx)),
+                );
             let cancel = runtime.clone();
-            row.child(words(format!("Downloading the web runtime, {} of {} MB", received / 1_000_000, (total + 500_000) / 1_000_000)))
-                .child(bar)
-                .child(PushButton::new(SharedString::from(format!("{id}-cancel")), "Cancel", "Stop downloading the web runtime").busy(r.cancelling).render(cx, move |_, _, cx| cancel.update(cx, |r, cx| r.cancel(cx))))
-                .into_any_element()
+            row.child(words(format!(
+                "Downloading the web runtime, {} of {} MB",
+                received / 1_000_000,
+                (total + 500_000) / 1_000_000
+            )))
+            .child(bar)
+            .child(
+                PushButton::new(
+                    SharedString::from(format!("{id}-cancel")),
+                    "Cancel",
+                    "Stop downloading the web runtime",
+                )
+                .busy(r.cancelling)
+                .render(cx, move |_, _, cx| cancel.update(cx, |r, cx| r.cancel(cx))),
+            )
+            .into_any_element()
         }
-        State::Unpacking => row.child(Spinner::new().color(secondary).with_size(px(11.))).child(words("Unpacking the web runtime".to_owned())).into_any_element(),
+        State::Unpacking => row
+            .child(Spinner::new().color(secondary).with_size(px(11.)))
+            .child(words("Unpacking the web runtime".to_owned()))
+            .into_any_element(),
         State::Failed(why) => {
             let (again, later) = (runtime.clone(), runtime.clone());
             v_flex()
                 .gap(px(6.))
-                .child(div().text_size(px(style::size::DETAIL)).line_height(px(17.)).text_color(style::failed_text(cx)).child(format!("Couldn't install the web runtime: {why}")))
                 .child(
-                    row.child(PushButton::new(SharedString::from(format!("{id}-retry")), "Try again", "Download the web runtime again").render(cx, move |_, _, cx| again.update(cx, |r, cx| r.install(cx))))
-                        .child(PushButton::new(SharedString::from(format!("{id}-not-now")), "Not now", "Show the source, and don't ask again until Threadbear restarts").render(cx, move |_, _, cx| later.update(cx, |r, cx| r.not_now(cx)))),
+                    div()
+                        .text_size(px(style::size::DETAIL))
+                        .line_height(px(17.))
+                        .text_color(style::failed_text(cx))
+                        .child(format!("Couldn't install the web runtime: {why}")),
+                )
+                .child(
+                    row.child(
+                        PushButton::new(
+                            SharedString::from(format!("{id}-retry")),
+                            "Try again",
+                            "Download the web runtime again",
+                        )
+                        .render(cx, move |_, _, cx| again.update(cx, |r, cx| r.install(cx))),
+                    )
+                    .child(
+                        PushButton::new(
+                            SharedString::from(format!("{id}-not-now")),
+                            "Not now",
+                            "Show the source, and don't ask again until Threadbear restarts",
+                        )
+                        .render(cx, move |_, _, cx| later.update(cx, |r, cx| r.not_now(cx))),
+                    ),
                 )
                 .into_any_element()
         }
@@ -284,21 +540,46 @@ pub(crate) fn prompt(id: &str, wants: &str, cx: &App) -> Option<AnyElement> {
 /// Install or Cancel. (Removing it to free the space is for a later change:
 /// it can't go while this run of the app has it loaded.)
 pub(crate) fn settings_control(cx: &App) -> AnyElement {
-    let Some(runtime) = runtime(cx) else { return div().into_any_element() };
+    let Some(runtime) = runtime(cx) else {
+        return div().into_any_element();
+    };
     let r = runtime.read(cx);
     let secondary = style::secondary_text(cx);
-    let text = div().id("settings-web-runtime-state").max_w(px(300.)).text_size(px(13.)).text_color(secondary).child(settings_words(cx));
+    let text = div()
+        .id("settings-web-runtime-state")
+        .max_w(px(300.))
+        .text_size(px(13.))
+        .text_color(secondary)
+        .child(settings_words(cx));
     let mut row = h_flex().gap(px(8.)).items_center().child(text);
     match &r.state {
         State::Missing | State::Failed(_) => {
             let install = runtime.clone();
-            row = row.child(PushButton::new("settings-web-runtime-install", "Install", format!("Download the web runtime ({} MB)", megabytes())).render(cx, move |_, _, cx| install.update(cx, |r, cx| r.install(cx))));
+            row = row.child(
+                PushButton::new(
+                    "settings-web-runtime-install",
+                    "Install",
+                    format!("Download the web runtime ({} MB)", megabytes()),
+                )
+                .render(cx, move |_, _, cx| {
+                    install.update(cx, |r, cx| r.install(cx))
+                }),
+            );
         }
         State::Downloading { .. } => {
             let cancel = runtime.clone();
-            row = row.child(PushButton::new("settings-web-runtime-cancel", "Cancel", "Stop downloading the web runtime").busy(r.cancelling).render(cx, move |_, _, cx| cancel.update(cx, |r, cx| r.cancel(cx))));
+            row = row.child(
+                PushButton::new(
+                    "settings-web-runtime-cancel",
+                    "Cancel",
+                    "Stop downloading the web runtime",
+                )
+                .busy(r.cancelling)
+                .render(cx, move |_, _, cx| cancel.update(cx, |r, cx| r.cancel(cx))),
+            );
         }
         State::Unpacking => row = row.child(Spinner::new().color(secondary).with_size(px(11.))),
+        State::Ready => row = row.children(try_again_button("settings-web-runtime-try-again", cx)),
         _ => {}
     }
     row.into_any_element()
@@ -306,12 +587,19 @@ pub(crate) fn settings_control(cx: &App) -> AnyElement {
 
 /// What the Settings row says (and its dump, for the specs).
 pub(crate) fn settings_words(cx: &App) -> String {
-    let Some(runtime) = runtime(cx) else { return String::new() };
+    let Some(runtime) = runtime(cx) else {
+        return String::new();
+    };
     let r = runtime.read(cx);
     match (&r.state, &r.engine) {
         (State::Ready, Engine::Running) => "Installed, running".to_owned(),
         (State::Ready, Engine::Failed(why)) => format!("Installed, but it didn't start: {why}"),
-        (State::Missing, _) if r.not_now => "Not installed (Not now, until Threadbear restarts)".to_owned(),
+        (State::Ready, Engine::Waiting(pid)) => format!(
+            "Installed, waiting for the last copy of Threadbear (pid {pid}) to let go of it"
+        ),
+        (State::Missing, _) if r.not_now => {
+            "Not installed (Not now, until Threadbear restarts)".to_owned()
+        }
         (state, _) => state.words(),
     }
 }
@@ -329,26 +617,39 @@ pub(crate) const SETTINGS_ABOUT: &str = "Diagrams and pages in replies, and web 
 /// here; `save` writes its picture to that path.
 #[cfg(feature = "automation")]
 pub(crate) async fn automation(cmd: &Value, cx: &mut AsyncApp) -> Result<Value, String> {
-    let runtime = cx.update(|cx| runtime(cx)).ok_or("the web runtime isn't set up")?;
+    let runtime = cx
+        .update(|cx| runtime(cx))
+        .ok_or("the web runtime isn't set up")?;
     let wait = Duration::from_secs_f64(cmd["wait"].as_f64().unwrap_or(0.));
     let since = std::time::Instant::now();
     match cmd["do"].as_str().unwrap_or("") {
         "install" => {
-            let local = cmd["archive"].as_str().filter(|a| !a.is_empty()).map(std::path::PathBuf::from);
+            let local = cmd["archive"]
+                .as_str()
+                .filter(|a| !a.is_empty())
+                .map(std::path::PathBuf::from);
             cx.update(|cx| runtime.update(cx, |r, cx| r.install_from(local, cx)));
             while since.elapsed() < wait && cx.update(|cx| runtime.read(cx).state.busy()) {
-                cx.background_executor().timer(Duration::from_millis(100)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
             }
         }
         "notNow" => cx.update(|cx| runtime.update(cx, |r, cx| r.not_now(cx))),
         "cancel" => {
             cx.update(|cx| runtime.update(cx, |r, cx| r.cancel(cx)));
             while since.elapsed() < wait && cx.update(|cx| runtime.read(cx).state.busy()) {
-                cx.background_executor().timer(Duration::from_millis(100)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
             }
         }
         "start" | "smoke" | "probe" => {
-            let wait = if wait.is_zero() { Duration::from_secs(60) } else { wait };
+            let wait = if wait.is_zero() {
+                Duration::from_secs(60)
+            } else {
+                wait
+            };
             loop {
                 let (running, engine) = cx.update(|cx| {
                     let running = runtime.update(cx, |r, cx| r.ensure_engine(cx));
@@ -361,12 +662,17 @@ pub(crate) async fn automation(cmd: &Value, cx: &mut AsyncApp) -> Result<Value, 
                     return Err(format!("Chromium didn't start: {why}"));
                 }
                 if cx.update(|cx| runtime.read(cx).state != State::Ready) {
-                    return Err(format!("the web runtime isn't installed ({})", cx.update(|cx| runtime.read(cx).state.words())));
+                    return Err(format!(
+                        "the web runtime isn't installed ({})",
+                        cx.update(|cx| runtime.read(cx).state.words())
+                    ));
                 }
                 if since.elapsed() > wait {
                     return Err("Chromium didn't start in time".into());
                 }
-                cx.background_executor().timer(Duration::from_millis(100)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
             }
             if cmd["do"] == "smoke" {
                 return smoke(cmd["save"].as_str()).await;
@@ -375,7 +681,11 @@ pub(crate) async fn automation(cmd: &Value, cx: &mut AsyncApp) -> Result<Value, 
                 return probe(cx).await;
             }
         }
-        other => return Err(format!("do must be install, notNow, cancel, start, smoke or probe, not {other:?}")),
+        other => {
+            return Err(format!(
+                "do must be install, notNow, cancel, start, smoke or probe, not {other:?}"
+            ))
+        }
     }
     Ok(cx.update(|cx| runtime.read(cx).dump()))
 }
@@ -385,8 +695,18 @@ pub(crate) async fn automation(cmd: &Value, cx: &mut AsyncApp) -> Result<Value, 
 async fn smoke(save: Option<&str>) -> Result<Value, String> {
     let page = "<!doctype html><title>ok</title><body style=\"margin:0;background:#2a7a5a;color:white;font:24px -apple-system\"><p style=\"margin:20px\">The web runtime draws.</p>";
     let url = format!("data:text/html;charset=utf-8,{}", percent_encode(page));
-    let (page, loaded) = threadbear_web::Offscreen::open(&url, threadbear_web::Options { javascript: false, width: 400, height: 120, scale: 2. })?;
-    loaded.await.map_err(|_| "the page went away".to_owned())??;
+    let (page, loaded) = threadbear_web::Offscreen::open(
+        &url,
+        threadbear_web::Options {
+            javascript: false,
+            width: 400,
+            height: 120,
+            scale: 2.,
+        },
+    )?;
+    loaded
+        .await
+        .map_err(|_| "the page went away".to_owned())??;
     let png = threadbear_web::picture(&page, 400., 120.).await?;
     if let Some(path) = save {
         std::fs::write(path, &png).map_err(|e| format!("couldn't save the picture: {e}"))?;
@@ -408,7 +728,8 @@ async fn smoke(_save: Option<&str>) -> Result<Value, String> {
 /// the listener.
 #[cfg(all(feature = "automation", target_os = "macos"))]
 async fn probe(cx: &mut AsyncApp) -> Result<Value, String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("no listener: {e}"))?;
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("no listener: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let at = format!("http://127.0.0.1:{port}");
@@ -426,7 +747,9 @@ async fn probe(cx: &mut AsyncApp) -> Result<Value, String> {
     );
     let drawn = threadbear_web::draw_page(&html, 100, 2.).await?;
     // Anything late (a refresh, a prefetch) has a moment to try.
-    cx.background_executor().timer(Duration::from_millis(1500)).await;
+    cx.background_executor()
+        .timer(Duration::from_millis(1500))
+        .await;
     let mut reached = 0;
     while listener.accept().is_ok() {
         reached += 1;
@@ -443,12 +766,16 @@ graph TD
   style A fill:url({at}/style.png)"#
     );
     let diagram = threadbear_web::draw_diagram(&source, 100, 2.).await;
-    cx.background_executor().timer(Duration::from_millis(1500)).await;
+    cx.background_executor()
+        .timer(Duration::from_millis(1500))
+        .await;
     let mut diagram_reached = 0;
     while listener.accept().is_ok() {
         diagram_reached += 1;
     }
-    Ok(json!({ "height": drawn.height, "reached": reached, "diagramDrawn": diagram.is_ok(), "diagramReached": diagram_reached }))
+    Ok(
+        json!({ "height": drawn.height, "reached": reached, "diagramDrawn": diagram.is_ok(), "diagramReached": diagram_reached }),
+    )
 }
 
 #[cfg(all(feature = "automation", not(target_os = "macos")))]

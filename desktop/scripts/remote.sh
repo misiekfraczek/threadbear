@@ -2,10 +2,15 @@
 # Runs a command from this checkout on another machine, so the Rust builds and
 # the spec runs stay off the Mac you're working on (AGENTS.md).
 #
-#   desktop/scripts/remote.sh <ssh host> [--desk] [--perf] [--try] -- <command...>
+#   desktop/scripts/remote.sh <ssh host> [--desk] [--perf] [--try] [--build] -- <command...>
 #
 # --try is for automatic updates: exit 75 instead of queueing behind this
 # checkout's run or either host lease, leaving queued measurements ahead.
+#
+# --build (or THREADBEAR_REMOTE_BUILD=1) says the command only builds: it may
+# run beside other builds on a host that allows more than one at once
+# (~/.cache/threadbear-check/builds-at-once there; scripts/perf-lock.pl), and
+# never beside a measurement, a desk run or a check. Not with --desk or --perf.
 #
 # It copies the checkout, committed or not, less its build folders, to a folder
 # of its own under ~/.cache/threadbear-check/gpui there (so two checkouts at once
@@ -28,6 +33,8 @@ host="${1:?usage: remote.sh <ssh host> [--desk] [--perf] -- <command>}"; shift
 desk=0
 perf=0
 try_flag=""
+build_flag=""
+[ "${THREADBEAR_REMOTE_BUILD:-}" != 1 ] || build_flag="--build "
 # An older remote.sh ignores this request and still builds normally. The
 # updater lives in the app bundle but this script comes from main, which can
 # be rolled back to a version from before --try existed.
@@ -37,11 +44,18 @@ while [ $# -gt 0 ]; do
     --desk) desk=1; shift ;;
     --perf) perf=1; shift ;;
     --try) try_flag="--try "; shift ;;
+    --build) build_flag="--build "; shift ;;
     --) shift; break ;;
     *) break ;;
   esac
 done
 [ $# -gt 0 ] || { echo "no command given" >&2; exit 2; }
+# THREADBEAR_REMOTE_TRACE=1: a timed line on stderr as each step starts, so a
+# run that hangs says how far it got (scripts/nightly-fuzz.sh sets it: a
+# round on 20 Nov printed nothing for 47 minutes, and on 18 Nov one sat in
+# a mkdir on the host all night).
+phase() { [ "${THREADBEAR_REMOTE_TRACE:-}" != 1 ] || echo "remote.sh $(date +%H:%M:%S): $*" >&2; }
+[ -z "$build_flag" ] || [ "$desk" = 0 -a "$perf" = 0 ] || { echo "remote.sh: --build is for plain builds, not with --desk or --perf" >&2; exit 2; }
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 base=".cache/threadbear-check/gpui"
 # Each checkout's folders there are its own, by its path here. A caller whose
@@ -79,6 +93,9 @@ target="$base/target-$key"
 # An array, not a function: a background function is a subshell, and its $!
 # isn't the ssh the signal trap has to kill.
 SSH=(ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=4)
+# "local" is the machine this runs on, for a job on a check host itself
+# (scripts/nightly-fuzz.sh): local-ssh.sh says how.
+[ "$host" != local ] || SSH=("$root/desktop/scripts/local-ssh.sh")
 # wait_run: waits for the background ssh, and says when it was ssh itself that
 # failed (255: the connection dropped, or never came up), so a drop doesn't
 # read as the lock wait or build step that was last printed.
@@ -101,7 +118,10 @@ lock_pid=""
 # of one that has just exited would end the trap before its exit (Codex).
 on_signal() {
   [ -z "$lock_pid" ] || kill "$lock_pid" 2>/dev/null || true
-  pkill -TERM -P $$ 2>/dev/null || true
+  # Children by ps, not pgrep -P: Homebrew's proctools pgrep and pkill are
+  # reported to take -P with no pattern as every process on the machine, so a
+  # stop would signal them all (teodorboev's fork, 14 Nov 2026).
+  for kid in $(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$$" '$2 == p { print $1 }'); do kill -TERM "$kid" 2>/dev/null || true; done
   if [ -n "$ssh_pid" ]; then
     kill "$ssh_pid" 2>/dev/null || true
     "${SSH[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$host" \
@@ -130,6 +150,7 @@ if command -v flock >/dev/null 2>&1; then
 else
   turn_cmd() { turn=(perl -e 'use Fcntl ":flock"; open(my $f, ">&=", 9) or die "remote.sh: no lock file: $!\n"; flock($f, $ARGV[0] ? LOCK_EX : LOCK_EX | LOCK_NB) or exit 1' "$1"); }
 fi
+phase "taking this checkout's turn"
 turn_cmd 0
 if ! "${turn[@]}"; then
   if [ -n "$try_flag" ]; then
@@ -160,11 +181,13 @@ fi
 # guard files first: the worktree copy may not exist yet, or be queued for
 # eviction. No build or capture starts until the final whole-command turn.
 boot="$base/run-$tag-tools"
+phase "making the tools folder on $host"
 # The helpers are written here and then run, so every folder down to them must
 # be this account's own and closed to others, or the run stops: a group with
 # write on the cache could otherwise swap one in between (Codex's review of
 # Daybreak 114/116, 13 Nov). A fresh boot folder each run, never one found there.
 "${SSH[@]}" "$host" "umask 077 && mkdir -p $base && for d in .cache ${base%/*} $base; do [ -d \$d ] && [ ! -L \$d ] && [ -O \$d ] && chmod go-w \$d || { echo \"remote.sh: ~/\$d on $host isn't a folder of this account's own\" >&2; exit 1; }; done && rm -rf $boot && mkdir -m 700 $boot"
+phase "copying the helpers to $host"
 for helper in perf-lock.pl perf-children.pl hangup-guard.sh; do
   "${SSH[@]}" "$host" "cat > $boot/$helper" <"$root/scripts/$helper"
 done
@@ -185,8 +208,9 @@ old_target=""
 precopy="$old_target""mkdir -p $src $target; [ -e $target/.synced-by-content ] || { if [ -d $src ]; then find $src -type f -exec touch -c {} + || exit 9; fi; touch $target/.synced-by-content 2>/dev/null; }; touch $src $target; find $base -mindepth 1 -maxdepth 1 \\( -name 'src-*' -o -name 'target-*' -o -name src -o -name target \\) -mtime +3 ! -name 'src-$key' ! -name '${target##*/}' 2>/dev/null | while IFS= read -r d; do [ -n \"\$(find \"\$d\" -mmin -15 2>/dev/null | head -1)\" ] || rm -rf \"\$d\"; done; find $base -mindepth 1 -maxdepth 1 -name 'run-*' -mmin +720 -exec rm -rf {} + 2>/dev/null; true
 cd \"\$HOME/$base\"
 bash \"\$HOME/$boot/trim-remote-cache.sh\" $key ${target##*/}"
+phase "taking the host's lock, then trimming its cache"
 alive_stdin 7
-remote="env THREADBEAR_REMOTE_SOURCE=\"\$HOME/$src\" THREADBEAR_REMOTE_TARGET=\"\$HOME/$target\" THREADBEAR_REMOTE_TOOLS=\"\$HOME/$boot\" perl $boot/perf-lock.pl ${try_flag}- bash -c $(single_quoted "$precopy")"
+remote="env THREADBEAR_REMOTE_SOURCE=\"\$HOME/$src\" THREADBEAR_REMOTE_TARGET=\"\$HOME/$target\" THREADBEAR_REMOTE_TOOLS=\"\$HOME/$boot\" perl $boot/perf-lock.pl ${build_flag}${try_flag}- bash -c $(single_quoted "$precopy")"
 "${SSH[@]}" "$host" "$remote" <&7 &
 ssh_pid=$!
 rc=0
@@ -213,6 +237,12 @@ fi
 # passed on stale code (11 Nov, thread 699f31d2). Unchanged files keep their
 # time, so they don't rebuild. desktop/scripts/test-remote-freshness.sh <host>
 # plays that case.
+# First, a path that became a link, or stopped being one, since the copy there
+# was made (scripts/fix-link-kinds.sh): rsync can't swap those over itself.
+phase "copying the checkout to $host"
+links=()
+while IFS= read -r l; do links+=("$l"); done < <(bash "$root/scripts/fix-link-kinds.sh" --links "$root")
+"${SSH[@]}" "$host" "bash -c $(printf '%q' "$(cat "$root/scripts/fix-link-kinds.sh")") _ $(printf '%q ' "$src" ${links[@]+"${links[@]}"})" </dev/null
 rsync -rlpDcz -e "${SSH[*]}" --delete --exclude .git --exclude node_modules --exclude .build --exclude target --exclude reports \
   --exclude .fixtures --exclude .swiftpm --exclude dist --exclude DerivedData --exclude .DS_Store \
   "$root/" "$host:$src/"
@@ -269,6 +299,19 @@ export THREADBEAR_SHARED_CARGO_BASE="\$HOME/$base" THREADBEAR_SHARED_CARGO_SRC="
 export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export TMPDIR="\$HOME/$base/tmp"
 mkdir -p "\$TMPDIR"
+# The web runtimes the specs and real-screen tools install, though, go on the
+# home disk. On Tinker Desk $base is an external SSD, and Chromium starts its
+# helpers as apps in their own right: run from that disk, each new build's
+# Threadbear Helper asked macOS for it, with nobody at the screen to answer,
+# and the prompt held Desk Runner's own reads too (19 Nov). The specs' driver
+# also gives the app its temp folder there (features/support/gpui.ts), as the
+# helpers inherit it. That disk is the small one, so this checkout's
+# folder is emptied as each run starts and ends (its runs take turns), and
+# another checkout's, left by a run that was killed, once a day old.
+export THREADBEAR_WEB_RUNTIME_PARENT="\$HOME/.cache/threadbear-check/web-runtimes/$key"
+find "\$HOME/.cache/threadbear-check/web-runtimes" -mindepth 1 -maxdepth 1 ! -name "$key" -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+rm -rf "\$THREADBEAR_WEB_RUNTIME_PARENT"
+mkdir -p "\$THREADBEAR_WEB_RUNTIME_PARENT"
 . scripts/build-priority.sh
 # The shared targets' cargo goes in front of build-priority's, which wrote the
 # real cargo's path into its own as it was made: so the slot's wait and copy
@@ -276,7 +319,7 @@ mkdir -p "\$TMPDIR"
 # priority cargo would have called this one, and this one it, for ever.
 export PATH="\$HOME/$src/desktop/scripts/shared-cargo:\$PATH"
 # What the specs need, the first time this folder's used.
-for dir in features app/Tools/mock-runner runner; do
+for dir in features mock-runner runner; do
   [ -d "\$dir/node_modules" ] || npm ci --silent --prefix "\$dir" >/dev/null 2>&1 || true
 done
 PRELUDE
@@ -285,15 +328,21 @@ PRELUDE
 # on 13 Nov every spec scenario failed with ENOSPC on the cloud box, cargo said
 # nothing, and the run ended 0. So a run that leaves the host under 1 GiB free
 # fails, whatever its command said, and says why.
+# The home disk too, where the web runtimes went (above), and checked before
+# they're cleared, as that's when it was fullest.
 read -r -d '' postlude <<POSTLUDE || true
-kb="\$(df -Pk "\$HOME/$base" 2>/dev/null | awk 'END { print \$4 }')"
-case "\$kb" in
-  ""|*[!0123456789-]*) ;;
-  *) if [ "\$kb" -lt 1048576 ]; then
-       echo "remote.sh: $host has only \$((kb / 1024)) MiB free after this run, so whatever it wrote may have failed for want of space, even if it said it passed. Treating it as failed. Run it again: it gives back idle build folders there first, or says why it can't." >&2
-       [ "\$rc" != 0 ] || rc=1
-     fi ;;
-esac
+for disk in "\$HOME/$base" "\$HOME/.cache/threadbear-check/web-runtimes"; do
+  kb="\$(df -Pk "\$disk" 2>/dev/null | awk 'END { print \$4 }')"
+  case "\$kb" in
+    ""|*[!0123456789-]*) ;;
+    *) if [ "\$kb" -lt 1048576 ]; then
+         echo "remote.sh: $host has only \$((kb / 1024)) MiB free after this run (on the disk with \$disk), so whatever it wrote may have failed for want of space, even if it said it passed. Treating it as failed. Run it again: it gives back idle build folders there first, or says why it can't." >&2
+         [ "\$rc" != 0 ] || rc=1
+         break
+       fi ;;
+  esac
+done
+rm -rf "\$THREADBEAR_WEB_RUNTIME_PARENT"
 exit "\$rc"
 POSTLUDE
 run="$prelude
@@ -306,19 +355,21 @@ $postlude"
 # Named by this run alone: a stopped --desk run's .gone file stays there (the
 # guard's comment says why) until the clear-out above, half a day on.
 script="$base/run-$tag.sh"
+phase "sending the run"
 "${SSH[@]}" "$host" "cat > $script" <<<"$run"
 alive_stdin 7
 # What a run waiting for the host's perf lock is told the holder is running
 # (perf-lock.pl's holder note): the checkout's folder, which names the thread's
 # slot, and the command.
-label="remote.sh from $(basename "$root")$([ "$desk" = 1 ] && printf ' --desk' || true): $*"
+label="remote.sh from $(basename "$root")$([ "$desk" = 1 ] && printf ' --desk' || true)$([ -n "$build_flag" ] && printf ' --build' || true): $*"
 label="THREADBEAR_PERF_LOCK_LABEL=$(single_quoted "${label:0:200}")"
 if [ "$desk" = 1 ]; then
   pidfile="$base/run-$tag.pid"
   remote="env $label THREADBEAR_REMOTE_SOURCE=\"\$HOME/$src\" THREADBEAR_REMOTE_TARGET=\"\$HOME/$target\" perl $src/scripts/perf-lock.pl ${try_flag}--desk $pidfile bash $script $pidfile"
 else
-  remote="env $label THREADBEAR_REMOTE_SOURCE=\"\$HOME/$src\" THREADBEAR_REMOTE_TARGET=\"\$HOME/$target\" perl $src/scripts/perf-lock.pl ${try_flag}- bash $script"
+  remote="env $label THREADBEAR_REMOTE_SOURCE=\"\$HOME/$src\" THREADBEAR_REMOTE_TARGET=\"\$HOME/$target\" perl $src/scripts/perf-lock.pl ${build_flag}${try_flag}- bash $script"
 fi
+phase "taking the host's lock and running: $*"
 "${SSH[@]}" "$host" "$remote; rc=\$?; rm -f $script; rm -rf $boot; exit \$rc" <&7 &
 ssh_pid=$!
 rc=0

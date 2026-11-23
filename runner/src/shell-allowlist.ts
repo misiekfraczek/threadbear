@@ -1,6 +1,6 @@
 // The short list of shell a command that runs by itself may use: a live
 // function's `sh(...)` (badges, `when`, summaries, list panels) and a
-// folder's Claude Code hooks and settings commands (docs/protocol.md,
+// folder's Claude Code hooks and settings commands (docs/protocol/trust.md,
 // "Commands that run by themselves", "Trusting a folder's Claude Code
 // hooks").
 //
@@ -73,6 +73,7 @@ import {
   type ScriptReach,
 } from './script-trust.ts';
 import { inNodeModules, trackedNodeModules } from './tracked-packages.ts';
+import { noHooksPath } from './platform.ts';
 
 export type AllowOptions = FollowOptions & {
   // A live function's command: held to the live list; the runner ends its
@@ -1151,6 +1152,10 @@ class Allow {
       this.refuse(ctx, line, `runs ${byPath ? 'a path to ' : ''}\`${given}\`, which isn't the shell's \`${name}\`: the shell knows its own words only as written, so this runs something else, ${OFF}.`);
     }
     if (SHELL_BUILTINS.has(name)) this.refuse(ctx, line, `uses the shell's \`${name}\`, ${OFF}.`);
+    // On Windows these run package scripts and programs with cmd.exe, which
+    // looks in the folder for a program before PATH (Codex's reviews of the
+    // Windows port, 18 Nov 2026): none is on the list there.
+    if (process.platform === 'win32' && ['npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'bunx'].includes(name)) this.refuse(ctx, line, `runs ${name}, which on Windows runs package scripts and programs with cmd.exe, which this short list can't read.`);
     if (this.o.live) return this.liveProgram(name, args, ctx, line);
     if (name === 'source' || name === '.') return this.source(args, ctx, line);
     if (ALLOWED_BUILTINS.has(name)) return this.builtin(name, args, ctx, line);
@@ -1162,7 +1167,7 @@ class Allow {
     if (name === 'find') return this.find(args, ctx, line);
     if (name === 'awk' || name === 'gawk' || name === 'nawk' || name === 'mawk') return this.awk(args, ctx, line);
     if (HOOK_PROGRAMS.has(name)) return this.hookProgram(name, args, ctx, line);
-    this.refuse(ctx, line, `runs ${name}, which isn't on the short list of programs a Claude Code hook may run: ones that load no code from the folder, run nothing they're handed and write no file (docs/protocol.md, "The short list of shell").`);
+    this.refuse(ctx, line, `runs ${name}, which isn't on the short list of programs a Claude Code hook may run: ones that load no code from the folder, run nothing they're handed and write no file (docs/protocol/trust.md, "The short list of shell").`);
   }
 
   // A live command: only the programs on the live list, in their forms.
@@ -1187,7 +1192,7 @@ class Allow {
       return;
     }
     if (!Object.hasOwn(LIVE, name)) {
-      this.refuse(ctx, line, `runs ${name}, which isn't on the short list of programs a live command may run (docs/protocol.md, "The short list of shell").`);
+      this.refuse(ctx, line, `runs ${name}, which isn't on the short list of programs a live command may run (docs/protocol/trust.md, "The short list of shell").`);
     }
     const operands = this.spec(name, args, ctx, line, LIVE[name]!);
     if (name === 'ssh') this.remoteCommand(operands.slice(1).join(' '), ctx, line);
@@ -1582,6 +1587,10 @@ class Allow {
       const text = scripts[n];
       if (typeof text !== 'string') continue;
       const label = `${this.rel(f)}'s "${n}" script`;
+      // npm runs it with cmd.exe on Windows, which finds a program in the
+      // package's folder before PATH and reads the text by its own rules
+      // (Codex's review of the Windows port, 18 Nov 2026).
+      if (process.platform === 'win32') throw new Refused(`${label} runs with cmd.exe on Windows, which this short list can't read.`);
       let l: List;
       try {
         l = parse(text, true);
@@ -2066,7 +2075,7 @@ function ownGitSettings(env: Record<string, string | undefined>): [string, strin
 export function liveCommandEnv(env: Record<string, string | undefined>): Record<string, string> {
   const pairs: [string, string][] = [
     ['core.fsmonitor', ''],
-    ['core.hooksPath', '/dev/null'],
+    ['core.hooksPath', noHooksPath()],
     ['safe.bareRepository', 'explicit'],
     // A protocol's own setting beats protocol.allow, so the repo's
     // protocol.ext.allow=always would win: each is set here too.

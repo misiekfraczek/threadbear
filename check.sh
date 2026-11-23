@@ -25,7 +25,8 @@
 #                 desktop/ changed, the public site's build (site/)
 #                 when it or the guide changed, and the GPUI specs'
 #                 pairing check (features/verify-pairing.mjs) when a
-#                 spec, its steps or docs/gpui-port/features.md changed
+#                 spec, its steps or docs/gpui-port/features.md changed,
+#                 and their steps' typecheck when features/ changed
 #   --runner      only the runner's typecheck and unit tests, nothing else
 #                 that --quick adds (Convex, web, app tools, iPhone kit), on
 #                 main too: the runner's self-update runs this (deploy.mjs),
@@ -42,15 +43,16 @@
 # The deploy tests (a few minutes) only run when something they cover
 # changed from main: runner/scripts/, launch.mjs, the launcher or the tests
 # themselves. The Swift Mac app is frozen (scripts/swift-freeze.sh), so its
-# build and tests only run when something in app/ or dock/ it builds from
-# changed: not the parts the GPUI app uses (the mock runner, fixtures, art),
+# build and tests only run when something it builds from changed (app/ and
+# dock/, and the iPhone kit's files app/ links to: SWIFT_NEEDS, below): not
+# what it shares with the GPUI app (the mock runner, shared/'s art and Pele),
 # whose own checks are the desktop app's. Except that a change to the mock
 # runner, or to the Swift tests that read it, runs just those tests
 # (swift test --filter, swift-freeze.sh --mock-tests), --quick included,
 # so it needs a Mac. BearDock's tests only run when
 # dock/ changed (the app's own build and tests cover how it uses it). The iPhone app's ThreadbearKit
-# tests run with any of the options when ios/ changed, or a Mac app file
-# ThreadbearKit links to (IOS_NEEDS, below), --quick included, so
+# tests run with any of the options when ios/ or shared/cases changed
+# (IOS_NEEDS, below), --quick included, so
 # `tb land` runs them (MicTapTests guards a crash the phone hit twice). On
 # main itself, with nothing changed, everything but the Swift app runs.
 #
@@ -62,12 +64,21 @@
 # (a new worktree), as SwiftPM's cache only works where it was made. Run
 # it in the background rather than waiting on it.
 #   --e2e         also the runner's end-to-end tests: the real claude CLI on
-#                 claude-haiku-5-5 and login claude-main (TB_E2E_ACCOUNT), then Codex on
+#                 claude-haiku-5-5 and the first Claude login that works (TB_E2E_ACCOUNT,
+#                 else runner/src/test-login.ts's pick), then Codex on
 #                 gpt-6-luna at low effort and a Codex install into a temp
 #                 folder, all in temp folders (several minutes, a few cents;
 #                 TB_E2E_SKIP_CODEX=1 leaves the Codex ones out)
 #   --shots DIR   also save the app's design screenshots to DIR
 #                 (app/Tools/screenshots.sh; look at them afterwards)
+#   --only STEPS  just these steps of the run the other options ask for,
+#                 by the names it prints, ";" between them, and for the
+#                 runner's unit tests optionally the files:
+#                 "site build;runner unit tests=test/unit/a.test.ts test/unit/b.test.ts".
+#                 A failed run ends with the --only that runs what failed
+#                 again. tb land uses it to find which landing of a group
+#                 broke the group's check (THREADBEAR_CHECK_ONLY is the same
+#                 thing, for a check command it can't add options to).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,6 +93,21 @@ ALL=0
 E2E=0
 SHOTS=""
 LOCAL=0
+ONLY=""
+# tb land runs whatever command the repo's patch names as its check, so it
+# asks for --only through the environment; from here on it's the option, which
+# is what reaches a check host.
+if [ -n "${THREADBEAR_CHECK_ONLY:-}" ]; then
+  set -- "$@" --only "$THREADBEAR_CHECK_ONLY"
+  unset THREADBEAR_CHECK_ONLY
+fi
+# And --all: tb land's run of what failed on main, where the Swift steps
+# would otherwise skip with nothing changed and blame nobody (17 Nov: four
+# hours of group checks halving instead).
+if [ "${THREADBEAR_CHECK_ALL:-}" = 1 ]; then
+  set -- "$@" --all
+fi
+unset THREADBEAR_CHECK_ALL
 ARGS=("$@")
 
 while [ $# -gt 0 ]; do
@@ -96,6 +122,10 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "--shots needs a folder" >&2; exit 2; }
       case "$2" in /*) SHOTS="$2" ;; *) SHOTS="$PWD/$2" ;; esac
       shift ;;
+    --only)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--only needs the steps to run" >&2; exit 2; }
+      ONLY="$2"
+      shift ;;
     -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -104,6 +134,28 @@ done
 
 if [ "$QUICK" = 1 ] && [ "$APP_ONLY" = 1 ]; then
   echo "--quick is the runner's checks and --app the app's; pick one (or neither for both)." >&2
+  exit 2
+fi
+# THREADBEAR_CHECK_HOST_ONLY (below, where the host is picked): a run that's
+# for a check host or nowhere. A check command that itself says --local or
+# --e2e would run it here all the same (Codex's review, 17 Nov), in tb
+# land's own checkout with no packages installed. On a host this isn't set:
+# ssh doesn't carry it.
+if [ -n "${THREADBEAR_CHECK_HOST_ONLY:-}" ] && { [ "$LOCAL" = 1 ] || [ "$E2E" = 1 ]; }; then
+  echo "This check runs on this Mac (--local or --e2e), and this run was only for a check host."
+  exit 4
+fi
+# plain <text> <regex>: whether all of it matches, a line break included
+# (grep would take each line by itself), whatever the locale's letters are.
+plain() {
+  local LC_ALL=C
+  [[ "$1" =~ $2 ]]
+}
+# Step names and test file paths only: it's passed to a check host's shell
+# and its file names to node.
+ONLY_CHARS='^[A-Za-z0-9 ._/=;()-]*$'
+if ! plain "$ONLY" "$ONLY_CHARS" || [ "${ONLY#-}" != "$ONLY" ]; then
+  echo "--only takes step names with ; between them (and =files for the runner's unit tests), not: $ONLY" >&2
   exit 2
 fi
 
@@ -134,10 +186,24 @@ if [ "$LOCAL" = 0 ] && [ "$E2E" = 0 ]; then
   else
     CHECK_HOST="$(configured_hosts)"
   fi
+  # THREADBEAR_CHECK_HOST_ONLY: a run that's for a check host or nowhere. tb
+  # land sets it for the runs that look for the landing that broke a group
+  # (--only, above): those are in a checkout of its own with no packages
+  # installed, and several in a row on the Mac someone's working on would be
+  # worse than the halving it falls back to. 4, with no step having failed,
+  # is nobody's fault.
+  if [ -z "$CHECK_HOST" ] && [ -n "${THREADBEAR_CHECK_HOST_ONLY:-}" ]; then
+    echo "No check host is set, and this run was only for one."
+    exit 4
+  fi
   if [ -n "$CHECK_HOST" ]; then
     "$ROOT/scripts/check-remote.sh" "$CHECK_HOST" ${ARGS[@]+"${ARGS[@]}"}
     code=$?
     [ "$code" = 255 ] || exit "$code"
+    if [ -n "${THREADBEAR_CHECK_HOST_ONLY:-}" ]; then
+      echo "No check host could take it, and this run was only for one."
+      exit 4
+    fi
     echo "So the checks run on this Mac instead, at low priority."
     # How low is runner.json's jobPriority (runner/src/background.ts), or
     # THREADBEAR_JOB_PRIORITY: background is taskpolicy -b (Mike's, for his
@@ -175,7 +241,7 @@ FALLBACK="${THREADBEAR_CHECK_FALLBACK:-}"
 # check-remote tests run under it would otherwise exit with it (Codex, 9 Nov).
 unset THREADBEAR_HOME THREADBEAR_DATA_DIR THREADBEAR_PORT THREADBEAR_URL THREADBEAR_LOG \
   THREADBEAR_THREAD_ID THREADBEAR_THREAD_KEY THREADBEAR_RUNNER_VERSION THREADBEAR_RUNNER_HOME THREADBEAR_CHECK_BUSY_EXIT THREADBEAR_CHECK_FALLBACK \
-  THREADBEAR_CHECK_PREFER THREADBEAR_CHECK_GROUP
+  THREADBEAR_CHECK_PREFER THREADBEAR_CHECK_GROUP THREADBEAR_CHECK_ONLY THREADBEAR_CHECK_HOST_ONLY
 # And their old names, which the runner and tb would otherwise take for these.
 for v in $(compgen -e | grep '^THREADBARE_' || true); do unset "$v"; done
 # The jobs the tests' runners start get no lower than the check itself
@@ -206,36 +272,48 @@ needed() {
 }
 
 # swift_needed [<regex>]: whether the frozen Swift app's build and tests
-# should run: with --app or --all, or when something it builds from (app/
-# and dock/, or <regex>) changed beyond what the GPUI app shares. Unlike
-# needed, not on main with nothing changed, nor for a change to this file.
+# should run: with --app or --all, or when something it builds from changed
+# (<regex>, else SWIFT_NEEDS). Unlike needed, not on main with nothing
+# changed, nor for a change to this file.
 # grep to /dev/null rather than -q: -q stops reading at the first match, and
 # with pipefail the grep -v before it then fails on the closed pipe (Codex's
 # review, 12 Nov: a few thousand changed files said "nothing changed").
-GPUI_SHARED="$("$ROOT/scripts/swift-freeze.sh" --gpui-shared 2>/dev/null)"
-# Without it, nothing counts as shared: an empty pattern would match every
-# line, and every change would look like none.
-[ -n "$GPUI_SHARED" ] || GPUI_SHARED='^$'
+#
+# What it builds from: app/ and dock/, and the iPhone kit's Swift files and
+# Sentry's package that app/ links to (found from its links, as below). Not
+# what the GPUI app shares with it (the mock runner, shared/'s art and Pele):
+# the Swift app is frozen, and a change to those doesn't build it. The mock
+# runner's own Swift tests still run (swift-freeze.sh --mock-tests).
+ROOT_REAL="$(cd "$ROOT" && pwd -P)"
+# links_out <folder> <into-regex>: the files and folders <folder>'s links
+# lead to outside it, matching <into-regex>, as a regex of paths.
+links_out() {
+  local from="$1" into="$2" link to dir out=""
+  while IFS= read -r link; do
+    to="$(readlink "$link")"
+    dir="$(cd "$(dirname "$link")" && cd "$(dirname "$to")" 2>/dev/null && pwd -P)" || continue
+    case "$dir/" in "$ROOT_REAL/$from"/*|"$ROOT_REAL/$from/") continue ;; "$ROOT_REAL"/*) ;; *) continue ;; esac
+    to="$dir/$(basename "$to")"
+    to="${to#"$ROOT_REAL"/}"
+    printf '%s\n' "$to" | grep -E "$into" >/dev/null || continue
+    out="$out|^$(printf '%s' "$to" | sed 's/[][\\.*^$()+?{}|]/\\&/g')"
+    [ -d "$ROOT_REAL/$to" ] && out="$out/"
+  done < <(find "$ROOT_REAL/$from" -type l -not -path '*/.build/*' 2>/dev/null)
+  printf '%s' "$out"
+}
+SWIFT_NEEDS="^(app|dock)/$(links_out app '^ios/')"
 swift_needed() {
   [ "$ALL" = 1 ] || [ "$APP_ONLY" = 1 ] \
-    || printf '%s\n' "$CHANGED" | grep -vE "$GPUI_SHARED" | grep -E "${1:-^(app|dock)/}" >/dev/null
+    || printf '%s\n' "$CHANGED" | grep -E "${1:-$SWIFT_NEEDS}" >/dev/null
 }
 
-# What the iPhone kit's tests cover: ios/, and the Mac app's files that
-# ThreadbearKit builds through links (SlashCommands.swift and the like). On
-# 9 Nov a change to one under app/ used a type the kit didn't have, the
-# kit's tests didn't run as nothing under ios/ had changed, and the iPhone
-# app stopped building on main.
-IOS_NEEDS='^ios/'
-ROOT_REAL="$(cd "$ROOT" && pwd -P)"
-while IFS= read -r link; do
-  to="$(readlink "$link")"
-  dir="$(cd "$(dirname "$link")" && cd "$(dirname "$to")" 2>/dev/null && pwd -P)" || continue
-  case "$dir/$(basename "$to")" in
-    "$ROOT_REAL"/ios/*) ;;
-    "$ROOT_REAL"/*) IOS_NEEDS="$IOS_NEEDS|^$(printf '%s' "${dir#"$ROOT_REAL"/}/$(basename "$to")" | sed 's/[][\\.*^$()+?{}|]/\\&/g')" ;;
-  esac
-done < <(find "$ROOT_REAL/ios" -type l -not -path '*/.build/*' 2>/dev/null)
+# What the iPhone kit's tests cover: ios/, the shared cases, and anything
+# outside ios/ that ThreadbearKit builds through links (none since 21 Nov
+# 2026, when the Swift files it linked from app/ moved into it; the Mac app
+# links to them now). On 9 Nov a change to one under app/ used a type the
+# kit didn't have, the kit's tests didn't run as nothing under ios/ had
+# changed, and the iPhone app stopped building on main.
+IOS_NEEDS="^ios/|^shared/cases/$(links_out ios '.')"
 
 skip() {
   printf 'skip  %-20s (%s; --all runs it)\n' "$1" "$2"
@@ -261,9 +339,44 @@ TMP_ROOT="${TMPDIR:-/tmp}"
 LOGS="$(mktemp -d "${TMP_ROOT%/}/threadbear-check.XXXXXX")"
 FAILED=""
 
+# only_entry <step>: --only's entry for it ("name" or "name=files"), failing
+# when --only was given and doesn't name it. (Loops, not a case: step names
+# have spaces and brackets in them.)
+only_entry() {
+  [ -n "$ONLY" ] || return 0
+  local rest="$ONLY;" e
+  while [ -n "$rest" ]; do
+    e="${rest%%;*}"
+    rest="${rest#*;}"
+    if [ "${e%%=*}" = "$1" ]; then
+      printf '%s' "$e"
+      return 0
+    fi
+  done
+  return 1
+}
+# ran_asked <step>: notes a step --only named as run, for the line a run
+# with --only ends with. tb land runs what failed on main too before it
+# blames a landing, and exit 0 alone wouldn't tell main passing a step from
+# main skipping it (the Swift steps never run on main with nothing changed).
+ONLY_RAN=""
+ran_asked() {
+  if [ -n "$ONLY" ] && only_entry "$1" >/dev/null; then ONLY_RAN="$ONLY_RAN${ONLY_RAN:+;}$1"; fi
+}
+# left_out <step>: says so and succeeds when --only leaves the step out. The
+# steps that install packages always run: they aren't checks, and the ones
+# asked for need them.
+left_out() {
+  [ "${1% packages}" = "$1" ] || return 1
+  only_entry "$1" >/dev/null && return 1
+  printf 'skip  %-20s (--only left it out)\n' "$1"
+}
+
 # step <name> <dir> <command...>: runs it with its output in a log file.
 step() {
   local name="$1" dir="$2"
+  if left_out "$name"; then return; fi
+  ran_asked "$name"
   shift 2
   local log="$LOGS/$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '-').log"
   local start=$SECONDS
@@ -296,19 +409,57 @@ LIMITED=("$NODE" "$ROOT/scripts/limit-step.mjs"
 # says which tests needed it, so one that keeps turning up gets fixed. A
 # test that fails on its own as well still fails the step.
 RERUN_MAX_FILES=8
+UNIT_FAILED_FILES=""
 runner_unit_tests() {
   local name="runner unit tests" dir="$ROOT/runner"
   local log="$LOGS/runner-unit-tests.log" list="$LOGS/runner-unit-tests.failed"
   local start=$SECONDS
+  if left_out "$name"; then return; fi
+  # (Run, for --only's last line, also when none of its files are here:
+  # files this checkout doesn't have are files it can't fail.)
+  ran_asked "$name"
+  # All of them, or the files --only names for this step. One this checkout
+  # doesn't have can't fail here: tb land runs a group's failed files on each
+  # of its landings alone, and another landing's new test isn't in this one.
+  local targets=("test/unit/**/*.test.ts") asked f
+  asked="$(only_entry "$name")"
+  if [ "$asked" != "${asked#*=}" ]; then
+    targets=()
+    set -f
+    for f in ${asked#*=}; do
+      if [ "${f#test/unit/}" != "$f" ] && [ "${f%.test.ts}" != "$f" ] && [ "${f#*..}" = "$f" ] && [ -f "$dir/$f" ]; then
+        targets+=("$f")
+      fi
+    done
+    set +f
+    if [ "${#targets[@]}" = 0 ]; then
+      printf 'skip  %-20s (none of the files --only names are in this checkout)\n' "$name"
+      return
+    fi
+  fi
   local run=(node --import=./test/helpers/clean-env.ts --test --test-timeout=300000 --test-force-exit --test-reporter=spec)
   if (cd "$dir" && "${run[@]}" --test-reporter-destination=stdout \
       --test-reporter=./test/helpers/failed-files-reporter.mjs --test-reporter-destination="$list" \
-      "test/unit/**/*.test.ts") >"$log" 2>&1; then
+      "${targets[@]}") >"$log" 2>&1; then
     printf 'ok    %-20s %4ss\n' "$name" "$((SECONDS - start))"
     return
   fi
-  local files=() f
+  local files=()
   [ -f "$list" ] && while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done <"$list"
+  # For the --only line a failed run ends with: the files, when they're few
+  # enough to have been run again and are plain test paths.
+  if [ "${#files[@]}" -ge 1 ] && [ "${#files[@]}" -le "$RERUN_MAX_FILES" ]; then
+    # The reporter gives whole paths; --only takes them from runner/, as
+    # another checkout (and a check host's copy) is somewhere else.
+    local real rel=()
+    real="$(cd "$dir" && pwd -P)"
+    for f in "${files[@]}"; do
+      f="${f#"$dir"/}"
+      rel+=("${f#"$real"/}")
+    done
+    UNIT_FAILED_FILES="${rel[*]}"
+    if ! plain "$UNIT_FAILED_FILES" '^test/unit/[A-Za-z0-9._/-]+( test/unit/[A-Za-z0-9._/-]+)*$'; then UNIT_FAILED_FILES=""; fi
+  fi
   if [ "${#files[@]}" -ge 1 ] && [ "${#files[@]}" -le "$RERUN_MAX_FILES" ]; then
     local relog="$LOGS/runner-unit-tests-again.log"
     if (cd "$dir" && "${run[@]}" --test-concurrency=1 "${files[@]}") >"$relog" 2>&1; then
@@ -338,7 +489,7 @@ if [ "$APP_ONLY" = 0 ] && [ "$RUNNER_ONLY" = 0 ]; then
   # The app's Node tools (the tour's end-to-end test, the mock runner)
   # aren't typechecked or run here: at least they have to parse. A quote
   # slip in tour-e2e.mjs went unnoticed until it was next run (2 Nov).
-  step "app tools parse" "$ROOT/app/Tools" bash -c 'for f in *.mjs mock-runner/*.mjs; do node --check "$f" || exit 1; done'
+  step "app tools parse" "$ROOT" bash -c 'for f in app/Tools/*.mjs mock-runner/*.mjs; do node --check "$f" || exit 1; done'
   # The Convex functions (convex/), against the generated types in git.
   if [ ! -d "$ROOT/node_modules" ]; then
     step "convex packages" "$ROOT" npm ci --no-audit --no-fund
@@ -346,6 +497,29 @@ if [ "$APP_ONLY" = 0 ] && [ "$RUNNER_ONLY" = 0 ]; then
   step "convex typecheck" "$ROOT" npm run convex:typecheck
   step "web typecheck" "$ROOT" npm run web:typecheck
   step "web tests" "$ROOT" npm run web:test
+  # ESLint with mikecann-lint's rules (eslint.config.mjs; old problems are
+  # recorded in eslint-suppressions.json). The whole thing takes about 40 s
+  # and 3 GB, so a landing lints only the code files it changed, and all of
+  # it when the lint setup or packages changed, with --all, or on main.
+  # Old problems fixed by hand don't fail it (--pass-on-unpruned-suppressions):
+  # `npx eslint . --prune-suppressions` tidies the file whenever.
+  # grep to /dev/null, not -q (see swift_needed).
+  if [ "$ALL" = 1 ] || [ -z "$CHANGED" ] \
+    || printf '%s\n' "$CHANGED" | grep -E '^(eslint\.config\.mjs|eslint-suppressions\.json|package(-lock)?\.json)$' >/dev/null; then
+    # Node's own heap limit (about 2 GB) is under what the whole lint takes,
+    # and it died out of memory on the cloud box (21 Nov 2026).
+    step "lint" "$ROOT" env NODE_OPTIONS="${NODE_OPTIONS:-} --max-old-space-size=4096" npm run lint:files -- .
+  else
+    LINT_FILES=()
+    while IFS= read -r f; do
+      if [ -f "$ROOT/$f" ]; then LINT_FILES+=("$f"); fi
+    done < <(printf '%s\n' "$CHANGED" | grep -E '\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$' || true)
+    if [ "${#LINT_FILES[@]}" -gt 0 ]; then
+      step "lint" "$ROOT" npm run lint:files -- "${LINT_FILES[@]}"
+    else
+      skip "lint" "no code changed"
+    fi
+  fi
   # The public site (site/) makes its docs pages from docs/guide.md (and the
   # experiments list from docs/experiments.md), and its build refuses some
   # guide content: a section with no icon in site/docs-icons.json, a link
@@ -367,6 +541,17 @@ if [ "$APP_ONLY" = 0 ] && [ "$RUNNER_ONLY" = 0 ]; then
   else
     skip "feature pairing" "no spec, step file or features.md changed"
   fi
+  # The specs' steps and tools are TypeScript Node runs as it is, so a type
+  # error in one showed up only when the Desktop workflow ran that spec
+  # (features/tsconfig.json). A few seconds.
+  if needed '^features/|^desktop/scripts/own-folder\.ts$'; then
+    if [ ! -d "$ROOT/features/node_modules" ]; then
+      step "features packages" "$ROOT/features" npm ci --no-audit --no-fund
+    fi
+    step "features typecheck" "$ROOT/features" npm run typecheck
+  else
+    skip "features typecheck" "nothing under features/ changed"
+  fi
 fi
 if [ "$APP_ONLY" = 0 ]; then
   runner_unit_tests
@@ -380,9 +565,9 @@ if [ "$APP_ONLY" = 0 ]; then
 fi
 # The desktop app's Rust (desktop/, the GPUI port), when something it reads
 # changed: desktop/ itself, the mock runner its client's tests start and the
-# runner code that mock imports, the Mac app's test fixtures core's tests
-# share, and the app's art and diagram library (Pele) the GPUI app builds
-# in. Nothing ran it before, and
+# runner code that mock imports (and the icon it serves), the shared cases
+# core's tests read, and the art and diagram library (Pele) the GPUI app
+# builds in. Nothing ran it before, and
 # on 11 Nov a GPUI change that built a file:// URL outside the open gate
 # landed on main, exactly what core's open_gate_source test is there to catch.
 # --quick runs the small crates' tests (the core logic, the golden
@@ -392,10 +577,10 @@ fi
 # (cargo check of the GPUI app, the dock and every test), a few minutes from
 # cold. On a check host cargo's target folder is kept between runs
 # (scripts/check-remote.sh), so --quick stays about a minute.
-DESKTOP_NEEDS='^desktop/|^features/support/sample\.png$|^site/app-doc-slugs\.json$|^app/Tools/mock-runner/|^runner/src/|^app/Tests/Fixtures/|^app/Sources/Threadbear/Resources/Art/|^app/Sources/Threadbear/Resources/Rich/'
+DESKTOP_NEEDS='^desktop/|^rust-toolchain\.toml$|^features/support/sample\.png$|^site/app-doc-slugs\.json$|^mock-runner/|^runner/src/|^shared/cases/|^shared/art/|^shared/rich/|^shared/icons/'
 # What cargo builds from outside desktop/ (include_bytes!, include_str!), folders
 # or files, for the hashing below.
-DESKTOP_BUILT_IN=(app/Sources/Threadbear/Resources/Art app/Sources/Threadbear/Resources/Rich site/app-doc-slugs.json features/support/sample.png)
+DESKTOP_BUILT_IN=(shared/art shared/rich site/app-doc-slugs.json features/support/sample.png)
 #
 # That kept target is shared by every checkout that sends a run, and cargo
 # calls a crate fresh when none of its files is newer than its last build: a
@@ -410,6 +595,9 @@ DESKTOP_BUILT_IN=(app/Sources/Threadbear/Resources/Art app/Sources/Threadbear/Re
 # everything that differs again next time (Codex's review).
 cargo_step() {
   local name="$1" sums="" record="" before="$FAILED"
+  # Before anything below: a step --only leaves out builds nothing, so it
+  # mustn't write down these files as what the shared target was built from.
+  if left_out "$name"; then return; fi
   shift
   if [ -z "$CARGO" ]; then
     if [ -n "${THREADBEAR_CHECK_CHANGED_FILE:-}" ]; then
@@ -441,6 +629,30 @@ cargo_step() {
   step "$name" "$ROOT/desktop" "${LIMITED[@]}" "$CARGO" "$@"
   [ -z "$record" ] || [ "$FAILED" != "$before" ] || mv "$sums" "$record"
 }
+# desktop/'s Rust as cargo fmt writes it (desktop/rustfmt.toml, with the
+# rustfmt of rust-toolchain.toml), --quick included: no build, a few seconds,
+# so it runs wherever this does, this Mac included. The log ends with the fix.
+if [ "$APP_ONLY" = 0 ] && [ "$RUNNER_ONLY" = 0 ]; then
+  if needed '^desktop/|^rust-toolchain\.toml$'; then
+    FMT_CARGO="$(command -v cargo || true)"
+    [ -n "$FMT_CARGO" ] || [ ! -x "$HOME/.cargo/bin/cargo" ] || FMT_CARGO="$HOME/.cargo/bin/cargo"
+    if [ -n "$FMT_CARGO" ]; then
+      step "desktop format" "$ROOT/desktop" bash -c '"$1" fmt --all -- --check && exit 0
+        printf "\ndesktop/ is not formatted as cargo fmt writes it (the diff is above).\nFix: cd desktop && cargo fmt --all, then commit what it changed.\n"
+        exit 1' _ "$FMT_CARGO"
+    elif [ -n "${THREADBEAR_CHECK_CHANGED_FILE:-}" ]; then
+      log="$LOGS/desktop-format.log"
+      echo "No cargo on this check host, and desktop/ changed: rustup.rs installs it." >"$log"
+      printf 'FAIL  %-20s       %s\n' "desktop format" "$log"
+      FAILED="${FAILED}desktop format|$log
+"
+    else
+      skip "desktop format" "no cargo here: rustup.rs installs it"
+    fi
+  else
+    skip "desktop format" "nothing in desktop/ changed"
+  fi
+fi
 if [ "$APP_ONLY" = 0 ] && [ "$RUNNER_ONLY" = 0 ]; then
   if ! needed "$DESKTOP_NEEDS"; then
     skip "desktop core tests" "nothing desktop/ reads changed"
@@ -465,10 +677,23 @@ if [ "$APP_ONLY" = 0 ] && [ "$RUNNER_ONLY" = 0 ]; then
     CARGO="$(command -v cargo || true)"
     [ -n "$CARGO" ] || [ ! -x "$HOME/.cargo/bin/cargo" ] || CARGO="$HOME/.cargo/bin/cargo"
     # The client's tests start the mock runner, which needs its packages.
-    if [ -n "$CARGO" ] && [ ! -d "$ROOT/app/Tools/mock-runner/node_modules" ]; then
-      step "mock runner packages" "$ROOT/app/Tools/mock-runner" npm ci --no-audit --no-fund
+    if [ -n "$CARGO" ] && [ ! -d "$ROOT/mock-runner/node_modules" ]; then
+      step "mock runner packages" "$ROOT/mock-runner" npm ci --no-audit --no-fund
     fi
     cargo_step "desktop core tests" test --locked --no-fail-fast -p threadbear-core -p threadbear-client
+    # Clippy over the whole workspace, with desktop/Cargo.toml's
+    # [workspace.lints] (each says why it's there) and desktop/clippy.toml,
+    # --quick included, when the Rust or the toolchain changed: a warning
+    # fails it.
+    if needed '^desktop/|^rust-toolchain\.toml$'; then
+      lint_before="$FAILED"
+      cargo_step "desktop lint" clippy --locked --workspace --all-targets -- -D warnings
+      if [ "$FAILED" != "$lint_before" ] && [ -f "$LOGS/desktop-lint.log" ]; then
+        printf '\nClippy found the problems above. To see them: cd desktop && cargo clippy --workspace --all-targets -- -D warnings\n(desktop/Cargo.toml says what each lint is for; an exception needs #[expect(clippy::..., reason = "...")]).\n' >>"$LOGS/desktop-lint.log"
+      fi
+    else
+      skip "desktop lint" "nothing in desktop/ changed"
+    fi
     # The GPUI app itself, which the core tests never build: main's app
     # stopped compiling twice in the week to 13 Nov (tour.rs's
     # panel_available, fixed in 92c48ee73) with every landing's --quick
@@ -476,8 +701,13 @@ if [ "$APP_ONLY" = 0 ] && [ "$RUNNER_ONLY" = 0 ]; then
     # tests, so a test module that stopped compiling fails here too. Only
     # when something it builds from changed: the runner code the mock
     # imports can't break it.
-    if [ "$QUICK" = 1 ] && needed '^desktop/|^app/Sources/Threadbear/Resources/(Art|Rich)/|^features/support/sample\.png$'; then
+    if [ "$QUICK" = 1 ] && needed '^desktop/|^shared/(art|rich)/|^features/support/sample\.png$'; then
       cargo_step "desktop app check" check --locked -p threadbear-gpui --features automation --all-targets
+      # And as it's installed (install-app.sh, stage-update.sh: frame-stats,
+      # no automation), so code that slips out of its automation cfg fails
+      # here rather than in self-update. Two forks' updates were stuck on
+      # just that (emilsbauga's and TeeLusk's, 14 to 16 Nov).
+      cargo_step "desktop app check (as installed)" check --locked -p threadbear-gpui --features frame-stats
     fi
     [ "$QUICK" = 1 ] || cargo_step "desktop build" check --locked --workspace --all-targets
   fi
@@ -514,8 +744,8 @@ if [ "$RUNNER_ONLY" = 0 ] && [ -n "$SWIFT_MOCK_NEEDS" ] && [ -n "$SWIFT_MOCK_FIL
   if [ "$E2E" = 1 ] && [ "$FALLBACK" != 1 ]; then
     skip "app mock tests" "--e2e runs on this Mac; ./check.sh --quick runs them on a check host"
   else
-  if [ ! -d "$ROOT/app/Tools/mock-runner/node_modules" ]; then
-    step "mock runner packages" "$ROOT/app/Tools/mock-runner" npm ci --no-audit --no-fund
+  if [ ! -d "$ROOT/mock-runner/node_modules" ]; then
+    step "mock runner packages" "$ROOT/mock-runner" npm ci --no-audit --no-fund
   fi
   swift_test_step "app mock tests" "$ROOT/app" env THREADBEAR_REQUIRE_MOCK=1 "${LIMITED[@]}" swift test --disable-keychain --filter "$SWIFT_MOCK_FILTER"
   fi
@@ -526,8 +756,8 @@ elif [ "$QUICK" = 0 ]; then
   # The app's MockRunnerTests run the real WebSocket client (and the
   # runner restart) against the mock, and skip without its packages: in a
   # fresh checkout or worktree they used to skip while this said ok.
-  if [ ! -d "$ROOT/app/Tools/mock-runner/node_modules" ]; then
-    step "mock runner packages" "$ROOT/app/Tools/mock-runner" npm ci --no-audit --no-fund
+  if [ ! -d "$ROOT/mock-runner/node_modules" ]; then
+    step "mock runner packages" "$ROOT/mock-runner" npm ci --no-audit --no-fund
   fi
   step "app build" "$ROOT/app" "${LIMITED[@]}" swift build --disable-keychain
   swift_test_step "app tests" "$ROOT/app" env THREADBEAR_REQUIRE_MOCK=1 "${LIMITED[@]}" swift test --disable-keychain
@@ -554,6 +784,10 @@ fi
 if [ "$E2E" = 1 ]; then
   # Claude's first, then Codex's (codex*.e2e.test.ts: the conversation
   # tests and the install test), which TB_E2E_SKIP_CODEX=1 leaves out.
+  # One login for every e2e file, named here so a failure says which.
+  TB_E2E_ACCOUNT="$("$NODE" "$ROOT/runner/src/test-login.ts")"
+  export TB_E2E_ACCOUNT
+  echo "e2e login: $TB_E2E_ACCOUNT"
   E2E_RUN=(node --test --test-reporter=spec --test-concurrency=1 --test-timeout=600000)
   CLAUDE_E2E=()
   CODEX_E2E=()
@@ -586,9 +820,28 @@ if [ -n "$FAILED" ]; then
     echo "--- $name: end of $log"
     tail -n 30 "$log"
   done
+  # What failed, as a whole ./check.sh --only command: run by hand it's the
+  # quick way to see a fix work. It names check.sh, as tb land takes no
+  # --only and an agent told just "--only" tried it there (19 Nov). tb land
+  # reads this line off a group's failed check to run
+  # just that on each of the group's landings alone (worktrees.ts, findBroken).
+  AGAIN=""
+  while IFS='|' read -r name log; do
+    [ -n "$name" ] || continue
+    if [ "$name" = "runner unit tests" ] && [ -n "$UNIT_FAILED_FILES" ]; then name="$name=$UNIT_FAILED_FILES"; fi
+    AGAIN="$AGAIN${AGAIN:+;}$name"
+  done <<EOF_FAILED
+$FAILED
+EOF_FAILED
+  if [ -n "$AGAIN" ] && plain "$AGAIN" "$ONLY_CHARS"; then
+    echo
+    echo "To run only what failed again: ./check.sh --only \"$AGAIN\""
+  fi
+  [ -z "$ONLY" ] || echo "--only ran: \"$ONLY_RAN\""
   echo
   echo "Logs kept in $LOGS; rm -rf it when you're done."
   exit 1
 fi
+[ -z "$ONLY" ] || echo "--only ran: \"$ONLY_RAN\""
 rm -rf "$LOGS"
 [ -z "$SHOTS" ] || echo "Screenshots are in $SHOTS."

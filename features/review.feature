@@ -1,7 +1,7 @@
 Feature: Design reviews
   As someone an agent shows design options to (its show_options)
   I want them in a window of their own, big enough to compare
-  So I can step through them, tick one or several, say why and send it
+  So I can step through them, read why under each, tick one or several, say why and send it
 
   # The demo thread's review has four options, each one picture: A, B and C to
   # pick from, C the agent's pick, and D for reference only.
@@ -13,6 +13,14 @@ Feature: Design reviews
   Scenario: The card opens the review on its first option, one at a time
     When I press "Compare 4 images"
     Then the review window is open on option "A", one at a time
+
+  # The card shows each option's small picture and name (Mike, 20 Nov: the
+  # reply needn't list them), and a click on one opens the window on it. The
+  # Swift app's card has only the button.
+  @review.window @transcript.review @swift-pending
+  Scenario: An option's picture on the card opens the review on that option
+    When I press the picture of "C. Account pools" on the review's card
+    Then the review window is open on option "C", one at a time
 
   @review.window
   Scenario: A review: link in the agent's reply opens that review
@@ -81,6 +89,25 @@ Feature: Design reviews
     And I open the review
     Then the review has "B" ticked and the reply "Bigger, please. That one."
 
+  # Mike, 17 Nov: a screenshot pasted in the reply went in as its file path,
+  # where the thread's box makes it a chip, so the agent never saw it.
+  @review.picks @swift-pending @windows-pending @linux-pending
+  Scenario: A picture pasted in the reply is a chip and goes with the answer
+    When I open the review
+    And I tick "C" in the review
+    And I paste "Is it cut off at the bottom? " in the review with ⌘V
+    And I paste a picture in the review with ⌘V
+    Then the review's reply holds 1 picture, and says "Is it cut off at the bottom? [Picture 1]"
+    # Mike, 17 Nov: to look at it full size, as a chip in the thread's box opens.
+    When I click picture 1 in the review's reply
+    Then the review shows picture 1 of 1 full size
+    When I close the picture in the review
+    And I press Send in the review
+    Then the review window has closed
+    And the transcript shows my message "Review: Account picker"
+    When I press "Open review"
+    Then the review window shows it sent "Is it cut off at the bottom? [Picture 1]" with 1 picture
+
   @review.picks
   Scenario: Sending answers the agent, and the review can't be changed after
     When I open the review
@@ -106,6 +133,24 @@ Feature: Design reviews
     When I press "Back to the last one (←)" in the review
     Then the review is on option "D", shot 1
 
+  # Mike, 20 Nov: the options' words were small and grey in a column down the
+  # right, so he went back to the thread to read them. They're under the
+  # picture now, at the thread's size, for the option on show; the agent's
+  # lead is there with all of them side by side. The Swift window keeps its
+  # column.
+  @review.window @swift-pending
+  Scenario: The words under the picture are the option on show's
+    When I open the review
+    Then the review's words start "A. Auto account"
+    And the review's words say "Keep the account menu and add Auto."
+    When I press "Next (→)" in the review
+    Then the review's words start "B. One picker"
+    When I press "C. Account pools" in the review
+    Then the review's words start "C. Account pools"
+    When I press "See them all and choose (Esc)" in the review
+    Then the review shows them all
+    And the review's words start "Three ways to let you pick"
+
   @review.nav
   Scenario: Every shot of an option comes before the next option
     Given the agent shows options with several shots each
@@ -118,7 +163,8 @@ Feature: Design reviews
     Then the review is on option "B", shot 1
     When I press "Previous (←)" in the review
     Then the review is on option "A", shot 3
-    When I press "B. One picker, shot 2" in the review
+    When I press "B. One picker, shot 1" in the review
+    And I press "B. One picker, shot 2" in the review
     Then the review is on option "B", shot 2
 
   # The Swift scripts' keys go to the main window, not a review's.
@@ -184,5 +230,6 @@ Feature: Design reviews
     Given the web runtime is installed
     And the agent shows options with several shots each
     When I open that review
+    And I press "B. One picker, shot 1" in the review
     And I press "B. One picker, shot 2" in the review
     Then the stage shows the page

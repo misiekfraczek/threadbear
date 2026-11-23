@@ -14,7 +14,6 @@ import type {
   CommandExecutionRequestApprovalParams,
   DynamicToolCallParams,
   DynamicToolCallResponse,
-  ElicitationProperty,
   ExecCommandApprovalParams,
   FileChangeRequestApprovalParams,
   McpServerElicitationRequestParams,
@@ -23,6 +22,7 @@ import type {
   ToolRequestUserInputParams,
 } from './types.ts';
 import { firstLineSafely } from '../../safe-cut.ts';
+import { choicesFor, elicitedValue } from '../elicitation.ts';
 
 // ---- Refusals, for a request no session is there to answer
 
@@ -386,7 +386,7 @@ export class CodexApprovals {
   // switch to Full while it shows allows it (ToolApprovalRequest.fullAllows).
   private ask(id: RequestId, method: string, req: Omit<ToolApprovalRequest, 'signal'>, answer: (a: ToolApprovalAnswer) => unknown): void {
     const p = this.open(id, method);
-    this.deps
+    void this.deps
       .requestApproval({ ...req, signal: p.abort.signal, fullAllows: true })
       .catch((e: unknown): ToolApprovalAnswer => {
         this.deps.log.warn('approval request failed', { threadId: this.deps.label, method, error: String(e) });
@@ -505,7 +505,7 @@ export class CodexApprovals {
       return out;
     });
     const pending = this.open(id, 'item/tool/requestUserInput');
-    this.deps
+    void this.deps
       .requestQuestion({ toolUseId: fromChild ? undefined : p.itemId, questions, signal: pending.abort.signal })
       .catch((): QuestionAnswer => ({ answers: null }))
       .then((a) => {
@@ -544,7 +544,7 @@ export class CodexApprovals {
         })
       : [{ question: message, header: server.slice(0, 30), multiSelect: false, options: [{ label: 'Accept' }, { label: 'Decline' }] }];
     const pending = this.open(id, 'mcpServer/elicitation/request');
-    this.deps
+    void this.deps
       .requestQuestion({ questions, signal: pending.abort.signal })
       .catch((): QuestionAnswer => ({ answers: null }))
       .then((a) => {
@@ -565,7 +565,7 @@ export class CodexApprovals {
 
   private toolCall(id: RequestId, p: DynamicToolCallParams, fromChild: boolean): void {
     const pending = this.open(id, 'item/tool/call');
-    this.deps
+    void this.deps
       .callTool(p, { fromChild, signal: pending.abort.signal })
       .catch((e: unknown): DynamicToolCallResponse => ({ contentItems: [{ type: 'inputText', text: (e as Error)?.message ?? String(e) }], success: false }))
       .then((r) => this.settle(id, r));
@@ -669,22 +669,3 @@ function quoteWord(w: string): string {
   return /^[A-Za-z0-9_./:=@%+,-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`;
 }
 
-type Choice = { label: string; value: unknown };
-
-function choicesFor(prop: ElicitationProperty): Choice[] {
-  if (Array.isArray(prop.oneOf) && prop.oneOf.length) return prop.oneOf.map((o) => ({ label: o.title || String(o.const), value: o.const }));
-  if (Array.isArray(prop.enum) && prop.enum.length) return prop.enum.map((v, i) => ({ label: prop.enumNames?.[i] || String(v), value: v }));
-  if (prop.type === 'boolean') return [{ label: 'Yes', value: true }, { label: 'No', value: false }];
-  return [];
-}
-
-function elicitedValue(answer: string, prop: ElicitationProperty, choices: Choice[]): unknown {
-  const choice = choices.find((c) => c.label === answer);
-  if (choice) return choice.value;
-  if (prop.type === 'number' || prop.type === 'integer') {
-    const n = Number(answer);
-    return Number.isFinite(n) ? (prop.type === 'integer' ? Math.trunc(n) : n) : answer;
-  }
-  if (prop.type === 'boolean') return /^(y|yes|true|1)$/i.test(answer.trim());
-  return answer;
-}

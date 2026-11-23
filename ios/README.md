@@ -42,11 +42,36 @@ directly, so it works with the Mac asleep: whatever you send waits in
   `-ThreadbearCompose <text>`, `-ThreadbearSearch <text>`, `-ThreadbearLong` for a very long thread, "long", `-ThreadbearSecret` for one waiting on a secret card, "secret", `-ThreadbearShortInbox` for one row in the inbox and one of each put away, `-ThreadbearEmptyInbox` for none, `-ThreadbearFinishSoon` for the running thread's turn to end after 14 s, `-ThreadbearManyThreads` for a long inbox with more starred and running too, `-ThreadbearScrollTo <threadId>` to start with the inbox scrolled to that row (with `-foldedSections "(hibernating,archived)"` for Running open: the headings sticking), `-ThreadbearSlowAnswers` for answers to cards to take 3 s to land, `-ThreadbearRefuseAnswers` for them then to be refused), on a 6.9" iPhone, so they're App Store sized.
 - `scripts/sim.sh [boot|stop]`: this worktree's own simulator, for
   `sim-shots.sh` and any repro of your own. It prints the id; use that
-  rather than picking a simulator from `simctl list`, and `stop` it when
-  you're done. It refuses to boot a third.
+  rather than picking a simulator from `simctl list`, which may be another
+  thread's (on 1 Nov one thread installed over another's repro and shut it
+  down, and nothing said so), and `stop` it when you're done. It refuses to
+  boot a third.
 - `appstore/` and `scripts/appstore-*`: the App Store listing and release,
   in `appstore/RELEASE.md`.
-- `scripts/install-phone.sh`: build, install over wifi, launch.
+- `scripts/nightly-testflight.sh`: the safety net. A schedule on the M5
+  (`--check` at 1:00 and 6:00 Perth) archives main when the app has changed
+  since the last one, uploads it and hands it to the internal TestFlight
+  group "Mike (nightly)", which gets every build with no Beta App Review, so
+  Mike's phone has last night's main through TestFlight's automatic updates.
+  The first check starts it, the second opens a thread only if it failed.
+  Mike's copy only (it needs the App Store Connect key and `origin` being
+  his repo); details in the script's header and `appstore/RELEASE.md`.
+- `scripts/install-phone.sh`: build, install over wifi, launch. After
+  landing an `ios/` change, an agent in Mike's copy tries to install it on
+  his phone itself, without asking, so he has it to look at before the
+  nightly TestFlight build brings it:
+  `taskpolicy -b ios/scripts/install-phone.sh` from the landed commit. It
+  takes ten minutes or more, so run it in the background, and don't
+  `tb land` or rebase while it builds: files changing under the compile
+  broke the first try. Say in the reply that it's installed, or why it
+  couldn't be (the phone off the wifi, asleep, or needing a restart for
+  "cryptexd"); when it can't, say it comes with the nightly TestFlight
+  build and leave it there, no retry watchers. Either install replaces the
+  other: they share the bundle id, so the pairing and settings stay, but a
+  dev install's pushes come through the sandbox, and TestFlight may not
+  update an app it didn't install until Install is tapped in TestFlight. "Unable to launch ... could not be unlocked" at the end is
+  fine: it's installed, just not opened. That's his own phone only:
+  uploading to App Store Connect still needs him to ask.
 - `scripts/make-icon.swift`: the icon, from the same mascot as the Mac's.
 
 ## The demo
@@ -67,9 +92,9 @@ the pairing QR code, which holds no token (Daybreak finding 127, 15 Nov
 `url=<https://….convex.cloud>&code=<tbp_…>&key=<runnerId>:<key>`: not a
 link, so no app can claim it, with a code that works once for ten minutes.
 Scan the code (`PairView`) reads it and trades the code for a token with
-`tokens:claim` (docs/protocol.md "Devices"). The `key` is the runner's
+`tokens:claim` (docs/protocol/moves.md "Devices"). The `key` is the runner's
 secret-box key, without which the phone pairs but won't answer secret
-cards (docs/protocol.md, "Trusting the key"). The same tab lists paired
+cards (docs/protocol/threads.md, "Trusting the key"). The same tab lists paired
 phones with Revoke.
 
 By hand, `swift ios/scripts/pair-qr.swift` makes a code with `npx convex
@@ -115,11 +140,14 @@ follow-up is an ordinary reply there; ↗ opens it.
 - It only listens when asked (the intent or the inbox's waveform button), and
   nothing shows until a server and token are set, so App Store users without
   an archive never see it.
-- The server and token: a QR code of `threadbear://quickask?url=<server>&token=<aa_…>`,
-  or typed into Settings. The token is an archive phone token issued on
-  Bruce (agent-archive's `scripts/phone-token.mjs`, `--bruce`). Get it onto
-  the phone as a QR code, never through the Mac clipboard: Quick Ask's
-  OpenRouter key leaked that way.
+- The server and token: Settings › Ask › Scan the code, of the setup code
+  agent-archive's `npm run phone-token -- issue --bruce --qr` shows
+  (`TBASK1_…`, a one-use code good for ten minutes, never the token), which
+  the phone trades for its token at `/api/quick/claim` (`QuickAskSetup`,
+  docs/ask-server.md); or typed into Settings. Never through the Mac
+  clipboard: Quick Ask's OpenRouter key leaked that way. A
+  `threadbear://quickask` link is refused from anywhere: any app can claim
+  the scheme, so it could catch the token as the link opened.
 - Debug builds take `-QuickAskServer <url> -QuickAskToken <token>
   -QuickAskDebugQuestion "…"` (and `-quickAsk.speakAnswers NO`) to ask from
   the simulator with no mic. The simulator reaches the server through the

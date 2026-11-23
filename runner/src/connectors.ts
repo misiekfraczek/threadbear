@@ -1,7 +1,7 @@
 // The Connectors gateway (plugbear, optional; runner.json's gateway): which of its
 // services are signed in, for the app's Connectors panel, and the sign-in
 // problems an agent runs into, for end_turn to turn into an ask
-// (docs/protocol.md, "Connectors").
+// (docs/protocol/panels.md, "Connectors").
 //
 // The runner asks the gateway's open /health every few minutes and when
 // the panel opens; the app never calls the gateway itself. /health has changed
@@ -405,6 +405,16 @@ export function uncovered(problems: SignInProblem[], asks: AskLike[] | undefined
       return `${a.action ?? ''} ${a.why ?? ''}`.toLowerCase().includes(name);
     });
   });
+}
+
+// The asks that aren't about a sign-in this turn needs: the try-first note
+// (needs.ts, handsOverAStep) leaves those to the user, as the sign-in note
+// asks for them (Gemini's and Codex's reviews, 20 Nov 2026).
+// An ask about signing in, not one that only names the service.
+const SIGNING_IN = /\b(?:sign(?:ed)?|log(?:ged)?) ?(?:in|on)|\b(?:re)?connect|\bauthori[sz]e|\bsign-in/i;
+export function notSignIns<T extends AskLike>(asks: T[], problems: SignInProblem[]): T[] {
+  if (!problems.length) return asks;
+  return asks.filter((a) => !SIGNING_IN.test(`${a.action ?? ''} ${a.why ?? ''}`) || uncovered(problems, [a]).length === problems.length);
 }
 
 // The nudge: what needs signing in and where, and what to do about it.

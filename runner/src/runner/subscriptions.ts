@@ -25,7 +25,6 @@ export const subscriptionsPart = {
       model: account.provider === rec.provider ? rec.model : this.defaultModelFor(account.provider),
       effort: account.provider === rec.provider ? rec.effort : this.defaultEffortFor(account.provider),
       permissionMode: rec.permissionMode,
-      confined: rec.confined,
       sessionId: rec.nativeSessionId ?? '',
       resume: false,
       mediaDir: this.store.mediaDir(rec.id),
@@ -40,9 +39,6 @@ export const subscriptionsPart = {
   subscriptionEligible(this: Runner, st: ThreadState, account: Account): Eligibility {
     const adapter = this.adapters[account.provider];
     if (!adapter) return { ok: false, reason: `${account.title}: CLI unavailable.` };
-    if (account.provider === 'antigravity' && account.subscription?.state !== 'ready')
-      return { ok: false, reason: `${account.title}: subscription is not confirmed.` };
-    if (st.rec.confined && account.provider !== 'claude') return { ok: false, reason: `${account.title}: cannot preserve the sandbox.` };
     const options = this.subscriptionOptions(st, account);
     const supports = adapter.supports?.(options);
     if (supports && !supports.ok) return supports;

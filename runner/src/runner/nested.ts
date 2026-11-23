@@ -1,4 +1,4 @@
-// Nested threads (experiment nestedThreads; docs/protocol.md, "Nested
+// Nested threads (experiment nestedThreads; docs/protocol/threads.md, "Nested
 // threads"): the runner's half. The sidebar's half (threads under the one
 // that started them) is the GPUI app's.
 //
@@ -113,7 +113,7 @@ export const nestedPart = {
     const text = this.takeHeld(st);
     if (!text) return;
     this.log.info('nested threads: passed on held reports', { threadId: st.rec.id });
-    this.sendTo(st, text, [], { origin: 'runner', queue: true });
+    this.sendTo(st, text, [], { origin: 'runner', queue: true, wakeReason: 'The threads it started reported back' });
   },
 
   // At a start: anything held while the runner was down, whose threads

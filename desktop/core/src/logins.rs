@@ -54,6 +54,30 @@ pub struct Account {
     /// Where the login's CLI keeps its sign-in, for Sign in… (sign_in.rs).
     #[serde(default, deserialize_with = "crate::wire::field")]
     pub config_dir: String,
+    /// Claude: no turn can run on it until someone signs it in again
+    /// (docs/protocol/settings.md, Pools, "Signed out"). Pools skip it.
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub signed_out: bool,
+    /// Claude: when this sign-in ends and can't be renewed (28 days after
+    /// signing in, from Claude Code 2.1.325). The Usage panel warns ahead.
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub login_ends_at: Option<String>,
+    /// Claude: its paid plan has lapsed to the free one, which has no Claude
+    /// Code. Pools skip it; nothing offers Sign in… or a reset for it.
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub plan_ended: bool,
+    /// Claude: runs on a year-long token Mike made for it (Year-long token…
+    /// on its Usage row, sign_in.rs), not its 28-day sign-in. The token
+    /// itself never comes to the app.
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub year_token: Option<YearToken>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct YearToken {
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub made_at: Option<String>,
 }
 
 impl Account {
@@ -121,7 +145,14 @@ pub struct RunnerDefaults {
 impl RunnerDefaults {
     /// The model a new thread on `provider` gets when it names none.
     pub fn model_for(&self, provider: &str) -> Option<&str> {
-        self.models.get(provider).map(String::as_str).or(if provider == "claude" { self.model.as_deref() } else { None })
+        self.models
+            .get(provider)
+            .map(String::as_str)
+            .or(if provider == "claude" {
+                self.model.as_deref()
+            } else {
+                None
+            })
     }
 }
 
@@ -157,15 +188,33 @@ pub struct RunnerLogins {
 
 impl RunnerLogins {
     pub fn login_command(&self, provider: &str) -> &str {
-        self.login_commands.get(provider).map(String::as_str).unwrap_or_else(|| crate::sign_in::login_command(provider))
+        self.login_commands
+            .get(provider)
+            .map(String::as_str)
+            .unwrap_or_else(|| crate::sign_in::login_command(provider))
     }
     pub fn from_hello(hello: &Value) -> RunnerLogins {
-        let login_commands = hello["providers"].as_array().into_iter().flatten().filter_map(|p| {
-            let id = p["id"].as_str().filter(|s| !s.is_empty())?;
-            let command = p["loginCommand"].as_str()?;
-            Some((id.to_owned(), command.trim().to_owned()))
-        }).collect();
-        RunnerLogins { accounts: accounts_from(&hello["accounts"]), providers: lossy(&hello["providers"]), pools: pools_from(&hello["pools"]), defaults: hello.get("defaults").cloned().and_then(crate::wire::read).unwrap_or_default(), login_commands }
+        let login_commands = hello["providers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| {
+                let id = p["id"].as_str().filter(|s| !s.is_empty())?;
+                let command = p["loginCommand"].as_str()?;
+                Some((id.to_owned(), command.trim().to_owned()))
+            })
+            .collect();
+        RunnerLogins {
+            accounts: accounts_from(&hello["accounts"]),
+            providers: lossy(&hello["providers"]),
+            pools: pools_from(&hello["pools"]),
+            defaults: hello
+                .get("defaults")
+                .cloned()
+                .and_then(crate::wire::read)
+                .unwrap_or_default(),
+            login_commands,
+        }
     }
 
     pub fn provider(&self, id: &str) -> Option<&ProviderInfo> {
@@ -174,11 +223,17 @@ impl RunnerLogins {
     }
 
     pub fn provider_title(&self, id: &str) -> String {
-        self.provider(id).and_then(|p| p.name.as_deref()).filter(|n| !n.trim().is_empty()).map_or_else(|| provider_title(id), str::to_owned)
+        self.provider(id)
+            .and_then(|p| p.name.as_deref())
+            .filter(|n| !n.trim().is_empty())
+            .map_or_else(|| provider_title(id), str::to_owned)
     }
 
     pub fn cli_name(&self, id: &str) -> String {
-        self.provider(id).and_then(|p| p.cli_name.as_deref()).filter(|n| !n.trim().is_empty()).map_or_else(|| crate::slash::cli_name(id), str::to_owned)
+        self.provider(id)
+            .and_then(|p| p.cli_name.as_deref())
+            .filter(|n| !n.trim().is_empty())
+            .map_or_else(|| crate::slash::cli_name(id), str::to_owned)
     }
 
     pub fn has_auto_mode(&self, id: &str) -> bool {
@@ -190,16 +245,26 @@ impl RunnerLogins {
     }
 
     pub fn can_rewind(&self, id: &str) -> bool {
-        self.provider(id).and_then(|p| p.rewind).unwrap_or_else(|| crate::composer::can_rewind(id))
+        self.provider(id)
+            .and_then(|p| p.rewind)
+            .unwrap_or_else(|| crate::composer::can_rewind(id))
     }
 
-    pub fn effort_levels(&self, model: Option<&str>, choices: &[ModelChoice], provider: &str) -> Vec<String> {
+    pub fn effort_levels(
+        &self,
+        model: Option<&str>,
+        choices: &[ModelChoice],
+        provider: &str,
+    ) -> Vec<String> {
         // No effort support is authoritative, even if a cached model still
         // lists levels. Otherwise the model can narrow the provider's list.
         if self.provider(provider).and_then(|p| p.effort.as_deref()) == Some("none") {
             return Vec::new();
         }
-        if let Some(choice) = model.and_then(|m| choice_for(m, choices)).filter(|c| !c.effort_levels.is_empty()) {
+        if let Some(choice) = model
+            .and_then(|m| choice_for(m, choices))
+            .filter(|c| !c.effort_levels.is_empty())
+        {
             return choice.effort_levels.clone();
         }
         match self.provider(provider).and_then(|p| p.effort.as_deref()) {
@@ -213,6 +278,44 @@ impl RunnerLogins {
     /// `accounts.updated`: the logins, which replace the ones from `hello`.
     pub fn set_accounts(&mut self, accounts: &Value) {
         self.accounts = accounts_from(accounts);
+    }
+
+    /// The logins given a year-long token since `before`: a first one, or a
+    /// new one in place of an older. The app throws confetti from their
+    /// Usage rows (confetti.rs). A login new to the list doesn't count, nor
+    /// one whose token went.
+    pub fn new_year_tokens(&self, before: &[Account]) -> Vec<String> {
+        self.accounts
+            .iter()
+            .filter(|a| a.year_token.is_some())
+            .filter(|a| {
+                before
+                    .iter()
+                    .any(|b| b.id == a.id && b.year_token != a.year_token)
+            })
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// The logins signed back in since `before`: signed out then, not now.
+    /// The app throws confetti for them too.
+    pub fn signed_back_in(&self, before: &[Account]) -> Vec<String> {
+        self.accounts
+            .iter()
+            .filter(|a| !a.signed_out)
+            .filter(|a| before.iter().any(|b| b.id == a.id && b.signed_out))
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// One login as the runner has it now (`accounts.useReset`'s answer),
+    /// in its place; a login not in the list is left out.
+    pub fn replace_account(&mut self, account: &Value) {
+        for a in accounts_from(&Value::Array(vec![account.clone()])) {
+            if let Some(slot) = self.accounts.iter_mut().find(|x| x.id == a.id) {
+                *slot = a;
+            }
+        }
     }
 
     /// `pools.updated`: the pools, which replace the ones from `hello`.
@@ -262,7 +365,14 @@ fn pools_from(v: &Value) -> Vec<Pool> {
 }
 
 fn lossy<T: serde::de::DeserializeOwned>(v: &Value) -> Vec<T> {
-    v.as_array().map(|items| items.iter().filter_map(|item| crate::wire::read(item.clone())).collect()).unwrap_or_default()
+    v.as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| crate::wire::read(item.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// How a provider id reads (Providers.info).
@@ -271,10 +381,14 @@ pub fn provider_title(id: &str) -> String {
         "claude" | "" => "Claude".to_owned(),
         "codex" => "Codex".to_owned(),
         "grok" => "Grok".to_owned(),
-        "antigravity" => "Google (Antigravity)".to_owned(),
+        "antigravity" => "Gemini".to_owned(),
+        "opencode" => "OpenCode".to_owned(),
         other => {
             let mut chars = other.chars();
-            chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
         }
     }
 }
@@ -296,9 +410,21 @@ pub struct PickerRow {
     pub is_older: bool,
 }
 
+/// One provider's models in a picker column (ModelPicker.Section), with
+/// its name over them when the column has more than one provider.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PickerSection {
+    pub provider: String,
+    pub title: Option<String>,
+    pub rows: Vec<PickerRow>,
+}
+
 /// ComposerChips.choice: the picker row an id belongs to.
 pub fn choice_for<'a>(id: &str, choices: &'a [ModelChoice]) -> Option<&'a ModelChoice> {
-    choices.iter().find(|c| c.id == id).or_else(|| choices.iter().find(|c| c.model == id))
+    choices
+        .iter()
+        .find(|c| c.id == id)
+        .or_else(|| choices.iter().find(|c| c.model == id))
 }
 
 /// ComposerChips.resolvedModel: the first id that's set.
@@ -311,7 +437,9 @@ pub fn resolved_model<'a>(ids: &[Option<&'a str>]) -> Option<&'a str> {
 pub fn model_title_with(id: Option<&str>, choices: &[ModelChoice]) -> String {
     match id.filter(|s| !s.is_empty()) {
         None => "Default".to_owned(),
-        Some(id) => choice_for(id, choices).map_or_else(|| model_title(Some(id)), |c| c.title.clone()),
+        Some(id) => {
+            choice_for(id, choices).map_or_else(|| model_title(Some(id)), |c| c.title.clone())
+        }
     }
 }
 
@@ -328,25 +456,34 @@ pub fn chip_title(model: Option<&str>, effort: Option<&str>, choices: &[ModelCho
 /// Unknown naming schemes keep the CLI's own label.
 fn family_title(word: &str) -> String {
     let mut chars = word.chars();
-    chars.next().map_or_else(String::new, |first| format!("{}{}", first.to_uppercase(), chars.as_str()))
+    chars.next().map_or_else(String::new, |first| {
+        format!("{}{}", first.to_uppercase(), chars.as_str())
+    })
 }
 
 fn model_options(options: &str) -> String {
-    options.split(',').filter(|s| !s.is_empty()).map(|option| {
-        match option.split_once('=') {
+    options
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|option| match option.split_once('=') {
             Some(("context", value)) => format!("{value} context"),
-            Some(("reasoning" | "reasoning_effort" | "effort", value)) => format!("{} effort", family_title(value)),
+            Some(("reasoning" | "reasoning_effort" | "effort", value)) => {
+                format!("{} effort", family_title(value))
+            }
             Some(("fast", "true")) => "Fast".into(),
             Some(("fast", "false")) => "Standard speed".into(),
             Some(("thinking", "true")) => "Thinking".into(),
             Some(("thinking", "false")) => "Thinking off".into(),
             _ => option.to_owned(),
-        }
-    }).collect::<Vec<_>>().join(" · ")
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn model_family(id: &str) -> Option<(String, String, Vec<u32>)> {
-    let (base, options) = id.split_once('[').map_or((id, ""), |(b, o)| (b, o.trim_end_matches(']')));
+    let (base, options) = id
+        .split_once('[')
+        .map_or((id, ""), |(b, o)| (b, o.trim_end_matches(']')));
     let words: Vec<&str> = base.split('-').collect();
     let (brand, version, family, variant) = match words.as_slice() {
         ["gpt", v, f @ ("astra" | "sol" | "terra" | "luna")] => ("GPT", *v, *f, String::new()),
@@ -355,20 +492,58 @@ fn model_family(id: &str) -> Option<(String, String, Vec<u32>)> {
         ["composer", v] => ("Composer", *v, "composer", String::new()),
         ["claude", f, rest @ ..] if !rest.is_empty() => {
             let version = rest.join(".");
-            let numbers = rest.iter().map(|x| x.parse::<u32>()).collect::<Result<Vec<_>, _>>().ok()?;
+            let numbers = rest
+                .iter()
+                .map(|x| x.parse::<u32>())
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
             let name = family_title(f);
-            return Some((name, format!("Claude {version}{}", if options.is_empty() { String::new() } else { format!(" · {}", model_options(options)) }), numbers));
+            return Some((
+                name,
+                format!(
+                    "Claude {version}{}",
+                    if options.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", model_options(options))
+                    }
+                ),
+                numbers,
+            ));
         }
         _ => return None,
     };
-    let numbers = version.split('.').map(|x| x.parse::<u32>()).collect::<Result<Vec<_>, _>>().ok()?;
-    if family.is_empty() { return None; }
+    let numbers = version
+        .split('.')
+        .map(|x| x.parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if family.is_empty() {
+        return None;
+    }
     let mut title = family_title(family);
     // Grok's Build Fast is a distinct choice, not an older Grok.
-    if brand == "Grok" && !variant.is_empty() { title.push_str(&format!(" {}", variant.split_whitespace().map(|w| family_title(w)).collect::<Vec<_>>().join(" "))); }
-    let mut detail = if brand == "GPT" { format!("GPT-{version}") } else { format!("{brand} {version}") };
-    if !variant.is_empty() && brand != "Grok" { detail.push_str(&format!(" · {variant}")); }
-    if !options.is_empty() { detail.push_str(&format!(" · {}", model_options(options))); }
+    if brand == "Grok" && !variant.is_empty() {
+        title.push_str(&format!(
+            " {}",
+            variant
+                .split_whitespace()
+                .map(|w| family_title(w))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    let mut detail = if brand == "GPT" {
+        format!("GPT-{version}")
+    } else {
+        format!("{brand} {version}")
+    };
+    if !variant.is_empty() && brand != "Grok" {
+        detail.push_str(&format!(" · {variant}"));
+    }
+    if !options.is_empty() {
+        detail.push_str(&format!(" · {}", model_options(options)));
+    }
     Some((title, detail, numbers))
 }
 
@@ -376,31 +551,87 @@ fn model_family(id: &str) -> Option<(String, String, Vec<u32>)> {
 /// aliases plus whatever the default and the chosen model are; dated and old
 /// full ids are older. Other providers show the latest of each recognised
 /// family, plus the current and default choices; the rest remain searchable.
-pub fn picker_rows(choices: &[ModelChoice], default_id: Option<&str>, selected: Option<&str>, query: &str, provider: &str) -> Vec<PickerRow> {
+pub fn picker_rows(
+    choices: &[ModelChoice],
+    default_id: Option<&str>,
+    selected: Option<&str>,
+    query: &str,
+    provider: &str,
+) -> Vec<PickerRow> {
     let codex = provider != "claude" && !provider.is_empty();
     let fallback: Vec<ModelChoice> = if codex {
-        default_id.filter(|d| !d.is_empty()).map(|d| vec![ModelChoice { id: d.into(), model: d.into(), title: model_title(Some(d)), ..Default::default() }]).unwrap_or_default()
+        default_id
+            .filter(|d| !d.is_empty())
+            .map(|d| {
+                vec![ModelChoice {
+                    id: d.into(),
+                    model: d.into(),
+                    title: model_title(Some(d)),
+                    ..Default::default()
+                }]
+            })
+            .unwrap_or_default()
     } else {
-        ["opus", "sonnet", "haiku"].iter().map(|a| ModelChoice { id: (*a).into(), model: (*a).into(), title: model_title(Some(a)), ..Default::default() }).collect()
+        ["opus", "sonnet", "haiku"]
+            .iter()
+            .map(|a| ModelChoice {
+                id: (*a).into(),
+                model: (*a).into(),
+                title: model_title(Some(a)),
+                ..Default::default()
+            })
+            .collect()
     };
-    let known: &[ModelChoice] = if choices.is_empty() { &fallback } else { choices };
-    let matches = |c: &ModelChoice, id: Option<&str>| id.filter(|s| !s.is_empty()).is_some_and(|id| c.id == id || c.model == id);
+    let known: &[ModelChoice] = if choices.is_empty() {
+        &fallback
+    } else {
+        choices
+    };
+    let matches = |c: &ModelChoice, id: Option<&str>| {
+        id.filter(|s| !s.is_empty())
+            .is_some_and(|id| c.id == id || c.model == id)
+    };
     let mut latest: HashMap<String, (Vec<u32>, String)> = HashMap::new();
     if codex {
         for c in known {
             if let Some((family, _, version)) = model_family(&c.id) {
-                let entry = latest.entry(family).or_insert_with(|| (version.clone(), c.id.clone()));
-                if version > entry.0 { *entry = (version, c.id.clone()); }
+                let entry = latest
+                    .entry(family)
+                    .or_insert_with(|| (version.clone(), c.id.clone()));
+                if version > entry.0 {
+                    *entry = (version, c.id.clone());
+                }
             }
         }
     }
-    let is_main = |c: &ModelChoice| (codex && model_family(&c.id).is_none_or(|(family, _, _)| latest.get(&family).is_some_and(|(_, id)| id == &c.id))) || (!codex && c.id.chars().all(char::is_alphabetic)) || matches(c, default_id) || matches(c, selected);
+    let is_main = |c: &ModelChoice| {
+        (codex
+            && model_family(&c.id).is_none_or(|(family, _, _)| {
+                latest.get(&family).is_some_and(|(_, id)| id == &c.id)
+            }))
+            || (!codex && c.id.chars().all(char::is_alphabetic))
+            || matches(c, default_id)
+            || matches(c, selected)
+    };
     let mut rows: Vec<PickerRow> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut add = |c: &ModelChoice, older: bool, rows: &mut Vec<PickerRow>| {
         if seen.insert(if codex { c.id.clone() } else { c.model.clone() }) {
-            let (title, subtitle) = if codex { model_family(&c.id).map(|(t, d, _)| (t, Some(d))).unwrap_or_else(|| (c.title.clone(), c.description.clone())) } else { (c.title.clone(), c.description.clone()) };
-            rows.push(PickerRow { id: c.id.clone(), title, subtitle, is_default: matches(c, default_id), is_selected: matches(c, selected), is_older: older });
+            let (title, subtitle) = if codex {
+                model_family(&c.id)
+                    .map(|(t, d, _)| (t, Some(d)))
+                    .unwrap_or_else(|| (c.title.clone(), c.description.clone()))
+            } else {
+                (c.title.clone(), c.description.clone())
+            };
+            rows.push(PickerRow {
+                id: c.id.clone(),
+                title,
+                subtitle,
+                is_default: matches(c, default_id),
+                is_selected: matches(c, selected),
+                is_older: older,
+            });
         }
     };
     for c in known.iter().filter(|c| is_main(c)) {
@@ -408,7 +639,14 @@ pub fn picker_rows(choices: &[ModelChoice], default_id: Option<&str>, selected: 
     }
     if let Some(selected) = selected.filter(|s| !s.is_empty()) {
         if !known.iter().any(|c| matches(c, Some(selected))) {
-            rows.push(PickerRow { id: selected.to_owned(), title: model_title(Some(selected)), subtitle: None, is_default: false, is_selected: true, is_older: false });
+            rows.push(PickerRow {
+                id: selected.to_owned(),
+                title: model_title(Some(selected)),
+                subtitle: None,
+                is_default: false,
+                is_selected: true,
+                is_older: false,
+            });
         }
     }
     for c in known.iter().filter(|c| !is_main(c)) {
@@ -419,7 +657,13 @@ pub fn picker_rows(choices: &[ModelChoice], default_id: Option<&str>, selected: 
         return rows;
     }
     rows.into_iter()
-        .filter(|r| r.title.to_lowercase().contains(&needle) || r.id.to_lowercase().contains(&needle) || r.subtitle.as_deref().is_some_and(|s| s.to_lowercase().contains(&needle)))
+        .filter(|r| {
+            r.title.to_lowercase().contains(&needle)
+                || r.id.to_lowercase().contains(&needle)
+                || r.subtitle
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(&needle))
+        })
         .map(|mut r| {
             r.is_older = false;
             r
@@ -443,14 +687,24 @@ pub fn effort_levels(model: Option<&str>, choices: &[ModelChoice], provider: &st
 }
 
 /// ModelPicker.impliedEffort: the level a thread with none chosen runs at.
-pub fn implied_effort(model: Option<&str>, choices: &[ModelChoice], account: Option<&Account>, runner_default: Option<&str>) -> Option<String> {
+pub fn implied_effort(
+    model: Option<&str>,
+    choices: &[ModelChoice],
+    account: Option<&Account>,
+    runner_default: Option<&str>,
+) -> Option<String> {
     if let Some(d) = runner_default.filter(|d| !d.is_empty()) {
         return Some(d.to_owned());
     }
-    if let Some(own) = account.and_then(|a| a.default_effort.as_deref()).filter(|d| !d.is_empty()) {
+    if let Some(own) = account
+        .and_then(|a| a.default_effort.as_deref())
+        .filter(|d| !d.is_empty())
+    {
         return Some(own.to_owned());
     }
-    model.and_then(|m| choice_for(m, choices)).and_then(|c| c.default_effort.clone())
+    model
+        .and_then(|m| choice_for(m, choices))
+        .and_then(|c| c.default_effort.clone())
 }
 
 /// What the composer's chips say about a thread, or the settings a new thread
@@ -475,12 +729,24 @@ pub struct ChipSettings<'a> {
 
 impl<'a> ChipSettings<'a> {
     pub fn choices(&self) -> &'a [ModelChoice] {
-        self.logins.account(&self.account).map_or(&[], |a| a.models.as_slice())
+        self.logins
+            .account(&self.account)
+            .map_or(&[], |a| a.models.as_slice())
     }
 
     pub fn default_model(&self) -> Option<String> {
-        let runner_default = if self.is_new { self.logins.defaults.model_for(&self.provider) } else { self.model_in_use.as_deref() };
-        resolved_model(&[runner_default, self.logins.account(&self.account).and_then(|a| a.default_model.as_deref())]).map(str::to_owned)
+        let runner_default = if self.is_new {
+            self.logins.defaults.model_for(&self.provider)
+        } else {
+            self.model_in_use.as_deref()
+        };
+        resolved_model(&[
+            runner_default,
+            self.logins
+                .account(&self.account)
+                .and_then(|a| a.default_model.as_deref()),
+        ])
+        .map(str::to_owned)
     }
 
     pub fn effective_model(&self) -> Option<String> {
@@ -488,8 +754,26 @@ impl<'a> ChipSettings<'a> {
     }
 
     pub fn effective_effort(&self) -> Option<String> {
-        let runner_default = if self.is_new { self.logins.defaults.efforts.get(&self.provider).map(String::as_str) } else { None };
-        self.effort.clone().or_else(|| self.effort_in_use.clone()).or_else(|| implied_effort(self.effective_model().as_deref(), self.choices(), self.logins.account(&self.account), runner_default))
+        let runner_default = if self.is_new {
+            self.logins
+                .defaults
+                .efforts
+                .get(&self.provider)
+                .map(String::as_str)
+        } else {
+            None
+        };
+        self.effort
+            .clone()
+            .or_else(|| self.effort_in_use.clone())
+            .or_else(|| {
+                implied_effort(
+                    self.effective_model().as_deref(),
+                    self.choices(),
+                    self.logins.account(&self.account),
+                    runner_default,
+                )
+            })
     }
 
     pub fn uses_pools(&self) -> bool {
@@ -512,7 +796,10 @@ impl<'a> ChipSettings<'a> {
         }
         match self.pool() {
             Some(pool) => Some(pool.title.clone()),
-            None => self.logins.account(&self.account).map(|_| crate::new_thread::login_name(&self.account, &self.logins.accounts)),
+            None => self
+                .logins
+                .account(&self.account)
+                .map(|_| crate::new_thread::login_name(&self.account, &self.logins.accounts)),
         }
     }
 
@@ -535,7 +822,11 @@ impl<'a> ChipSettings<'a> {
     }
 
     pub fn model_chip_title(&self) -> String {
-        let rest = chip_title(self.effective_model().as_deref(), self.effective_effort().as_deref(), self.choices());
+        let rest = chip_title(
+            self.effective_model().as_deref(),
+            self.effective_effort().as_deref(),
+            self.choices(),
+        );
         match self.owner().filter(|o| !o.is_empty()) {
             Some(owner) => format!("{owner} · {rest}"),
             None => rest,
@@ -548,7 +839,12 @@ impl<'a> ChipSettings<'a> {
         if let Some(pool) = self.pool() {
             parts.push(format!("{} pool", pool.title));
         } else if self.uses_pools() {
-            parts.push(format!("Pinned to {}", self.logins.account(&self.account).map_or_else(|| self.account.clone(), |a| a.name())));
+            parts.push(format!(
+                "Pinned to {}",
+                self.logins
+                    .account(&self.account)
+                    .map_or_else(|| self.account.clone(), |a| a.name())
+            ));
         }
         if let Some(model) = &self.model {
             parts.push(model.clone());
@@ -562,7 +858,10 @@ impl<'a> ChipSettings<'a> {
         } else if let Some(level) = &self.effort_in_use {
             parts.push(format!("{level} effort, the model's own level"));
         } else if let Some(level) = self.effective_effort() {
-            parts.push(format!("{} effort, the default", effort_title(&level).to_lowercase()));
+            parts.push(format!(
+                "{} effort, the default",
+                effort_title(&level).to_lowercase()
+            ));
         } else {
             parts.push("the model's own effort level".to_owned());
         }
@@ -574,10 +873,13 @@ impl<'a> ChipSettings<'a> {
     }
 
     pub fn account_chip_help(&self) -> String {
-        self.logins.account(&self.account).map_or_else(|| self.account.clone(), |a| match &a.note {
-            Some(note) if !note.is_empty() => format!("{} ({note})", a.name()),
-            _ => a.name(),
-        })
+        self.logins.account(&self.account).map_or_else(
+            || self.account.clone(),
+            |a| match &a.note {
+                Some(note) if !note.is_empty() => format!("{} ({note})", a.name()),
+                _ => a.name(),
+            },
+        )
     }
 
     pub fn permission_title(&self) -> &'static str {
@@ -601,27 +903,130 @@ impl<'a> ChipSettings<'a> {
     /// The model rows of a provider's column (ThreadSettings.rows).
     pub fn rows(&self, provider: &str, query: &str) -> Vec<PickerRow> {
         let own = provider == self.provider;
-        let listed = if own { Some(self.account.as_str()) } else { self.logins.accounts.iter().find(|a| a.provider_id() == provider).map(|a| a.id.as_str()) };
-        let Some(listed) = listed else { return picker_rows(&[], None, None, query, provider) };
+        let listed = if own {
+            Some(self.account.as_str())
+        } else {
+            self.logins
+                .accounts
+                .iter()
+                .find(|a| a.provider_id() == provider)
+                .map(|a| a.id.as_str())
+        };
+        let Some(listed) = listed else {
+            return picker_rows(&[], None, None, query, provider);
+        };
         let account = self.logins.account(listed);
         let choices = account.map_or(&[][..], |a| a.models.as_slice());
-        let default = if own { self.default_model() } else { self.logins.defaults.model_for(provider).map(str::to_owned).or_else(|| account.and_then(|a| a.default_model.clone())) };
-        picker_rows(choices, default.as_deref(), if own { self.effective_model() } else { None }.as_deref(), query, provider)
+        let default = if own {
+            self.default_model()
+        } else {
+            self.logins
+                .defaults
+                .model_for(provider)
+                .map(str::to_owned)
+                .or_else(|| account.and_then(|a| a.default_model.clone()))
+        };
+        picker_rows(
+            choices,
+            default.as_deref(),
+            if own { self.effective_model() } else { None }.as_deref(),
+            query,
+            provider,
+        )
     }
 
-    /// Only list models from logins belonging to the displayed pool.
-    pub fn rows_in_column(&self, column: &str, provider: &str, query: &str) -> Vec<PickerRow> {
-        let Some(pool) = self.logins.pool(column).filter(|_| self.uses_pools()) else { return self.rows(provider, query) };
-        let accounts = crate::new_thread::pool_logins(pool, &self.logins.accounts, Some(provider));
-        let Some(account) = accounts.iter().find(|a| a.id == self.account).or(accounts.first()) else { return Vec::new() };
-        let choices: Vec<ModelChoice> = accounts.iter().flat_map(|a| a.models.clone()).collect();
-        let own = self.pool_id.as_deref() == Some(column) && self.provider == provider;
-        let default = if own { self.default_model() } else { self.logins.defaults.model_for(provider).map(str::to_owned).or_else(|| account.default_model.clone()) };
-        picker_rows(&choices, default.as_deref(), if own { self.effective_model() } else { None }.as_deref(), query, provider)
+    /// A column's models (ThreadSettings.sections). Without pools a column
+    /// is one provider. A pool lists each of its providers' models, under
+    /// the provider's name when it has more than one: a pool of Claude,
+    /// Codex and OpenCode logins showed only Claude's until 20 Nov, so
+    /// OpenCode's Gemini models were nowhere. The default and the tick are
+    /// only for the thread's own pool and provider. Any other column (the
+    /// pinned one) is the thread's own login's list.
+    pub fn sections(&self, column: &str, query: &str) -> Vec<PickerSection> {
+        if !self.uses_pools() {
+            return vec![PickerSection {
+                provider: column.to_owned(),
+                title: None,
+                rows: self.rows(column, query),
+            }];
+        }
+        let Some(shown) = self.logins.pool(column) else {
+            return vec![PickerSection {
+                provider: self.provider.clone(),
+                title: None,
+                rows: self.rows(&self.provider, query),
+            }];
+        };
+        let providers = crate::new_thread::pool_providers(shown, &self.logins.accounts);
+        let many = providers.len() > 1;
+        providers
+            .into_iter()
+            .filter_map(|provider| {
+                let own =
+                    self.pool().is_some_and(|p| p.id == shown.id) && provider == self.provider;
+                // The login whose list it shows: the thread's own, else (or
+                // when its own lists none, signed out or not yet asked) the
+                // first of the pool's that lists models.
+                let logins =
+                    crate::new_thread::pool_logins(shown, &self.logins.accounts, Some(&provider));
+                let listing = logins
+                    .iter()
+                    .find(|a| !a.models.is_empty())
+                    .or(logins.first())
+                    .copied();
+                let rows = if own {
+                    let choices = if self.choices().is_empty() {
+                        listing.map_or(&[][..], |a| a.models.as_slice())
+                    } else {
+                        self.choices()
+                    };
+                    let default = self
+                        .default_model()
+                        .or_else(|| listing.and_then(|a| a.default_model.clone()));
+                    let chosen = resolved_model(&[self.model.as_deref(), default.as_deref()])
+                        .map(str::to_owned);
+                    picker_rows(
+                        choices,
+                        default.as_deref(),
+                        chosen.as_deref(),
+                        query,
+                        &provider,
+                    )
+                } else {
+                    let default = self
+                        .logins
+                        .defaults
+                        .model_for(&provider)
+                        .map(str::to_owned)
+                        .or_else(|| listing.and_then(|a| a.default_model.clone()));
+                    picker_rows(
+                        listing.map_or(&[][..], |a| a.models.as_slice()),
+                        default.as_deref(),
+                        None,
+                        query,
+                        &provider,
+                    )
+                };
+                // Nothing to list (no match, or none known yet): no section,
+                // so no heading with nothing under it.
+                if rows.is_empty() {
+                    return None;
+                }
+                Some(PickerSection {
+                    title: many.then(|| self.logins.provider_title(&provider)),
+                    provider,
+                    rows,
+                })
+            })
+            .collect()
     }
 
     pub fn effort_levels(&self) -> Vec<String> {
-        self.logins.effort_levels(self.effective_model().as_deref(), self.choices(), &self.provider)
+        self.logins.effort_levels(
+            self.effective_model().as_deref(),
+            self.choices(),
+            &self.provider,
+        )
     }
 }
 
@@ -632,6 +1037,7 @@ pub fn permission_title(mode: &str) -> &'static str {
         "ask" => "Ask before edits",
         "auto" => "Auto",
         "plan" => "Plan first",
+        "unknown" => "Access unknown",
         _ => "Unknown mode",
     }
 }
@@ -642,6 +1048,7 @@ pub fn permission_help(mode: &str) -> &'static str {
         "ask" => "Asks before editing files or running commands",
         "auto" => "A safety check approves or blocks each action, and asks only when unsure",
         "plan" => "Reads and plans, and changes nothing until you approve its plan",
+        "unknown" => "Its runner doesn't say what access this thread has. Updating Threadbear there shows it",
         _ => "A mode from a newer runner that this app doesn't know. Update the app to see it. Anything made from this thread here asks before edits",
     }
 }
@@ -650,9 +1057,28 @@ pub fn permission_help(mode: &str) -> &'static str {
 /// email (two config folders signed in to one account, issue 18): its
 /// note, else its id. None when its email is its own.
 pub fn twin_label(account: &Account, accounts: &[Account]) -> Option<String> {
-    let email = account.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty())?;
-    let twin = accounts.iter().any(|a| a.id != account.id && a.provider_id() == account.provider_id() && a.email.as_deref().map(|e| e.trim().to_lowercase()).as_deref() == Some(email.as_str()));
-    twin.then(|| account.note.as_deref().map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| account.id.clone(), str::to_owned))
+    let email = account
+        .email
+        .as_deref()
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty())?;
+    let twin = accounts.iter().any(|a| {
+        a.id != account.id
+            && a.provider_id() == account.provider_id()
+            && a.email
+                .as_deref()
+                .map(|e| e.trim().to_lowercase())
+                .as_deref()
+                == Some(email.as_str())
+    });
+    twin.then(|| {
+        account
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map_or_else(|| account.id.clone(), str::to_owned)
+    })
 }
 
 /// AccountName.short: the part of a Claude email before the @, unless
@@ -661,16 +1087,25 @@ pub fn twin_label(account: &Account, accounts: &[Account]) -> Option<String> {
 /// several. A login whose whole email another shares goes by its note
 /// or id (twin_label).
 pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
-    let Some(account) = accounts.iter().find(|a| a.id == id) else { return id.to_owned() };
+    let Some(account) = accounts.iter().find(|a| a.id == id) else {
+        return id.to_owned();
+    };
     if let Some(label) = twin_label(account, accounts) {
         return label;
     }
     let full = account.name();
     let local = |s: &str| s.split('@').next().unwrap_or(s).to_owned();
-    let siblings: Vec<&Account> = accounts.iter().filter(|a| a.id != id && a.provider_id() == account.provider_id()).collect();
+    let siblings: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| a.id != id && a.provider_id() == account.provider_id())
+        .collect();
     if account.provider_id() != "claude" {
         let provider = provider_title(account.provider_id());
-        return if siblings.is_empty() { provider } else { format!("{provider} {}", local(&full)) };
+        return if siblings.is_empty() {
+            provider
+        } else {
+            format!("{provider} {}", local(&full))
+        };
     }
     if !full.contains('@') {
         return full;
@@ -685,6 +1120,66 @@ pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_login_signed_back_in_is_one_that_was_signed_out() {
+        let list = |logins: &[(&str, bool)]| -> Vec<Account> {
+            logins
+                .iter()
+                .map(|(id, out)| Account {
+                    id: (*id).into(),
+                    signed_out: *out,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let before = list(&[("a", true), ("b", false), ("c", true)]);
+        let logins = RunnerLogins {
+            accounts: list(&[("a", false), ("b", false), ("c", true), ("d", false)]),
+            ..Default::default()
+        };
+        assert_eq!(logins.signed_back_in(&before), vec!["a".to_string()]);
+        assert!(logins.signed_back_in(&logins.accounts.clone()).is_empty());
+    }
+
+    #[test]
+    fn a_login_given_a_year_long_token_is_new_once() {
+        let list = |tokens: &[(&str, Option<&str>)]| -> Vec<Account> {
+            tokens
+                .iter()
+                .map(|(id, made)| Account {
+                    id: (*id).into(),
+                    year_token: made.map(|m| YearToken {
+                        made_at: Some(m.into()),
+                    }),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let before = list(&[
+            ("a", None),
+            ("b", Some("2026-01-01")),
+            ("c", Some("2026-02-01")),
+        ]);
+        let mut logins = RunnerLogins {
+            accounts: list(&[
+                ("a", Some("2026-11-18")),
+                ("b", Some("2026-01-01")),
+                ("c", Some("2026-11-18")),
+                ("d", Some("2026-11-18")),
+            ]),
+            ..Default::default()
+        };
+        // a got its first, c a new one; b is as it was and d is new to the list.
+        assert_eq!(
+            logins.new_year_tokens(&before),
+            vec!["a".to_string(), "c".to_string()]
+        );
+        let now = logins.accounts.clone();
+        assert!(logins.new_year_tokens(&now).is_empty());
+        logins.accounts = list(&[("a", None)]);
+        assert!(logins.new_year_tokens(&now).is_empty());
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -729,12 +1224,18 @@ mod tests {
             { "id": "future-2", "provider": "future-provider", "title": "lee@example.com" }
         ]}));
         assert_eq!(provider_title("grok"), "Grok");
-        assert_eq!(provider_title("antigravity"), "Google (Antigravity)");
+        assert_eq!(provider_title("antigravity"), "Gemini");
         assert_eq!(provider_title("future-provider"), "Future-provider");
         assert_eq!(short_account_name("claude-main", &l.accounts), "alex");
         assert_eq!(short_account_name("grok-main", &l.accounts), "Grok");
-        assert_eq!(short_account_name("antigravity-main", &l.accounts), "Google (Antigravity)");
-        assert_eq!(short_account_name("future-1", &l.accounts), "Future-provider sam");
+        assert_eq!(
+            short_account_name("antigravity-main", &l.accounts),
+            "Gemini"
+        );
+        assert_eq!(
+            short_account_name("future-1", &l.accounts),
+            "Future-provider sam"
+        );
         // No Claude aliases for a provider with no list of its own.
         for provider in ["grok", "antigravity", "future-provider"] {
             assert!(picker_rows(&[], None, None, "", provider).is_empty());
@@ -745,46 +1246,119 @@ mod tests {
     fn mixed_pool_lists_each_provider_without_models_from_outside_the_pool() {
         let mut l = logins();
         l.pools[0].account_ids.push("codex-main".into());
-        l.accounts.insert(0, Account { id: "codex-outside".into(), provider: "codex".into(), models: vec![ModelChoice { id: "outside-only".into(), model: "outside-only".into(), ..Default::default() }], ..Default::default() });
+        l.accounts.insert(
+            0,
+            Account {
+                id: "codex-outside".into(),
+                provider: "codex".into(),
+                models: vec![ModelChoice {
+                    id: "outside-only".into(),
+                    model: "outside-only".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
         let s = settings(&l);
-        assert_eq!(crate::new_thread::pool_providers(&l.pools[0], &l.accounts), vec!["claude", "codex"]);
-        let rows = s.rows_in_column("claude", "codex", "");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "gpt-6.1-sol");
-        assert!(!rows[0].is_selected);
-        assert!(s.rows_in_column("claude", "cursor", "").is_empty());
+        assert_eq!(
+            crate::new_thread::pool_providers(&l.pools[0], &l.accounts),
+            vec!["claude", "codex"]
+        );
+        let sections = s.sections("claude", "");
+        let codex = sections.iter().find(|x| x.provider == "codex").unwrap();
+        assert_eq!(codex.rows.len(), 1);
+        assert_eq!(codex.rows[0].id, "gpt-6.1-sol");
+        assert!(!codex.rows[0].is_selected);
+        assert!(sections.iter().all(|x| x.provider != "cursor"));
     }
 
     #[test]
     fn older_selected_model_stays_visible_and_unknown_labels_survive() {
         let ids = ["gpt-6-astra", "gpt-6.2-astra", "new-unknown"];
-        let choices: Vec<ModelChoice> = ids.iter().map(|id| ModelChoice { id: (*id).into(), model: (*id).into(), title: (*id).into(), ..Default::default() }).collect();
+        let choices: Vec<ModelChoice> = ids
+            .iter()
+            .map(|id| ModelChoice {
+                id: (*id).into(),
+                model: (*id).into(),
+                title: (*id).into(),
+                ..Default::default()
+            })
+            .collect();
         let rows = picker_rows(&choices, None, Some("gpt-6-astra"), "", "codex");
-        assert!(rows.iter().any(|r| r.id == "gpt-6-astra" && r.is_selected && !r.is_older));
+        assert!(rows
+            .iter()
+            .any(|r| r.id == "gpt-6-astra" && r.is_selected && !r.is_older));
         assert!(rows.iter().any(|r| r.title == "new-unknown" && !r.is_older));
     }
 
     #[test]
     fn compact_models_keep_exact_ids_and_latest_family_versions() {
-        let ids = ["gpt-6-astra", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.2-sol", "future-model"];
-        let choices: Vec<ModelChoice> = ids.iter().map(|id| ModelChoice { id: (*id).into(), model: (*id).into(), title: (*id).into(), ..Default::default() }).collect();
+        let ids = [
+            "gpt-6-astra",
+            "gpt-6.2-astra",
+            "gpt-6.1-terra",
+            "gpt-6.2-sol",
+            "future-model",
+        ];
+        let choices: Vec<ModelChoice> = ids
+            .iter()
+            .map(|id| ModelChoice {
+                id: (*id).into(),
+                model: (*id).into(),
+                title: (*id).into(),
+                ..Default::default()
+            })
+            .collect();
         let rows = picker_rows(&choices, None, None, "", "codex");
         let astra = rows.iter().find(|r| r.id == "gpt-6.2-astra").unwrap();
         assert_eq!(astra.title, "Astra");
         assert_eq!(astra.subtitle.as_deref(), Some("GPT-6.2"));
         assert!(!astra.is_older);
-        assert!(rows.iter().find(|r| r.id == "gpt-6-astra").unwrap().is_older);
-        assert!(!rows.iter().find(|r| r.id == "future-model").unwrap().is_older);
-        assert_eq!(picker_rows(&choices, None, None, "6-astra", "codex")[0].id, "gpt-6-astra");
+        assert!(
+            rows.iter()
+                .find(|r| r.id == "gpt-6-astra")
+                .unwrap()
+                .is_older
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|r| r.id == "future-model")
+                .unwrap()
+                .is_older
+        );
+        assert_eq!(
+            picker_rows(&choices, None, None, "6-astra", "codex")[0].id,
+            "gpt-6-astra"
+        );
     }
 
     #[test]
     fn cursor_parameters_and_google_variants_remain_selectable() {
         for (provider, ids, title) in [
-            ("cursor", vec!["gpt-5.6-sol[context=272k,reasoning=medium,fast=false]", "gpt-5.6-sol[reasoning=high,fast=true]"], "Sol"),
-            ("antigravity", vec!["gemini-4-argon-high", "gemini-4-argon-low"], "Argon"),
+            (
+                "cursor",
+                vec![
+                    "gpt-5.6-sol[context=272k,reasoning=medium,fast=false]",
+                    "gpt-5.6-sol[reasoning=high,fast=true]",
+                ],
+                "Sol",
+            ),
+            (
+                "antigravity",
+                vec!["gemini-4-argon-high", "gemini-4-argon-low"],
+                "Argon",
+            ),
         ] {
-            let choices: Vec<ModelChoice> = ids.iter().map(|id| ModelChoice { id: (*id).into(), model: (*id).into(), title: (*id).into(), ..Default::default() }).collect();
+            let choices: Vec<ModelChoice> = ids
+                .iter()
+                .map(|id| ModelChoice {
+                    id: (*id).into(),
+                    model: (*id).into(),
+                    title: (*id).into(),
+                    ..Default::default()
+                })
+                .collect();
             let rows = picker_rows(&choices, None, None, "", provider);
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].title, title);
@@ -810,8 +1384,18 @@ mod tests {
     fn rows_keep_older_ids_under_older() {
         let l = logins();
         let rows = settings(&l).rows("claude", "");
-        let titles: Vec<(&str, bool, bool, bool)> = rows.iter().map(|r| (r.title.as_str(), r.is_default, r.is_selected, r.is_older)).collect();
-        assert_eq!(titles, vec![("Opus 5.5", false, false, false), ("Fable 5.1", true, true, false), ("Sonnet 4.5", false, false, true)]);
+        let titles: Vec<(&str, bool, bool, bool)> = rows
+            .iter()
+            .map(|r| (r.title.as_str(), r.is_default, r.is_selected, r.is_older))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                ("Opus 5.5", false, false, false),
+                ("Fable 5.1", true, true, false),
+                ("Sonnet 4.5", false, false, true)
+            ]
+        );
     }
 
     #[test]
@@ -831,9 +1415,95 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_of_several_providers_lists_each_ones_models() {
+        let mut l = logins();
+        l.accounts.push(Account {
+            id: "opencode-main".into(),
+            provider: "opencode".into(),
+            models: vec![ModelChoice {
+                id: "google/gemini-4-neon".into(),
+                model: "google/gemini-4-neon".into(),
+                title: "Gemini 4 Neon".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        l.pools[0].account_ids = vec![
+            "claude-main".into(),
+            "opencode-main".into(),
+            "codex-main".into(),
+        ];
+        let sections = settings(&l).sections("claude", "");
+        let heads: Vec<(&str, Option<&str>)> = sections
+            .iter()
+            .map(|s| (s.provider.as_str(), s.title.as_deref()))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                ("claude", Some("Claude")),
+                ("opencode", Some("OpenCode")),
+                ("codex", Some("Codex"))
+            ]
+        );
+        assert!(
+            sections[0].rows.iter().any(|r| r.is_selected),
+            "the thread's own provider has its tick"
+        );
+        assert_eq!(
+            sections[1]
+                .rows
+                .iter()
+                .map(|r| r.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Gemini 4 Neon"]
+        );
+        assert!(
+            sections[1..]
+                .iter()
+                .flat_map(|s| &s.rows)
+                .all(|r| !r.is_selected),
+            "no tick on another provider"
+        );
+        l.accounts.push(Account {
+            id: "grok-main".into(),
+            provider: "grok".into(),
+            ..Default::default()
+        });
+        l.pools[0].account_ids.push("grok-main".into());
+        assert!(
+            settings(&l)
+                .sections("claude", "")
+                .iter()
+                .all(|s| s.provider != "grok"),
+            "a provider with no models known has no heading"
+        );
+        let found = settings(&l).sections("claude", "gemini");
+        assert_eq!(
+            found
+                .iter()
+                .map(|s| s.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opencode"],
+            "a search drops providers with no match"
+        );
+    }
+
+    #[test]
+    fn a_pool_of_one_provider_has_no_heading() {
+        let l = logins();
+        let sections = settings(&l).sections("claude", "");
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, None);
+    }
+
+    #[test]
     fn permission_modes_offer_auto_only_where_it_exists() {
         let l = logins();
-        assert_eq!(settings(&l).permission_modes(), vec!["full", "auto", "ask", "plan"]);
+        assert_eq!(
+            settings(&l).permission_modes(),
+            vec!["full", "auto", "ask", "plan"]
+        );
         let mut s = settings(&l);
         s.provider = "codex".into();
         assert_eq!(s.permission_modes(), vec!["full", "ask", "plan"]);
@@ -850,10 +1520,26 @@ mod tests {
 
     #[test]
     fn two_logins_with_one_email_go_by_note_or_id() {
-        let a = |id: &str, email: &str, note: Option<&str>| Account { id: id.into(), provider: "claude".into(), email: Some(email.into()), note: note.map(Into::into), ..Default::default() };
-        let accounts = vec![a("claude-main", "alex@example.com", None), a("claude-2", "Alex@Example.com", Some("Hooks")), a("claude-3", "sam@example.com", None)];
-        assert_eq!(twin_label(&accounts[0], &accounts).as_deref(), Some("claude-main"));
-        assert_eq!(twin_label(&accounts[1], &accounts).as_deref(), Some("Hooks"));
+        let a = |id: &str, email: &str, note: Option<&str>| Account {
+            id: id.into(),
+            provider: "claude".into(),
+            email: Some(email.into()),
+            note: note.map(Into::into),
+            ..Default::default()
+        };
+        let accounts = vec![
+            a("claude-main", "alex@example.com", None),
+            a("claude-2", "Alex@Example.com", Some("Hooks")),
+            a("claude-3", "sam@example.com", None),
+        ];
+        assert_eq!(
+            twin_label(&accounts[0], &accounts).as_deref(),
+            Some("claude-main")
+        );
+        assert_eq!(
+            twin_label(&accounts[1], &accounts).as_deref(),
+            Some("Hooks")
+        );
         assert_eq!(twin_label(&accounts[2], &accounts), None);
         assert_eq!(short_account_name("claude-2", &accounts), "Hooks");
         assert_eq!(short_account_name("claude-3", &accounts), "sam");

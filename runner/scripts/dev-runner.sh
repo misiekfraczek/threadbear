@@ -22,10 +22,11 @@
 #
 # It writes <home>/tb, a tb that always talks to this runner (an exported
 # THREADBEAR_HOME doesn't last past one command in an agent's shell), and
-# prints the app/Tools/dev-app.sh command for a debug app against it. On a
+# prints the desktop/scripts/dev-app.sh command for a debug app against it. On a
 # new data dir, threads default to the folder <home>/work (under $TMPDIR
-# when <home> isn't), the login claude-main (TB_E2E_ACCOUNT picks another)
-# and model claude-haiku-5-5, and Codex threads to gpt-6-luna at low effort
+# when <home> isn't), the first Claude login that works (src/test-login.ts:
+# not plan-ended, hidden or noted, else claude-main; TB_E2E_ACCOUNT picks
+# another) and model claude-haiku-5-5, and Codex threads to gpt-6-luna at low effort
 # (runner.json's defaults; keepAccount keeps new threads on that login rather
 # than the one with the most room), not your real folders or the
 # account's own model, so a thread started from a debug app's composer is
@@ -151,6 +152,7 @@ if [ ! -e "$DATA_HOME/runner.json" ]; then
   # Cellar), which isn't there when Codex was installed elsewhere: then the
   # one on PATH, as codexPath (Codex's review, 9 Nov 2026).
   DEV_CODEX=""
+  DEV_LOGIN="$("$NODE" "$RUNNER_DIR/src/test-login.ts")"
   [ -n "${THREADBEAR_CODEX_PATH:-}" ] || DEV_CODEX="$(command -v codex 2>/dev/null || true)"
   "$NODE" -e 'const fs = require("fs"), path = require("path");
   const beside = fs.existsSync(path.join(path.dirname(process.execPath), "codex"));
@@ -159,8 +161,8 @@ if [ ! -e "$DATA_HOME/runner.json" ]; then
     cliUpdates: { claude: "off", codex: "off" },
     ...(process.argv[4] && !beside ? { codexPath: process.argv[4] } : {}),
   }, null, 2) + "\n")' \
-    "$DATA_HOME/runner.json" "$WORK" "${TB_E2E_ACCOUNT:-claude-main}" "$DEV_CODEX"
-  IN_WORK="   (in $(printf '%q' "$WORK"), on claude-haiku-5-5)"
+    "$DATA_HOME/runner.json" "$WORK" "$DEV_LOGIN" "$DEV_CODEX"
+  IN_WORK="   (in $(printf '%q' "$WORK"), on $DEV_LOGIN and claude-haiku-5-5)"
 fi
 # THREADBEAR_PORT and THREADBEAR_URL go too: tb then reads the port this
 # runner wrote to runner.json. THREADBEAR_TB is what tb prints in the
@@ -185,7 +187,7 @@ echo "  pid:  $$"
 echo "For tb:      $(printf '%q' "$TB") status"
 echo "A thread:    $(printf '%q' "$TB") new \"say hi\" --model claude-haiku-5-5 --wait$IN_WORK"
 echo "On Codex:    $(printf '%q' "$TB") new \"say hi\" --account codex-main --model gpt-6-luna --effort low --wait"
-echo "For the app: $(printf '%q' "$(cd "$RUNNER_DIR/.." && pwd)/app/Tools/dev-app.sh") start --home $(printf '%q' "$DATA_HOME")"
+echo "For the app: $(printf '%q' "$(cd "$RUNNER_DIR/.." && pwd)/desktop/scripts/dev-app.sh") start --home $(printf '%q' "$DATA_HOME")"
 echo "Stop it:     kill $$   (never pkill: the real runner runs src/main.ts too)"
 echo
 
@@ -217,13 +219,16 @@ trap stop INT TERM HUP
 # runner sets its own for the CLIs it starts.
 while :; do
   env -u THREADBEAR_DATA_DIR -u THREADBEAR_URL -u THREADBEAR_THREAD_ID -u THREADBEAR_RUNNER_VERSION -u THREADBEAR_RUNNER_HOME \
-    THREADBEAR_HOME="$DATA_HOME" THREADBEAR_PORT="$PORT" THREADBEAR_LOG="$LOG" THREADBEAR_LOG_STDERR=1 THREADBEAR_CLI_UPDATES=off THREADBEAR_TOKEN_TALLY=off \
+    THREADBEAR_HOME="$DATA_HOME" THREADBEAR_PORT="$PORT" THREADBEAR_LOG="$LOG" THREADBEAR_LOG_STDERR=1 THREADBEAR_CLI_UPDATES=off THREADBEAR_DEV_RUNNER=1 THREADBEAR_TOKEN_TALLY=off \
     "$NODE" src/main.ts &
   CHILD=$!
   CODE=0
   wait "$CHILD" || CODE=$?
   CHILD=""
   if [ "$CODE" != 0 ]; then
+    # 70: an uncaught error (src/error-exits.ts). An installed runner
+    # restarts for one; a dev runner stops so it's seen.
+    if [ "$CODE" = 70 ]; then echo "The dev runner stopped after an uncaught error (the log above has it)." >&2; fi
     echo "The dev runner exited with $CODE; not starting it again." >&2
     # Kept, since its log says why.
     echo "Its data (threads, runner.log) is in $DATA_HOME; rm -rf it when you're done." >&2

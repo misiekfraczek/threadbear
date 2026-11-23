@@ -5,8 +5,9 @@ import { execFile } from 'node:child_process';
 import type { Clock, TimerHandle } from './clock.ts';
 import type { Logger } from './log.ts';
 import { isCliFor } from './stuck-jobs.ts';
+import { IS_WINDOWS } from './platform.ts';
 
-// A CLI frozen on something only a person can answer (docs/protocol.md,
+// A CLI frozen on something only a person can answer (docs/protocol/updates.md,
 // "Frozen CLIs"). On 31 Oct 2026 a phone thread went to Bruce, its command
 // named ~/Documents, and the CLI's main thread sat in open(2) waiting on a
 // macOS privacy dialog nobody was at the Mac to click. The thread looked
@@ -69,13 +70,18 @@ export class FrozenClis {
   private sweeping = false;
   private watches = new Map<string, Watch>();
 
+  // Windows has no ps, sandbox-exec or sample to look at a CLI with, so
+  // without a probe of its own there is nothing to do there: it never arms.
+  private readonly off: boolean;
+
   constructor(deps: Deps) {
     this.deps = deps;
+    this.off = IS_WINDOWS && !deps.probe;
     this.probe = deps.probe ?? realProbe();
   }
 
   start(): void {
-    this.arm();
+    if (!this.off) this.arm();
   }
 
   stop(): void {
@@ -90,7 +96,7 @@ export class FrozenClis {
   }
 
   async sweep(): Promise<void> {
-    if (this.sweeping) return;
+    if (this.off || this.sweeping) return;
     this.sweeping = true;
     try {
       await this.look();
@@ -205,7 +211,7 @@ export function parseProcs(text: string): Proc[] {
 // macOS asks about in Threadbear Runner's name: the very prompt this file is
 // looking for. It happened first at 21:54 on 31 Oct 2026, in the unit test of
 // this code that every release build runs, and that prompt then held up every
-// other app on that drive until 06:43 (docs/protocol.md, "A dialog on a Mac's
+// other app on that drive until 06:43 (docs/protocol/updates.md, "A dialog on a Mac's
 // screen"). The sandbox refuses those paths before macOS thinks of asking.
 // The stacks it's after come from the system's own libraries, which it can
 // still read (tried on Bruce, 1 Nov 2026).

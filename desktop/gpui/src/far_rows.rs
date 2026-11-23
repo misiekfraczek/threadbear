@@ -32,8 +32,9 @@ pub(crate) struct FarRows {
     /// it comes back, somewhere else, it's built where it now is).
     drawn: RefCell<HashSet<String>>,
     /// The zoom the heights were measured at: a new zoom makes every row
-    /// another height, so they're all measured again (Codex's review).
-    zoom: Cell<u32>,
+    /// another height, so they're all measured again (Codex's review). The
+    /// look too: Compact spacing and another font change them as well.
+    zoom: Cell<u64>,
 }
 
 impl FarRows {
@@ -44,7 +45,7 @@ impl FarRows {
         *self.scroll.borrow_mut() = Some(scroll.clone());
         let drawn = std::mem::take(&mut *self.drawn.borrow_mut());
         self.placed.borrow_mut().retain(|k, _| drawn.contains(k));
-        let zoom = crate::style::zoom_percent();
+        let zoom = crate::style::layout_key();
         if self.zoom.replace(zoom) != zoom {
             self.placed.borrow_mut().clear();
         }
@@ -54,7 +55,14 @@ impl FarRows {
     /// before any row.
     pub(crate) fn marker(self: &Rc<Self>) -> impl IntoElement {
         let rows = self.clone();
-        canvas(move |bounds, _, _| rows.list_top.set(f32::from(bounds.origin.y)), |_, _, _, _| {}).absolute().top_0().left_0().size_0()
+        canvas(
+            move |bounds, _, _| rows.list_top.set(f32::from(bounds.origin.y)),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_0()
     }
 
     /// The row's height when it's far enough out of view to be a gap: it
@@ -72,7 +80,13 @@ impl FarRows {
         self.drawn.borrow_mut().insert(key.to_owned());
         let is_gap = row.is_none();
         let child = row.unwrap_or_else(|| div().w_full().h(gpui_kit::px(gap)).into_any_element());
-        Placed { key: key.to_owned(), child, rows: self.clone(), is_gap }.into_any_element()
+        Placed {
+            key: key.to_owned(),
+            child,
+            rows: self.clone(),
+            is_gap,
+        }
+        .into_any_element()
     }
 }
 
@@ -113,18 +127,40 @@ impl Element for Placed {
         None
     }
 
-    fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
         (self.child.request_layout(window, cx), ())
     }
 
-    fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) {
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let top = f32::from(bounds.origin.y) - self.rows.list_top.get();
         let height = f32::from(bounds.size.height);
-        self.rows.placed.borrow_mut().insert(self.key.clone(), (top, height));
+        self.rows
+            .placed
+            .borrow_mut()
+            .insert(self.key.clone(), (top, height));
         // A gap that's come into view: the list changed above it (a section
         // opened) since it was measured. Draw the view again, with the row.
         if self.is_gap {
-            let near = self.rows.scroll.borrow().as_ref().is_some_and(|s| !is_far(top, height, s));
+            let near = self
+                .rows
+                .scroll
+                .borrow()
+                .as_ref()
+                .is_some_and(|s| !is_far(top, height, s));
             if near {
                 if let Some(view) = self.rows.view.get() {
                     cx.notify(view);
@@ -136,7 +172,16 @@ impl Element for Placed {
         self.child.prepaint(window, cx);
     }
 
-    fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window, cx: &mut App) {
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         self.child.paint(window, cx);
     }
 }

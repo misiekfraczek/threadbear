@@ -1,4 +1,4 @@
-// Which patch files the runner may load (docs/protocol.md, "Trusting a
+// Which patch files the runner may load (docs/protocol/trust.md, "Trusting a
 // folder's patches").
 //
 // A patch file is code: the runner imports it, and its hooks, live
@@ -55,10 +55,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseSync } from 'oxc-parser';
 import { atomicWriteFileSync } from './fsutil.ts';
-import { claudeCommands, type ClaudeOptions } from './claude-trust.ts';
-import { isBinary, looksRunnable, MAX_READ_BYTES, reachOf, reachOfCommand, Reads, type FollowOptions, type ScriptReach } from './script-trust.ts';
+import { claudeCommands, claudeCommandsKinds, type ClaudeCommands, type ClaudeOptions } from './claude-trust.ts';
+import type { Lane, TrustOffThread } from './trust-off-thread.ts';
+import { isBinary, looksRunnable, MAX_READ_BYTES, reachOf, reachOfCommand, Reads, type FollowOptions, type ScriptReach, type Writes, writeProblem } from './script-trust.ts';
 import { bareImport } from './tracked-packages.ts';
+import { fileShas, TrustedVersions, versionKey, type FileShas, type PatchChanges } from './patch-changes.ts';
 import { allowCommand } from './shell-allowlist.ts';
+import { clicksOnly, IS_WINDOWS, realPath, realPathSync } from './platform.ts';
 
 export type TrustVerdict =
   // `files`: the local files its hash covered, real paths. Absent when the
@@ -72,7 +75,9 @@ export type TrustVerdict =
   // `edges`: each of those files' local import specifiers to the file the
   // hash took them to.
   | { trusted: true; files?: string[]; blocked?: Record<string, string>; hash?: string; root?: string; code?: Map<string, Buffer>; edges?: Map<string, Map<string, string>> }
-  | { trusted: false; reason: 'new' | 'changed'; hash: string; helpers?: string[] }
+  // `changes`: with 'changed', what differs from the version last trusted
+  // there (patch-changes.ts), when that's on record.
+  | { trusted: false; reason: 'new' | 'changed'; hash: string; helpers?: string[]; changes?: PatchChanges }
   // Nothing can trust it as it stands (see the top): `problem` says why.
   | { trusted: false; reason: 'unchecked'; problem: string };
 
@@ -180,7 +185,16 @@ export interface PatchTrustStore extends PatchGate {
   // The thread folder's Claude Code settings (claude-trust.ts), with
   // what lets tools run unasked counted too for a thread that asks first
   // (`grants`).
-  checkClaude(cwd: string, opts?: ClaudeOptions): ClaudeVerdict;
+  // `look`, from lookClaude: what the folder's settings run, looked at off
+  // the main thread, used in place of looking again when it's of this
+  // folder and kind of thread.
+  checkClaude(cwd: string, opts?: ClaudeOptions, look?: ClaudeLook): ClaudeVerdict;
+  // The slow part of checkClaude, on a worker thread (trust-off-thread.ts).
+  // Absent: checkClaude looks for itself.
+  lookClaude?(cwd: string, opts?: ClaudeOptions, lane?: Lane): Promise<ClaudeLook>;
+  // Several kinds of thread (grants or not) in one look, the folder read
+  // once after the other with nothing between, as startSession's checks were.
+  lookClaudeKinds?(cwd: string, grants: boolean[], lane?: Lane): Promise<ClaudeLook[]>;
   trustClaude(cwd: string, hash: string): boolean;
   // An agent's verified Edit or Write to `file` in a Full access thread in
   // `cwd`, which wrote bytes hashing to `sha256` from a file hashing to
@@ -195,7 +209,7 @@ export interface PatchTrustStore extends PatchGate {
   // a card's approval, from a thread that asks first, which throws unless
   // that's what's there now and it can all be followed.
   approveCheck(command: string, cwd: string, card?: CheckCard): void;
-  checkApproved(command: string, cwd: string): { approved: boolean; hash: string };
+  checkApproved(command: string, cwd: string): { approved: boolean; hash: string; why?: string };
   save(): void;
 }
 
@@ -218,6 +232,12 @@ export const TRUST_ALL: PatchTrustStore = {
   save: () => {},
 };
 
+// What a folder's Claude Code settings run, as claudeCommands found it,
+// for checkClaude to judge against what's trusted at the time.
+// `skipped`: not looked at, as the folder was trusted whatever it held then;
+// checkClaude looks for itself if that has changed.
+export type ClaudeLook = { cwd: string; grants: boolean; found: ClaudeCommands | undefined; skipped?: true };
+
 const UNVOUCHED_VERSION = 2;
 
 export class PatchTrust implements PatchTrustStore {
@@ -237,13 +257,21 @@ export class PatchTrust implements PatchTrustStore {
   // Whether there was a trust file when this started. A runner from before
   // trust existed has none, and seeds it from what it was already running.
   readonly existed: boolean;
+  // What each trusted version was made of, so a re-ask can say what
+  // changed (patch-changes.ts). Describes only: it trusts nothing.
+  private versions: TrustedVersions;
 
   // `file` undefined keeps it in memory (tests). `always` are folders whose
   // patches are trusted whatever they hold.
-  constructor(opts: { file?: string; always?: string[]; claudeHome?: string } = {}) {
+  private offThread: TrustOffThread | undefined;
+  // offThread: where lookClaude looks (the runner's trust worker); without
+  // one, on the calling thread.
+  constructor(opts: { file?: string; always?: string[]; claudeHome?: string; offThread?: TrustOffThread } = {}) {
     this.file = opts.file;
     this.claudeHome = opts.claudeHome;
+    this.offThread = opts.offThread;
     this.always = (opts.always ?? []).map((d) => realpath(path.resolve(d)));
+    this.versions = new TrustedVersions(opts.file ? opts.file.replace(/\.json$/, '') + '-versions.json' : undefined);
     this.existed = this.load() !== 'missing';
   }
 
@@ -428,23 +456,44 @@ export class PatchTrust implements PatchTrustStore {
     if (known?.includes(hash)) {
       entry.trusted = true;
       this.approveEntry(entry);
+      // Trusted before versions were kept: on record from now on. Only
+      // when nothing of this patch is: an old branch's version, trusted
+      // long ago, mustn't become the one a re-ask compares with.
+      this.recordVersion(file, entry, true);
       return { trusted: true, files: deps.map((d) => d.path), hash, root: entry.root, code: entry.code, edges: entry.edges, ...(entry.blocked ? { blocked: entry.blocked } : {}) };
     }
     const helpers = deps.map((d) => d.path);
-    const before = known?.some((h) => !h.startsWith(CLAUDE_PREFIX) && !h.startsWith(CHECK_PREFIX));
-    return { trusted: false, reason: before ? 'changed' : 'new', hash, ...(helpers.length ? { helpers } : {}) };
+    const patchHashes = (known ?? []).filter((h) => !h.startsWith(CLAUDE_PREFIX) && !h.startsWith(CHECK_PREFIX));
+    if (!patchHashes.length) return { trusted: false, reason: 'new', hash, ...(helpers.length ? { helpers } : {}) };
+    const changes = await this.changesOf(file, entry, patchHashes.every((h) => h.startsWith(LEGACY_PREFIX)));
+    return { trusted: false, reason: 'changed', hash, ...(helpers.length ? { helpers } : {}), ...(changes ? { changes } : {}) };
   }
 
-  checkClaude(cwd: string, opts: ClaudeOptions = {}): ClaudeVerdict {
+  async lookClaude(cwd: string, opts: ClaudeOptions = {}, lane: Lane = 'background'): Promise<ClaudeLook> {
+    return (await this.lookClaudeKinds(cwd, [opts.grants === true], lane))[0];
+  }
+
+  async lookClaudeKinds(cwd: string, grants: boolean[], lane: Lane = 'background'): Promise<ClaudeLook[]> {
+    this.load();
+    // Trusted whatever it holds: nothing to look at.
+    if (this.alwaysFor(folderKeyOfDir(cwd), cwd)) return grants.map((g) => ({ cwd, grants: g, found: undefined, skipped: true }));
+    const found = this.offThread ? await this.offThread.claudeCommands(cwd, this.claudeHome ?? os.homedir(), grants, lane) : claudeCommandsKinds(cwd, this.claudeHome, grants);
+    return grants.map((g, i) => ({ cwd, grants: g, found: found[i] }));
+  }
+
+  checkClaude(cwd: string, opts: ClaudeOptions = {}, look?: ClaudeLook): ClaudeVerdict {
     this.load();
     const key = folderKeyOfDir(cwd);
     if (this.alwaysFor(key, cwd)) return { trusted: true };
-    const found = claudeCommands(cwd, this.claudeHome, opts);
+    const found = look && !look.skipped && look.cwd === cwd && look.grants === (opts.grants === true) ? look.found : claudeCommands(cwd, this.claudeHome, opts);
     if (!found) return { trusted: true };
     const known = (this.folders.get(key) ?? []).filter((h) => h.startsWith(CLAUDE_PREFIX));
     const base = { hash: found.hash, files: found.files, named: found.named, read: found.read, ...(found.grants ? { grants: found.grants } : {}) };
     // Before the stored hashes: a yes can't vouch for code the hash didn't see.
     if (found.incomplete) return { trusted: false, reason: 'unchecked', problem: found.incomplete, ...base };
+    // Windows, for now (platform.ts, clicksOnly): they'd run by themselves,
+    // so they stay off whatever was trusted.
+    if (clicksOnly()) return { trusted: false, reason: 'unchecked', problem: "on Windows, a folder's Claude Code hooks and settings that run commands stay off for now.", ...base };
     if (known.includes(CLAUDE_PREFIX + found.hash)) {
       // Kept apart by kind: bytes trusted for what they run (Full) haven't
       // been trusted for the permission rules in them, so an edit can't
@@ -504,6 +553,12 @@ export class PatchTrust implements PatchTrustStore {
   }
 
   approveCheck(command: string, cwd: string, card?: CheckCard): void {
+    if (this.checksHeld(cwd)) throw new Error(WINDOWS_CHECK);
+    // Bound as far as it can be is how an owner's check that can't be
+    // followed is approved, and for one that writes what it runs that
+    // leaves out what runs (Daybreak 153's verify-fix): never approved.
+    const writes = this.digestOf(command, cwd).writes;
+    if (writes) throw new CheckRefused(`A schedule's check runs by itself, and this one writes a file it then runs, so no approval can cover what will run: ${writes} Nothing changed. Have the check run only files already in the repo, and do any writing in the thread it wakes.`);
     if (card) {
       const now = checkDigest(command, cwd);
       if (now.problem) throw new Error(`A schedule's check runs by itself, so what it runs must be something Threadbear can hash, and it can't follow this: ${now.problem} Nothing changed. Put it in a shell script or JavaScript it can follow.`);
@@ -515,10 +570,23 @@ export class PatchTrust implements PatchTrustStore {
 
   // A stored approval only ever comes from approveCheck, on this runner, so
   // a row the backend (or another runner) wrote finds nothing here.
-  checkApproved(command: string, cwd: string): { approved: boolean; hash: string } {
+  checkApproved(command: string, cwd: string): { approved: boolean; hash: string; why?: string } {
     this.load();
-    const { hash } = this.digestOf(command, cwd);
+    const { hash, writes } = this.digestOf(command, cwd);
+    if (this.checksHeld(cwd)) return { approved: false, hash, why: WINDOWS_CHECK };
+    if (writes) return { approved: false, hash, why: writes };
     return { approved: (this.folders.get(folderKeyOfDir(cwd)) ?? []).includes(CHECK_PREFIX + hash), hash };
+  }
+
+  // Windows, for now (platform.ts, clicksOnly): a check runs by itself, so
+  // one in a repo's folder doesn't run at all, whatever was approved. One
+  // in Threadbear's own checkout, or in a folder no repo holds (home, say),
+  // nothing pulled can change under it, and still runs.
+  private checksHeld(cwd: string): boolean {
+    if (!clicksOnly()) return false;
+    if (this.alwaysFor(folderKeyOfDir(cwd), cwd)) return false;
+    const real = realpath(path.resolve(cwd));
+    return fs.existsSync(path.join(repoTop(real), '.git'));
   }
 
   // Threadbear's own checkout runs whatever it holds, so there only the
@@ -532,7 +600,61 @@ export class PatchTrust implements PatchTrustStore {
   trust(file: string, hash: string): boolean {
     if (!isPatchFile(file) || !/^[0-9a-f]{64}$/.test(hash)) return false;
     this.add(folderKey(file), [hash]);
+    try {
+      const entry = this.hashOf(file);
+      if (entry.hash === hash) this.recordVersion(file, entry);
+    } catch {
+      // Unreadable now: trusted all the same, just not on record.
+    }
     return true;
+  }
+
+  // The patch's files as `entry` hashed them, relative to the folder
+  // holding `.threadbear/`, kept as a trusted version (patch-changes.ts).
+  // `ifNew`: only when this version isn't on record yet.
+  private recordVersion(file: string, entry: HashEntry, ifNew = false): void {
+    try {
+      const { key, folder, files } = this.versionOf(file, entry);
+      if (ifNew && this.versions.any(key)) return;
+      this.versions.record(key, { hash: entry.hash, files }, folder);
+    } catch {
+      // Only a description is lost.
+    }
+  }
+
+  // Every record's HEAD written (tests).
+  settled(): Promise<void> {
+    return this.versions.settled();
+  }
+
+  private versionOf(file: string, entry: HashEntry): { key: string; folder: string; files: FileShas } {
+    const named = path.resolve(file);
+    const folder = realpath(path.dirname(path.dirname(path.dirname(named))));
+    const rel = (p: string) => {
+      const r = path.relative(folder, p);
+      // `../shared/u.ts` for one outside the folder, as a worktree and its
+      // main checkout name it alike; absolute only across drives.
+      return path.isAbsolute(r) ? p : r.split(path.sep).join('/');
+    };
+    // `.threadbear/patches/<name>`, as it's named (a patch that's a link is
+    // still kept under its own name).
+    const own = path.relative(path.dirname(path.dirname(path.dirname(named))), named).split(path.sep).join('/');
+    const files = fileShas([[own, entry.own], ...entry.deps.map((d): [string, string | null] => [rel(d.path), d.sha256 ?? null])]);
+    return { key: versionKey(folderKey(file), own), folder, files };
+  }
+
+  // What changed since the version last trusted in the folder; with
+  // nothing on record and only hashes from before version 3 there, that
+  // it's asked again because how patches are checked changed.
+  private async changesOf(file: string, entry: HashEntry, legacyOnly: boolean): Promise<PatchChanges | undefined> {
+    try {
+      const { key, folder, files } = this.versionOf(file, entry);
+      const changes = await this.versions.describe(key, entry.hash, files, folder);
+      if (changes) return changes;
+    } catch {
+      // Nothing to say.
+    }
+    return legacyOnly ? { recheck: true } : undefined;
   }
 
   // Trusts patch files as they are on disk now, unasked: the first
@@ -627,6 +749,7 @@ export class PatchTrust implements PatchTrustStore {
         entry.trusted = true;
         this.approveEntry(entry);
         hash = entry.hash;
+        this.recordVersion(file, entry);
       } catch {
         continue;
       }
@@ -657,8 +780,9 @@ export class PatchTrust implements PatchTrustStore {
   }
 
   // The patch's hash with its helpers'. Cached until anything it was made
-  // from changes: a file's inode, size, mtime, ctime or mode (ctime can't
-  // be set back, so a write that restores the mtime still shows), a
+  // from changes: a file's inode, size, mtime, ctime or mode (on macOS and
+  // Linux ctime can't be set back, so a write that restores the mtime still
+  // shows; on NTFS it can, so Windows reads the bytes again as well), a
   // symlink on the way to one retargeted, or a missing one turning up (a
   // stat and a realpath each; patches are read every 15 seconds).
   private hashOf(file: string): HashEntry {
@@ -852,6 +976,22 @@ export function patchHash(file: string): PatchHash {
         deps.push({ path: f });
       }
       for (const m of reach.missing) if (unnamed.size < 2000) unnamed.add(m);
+      // A Windows network or device path could be a file of the repo's
+      // under another name, and can't be hashed: the patch can't be trusted
+      // (an action's command that can't be followed is let go, but this one
+      // may hide the very file that runs).
+      if (reach.refused) incomplete ??= `patch trust won't follow ${reach.refused}: it could be a file in the repo under another name, so trusting the patch couldn't cover it.`;
+    }
+  }
+  // Windows: what a command run in the folder by a bare name could turn
+  // out to be (script-trust.ts, besideRun), for the commands a patch works
+  // out in code too, which aren't followed here: hashed, and the list of
+  // them watched, so a program dropped there asks again.
+  if (IS_WINDOWS && isInside(realpath(folder), top)) {
+    for (const f of reachOfCommand(':', 'the folder', opts).files) {
+      if (seen.has(f)) continue;
+      seen.add(f);
+      deps.push({ path: f });
     }
   }
   const missing = [...unnamed];
@@ -958,7 +1098,8 @@ export function scanModule(src: string, file: string): ModuleScan {
     const value = spec && plainString(spec);
     if (value === undefined) return refuse(at);
     if (/^\.{1,2}(\/|$)|^\//.test(value)) specifiers.add(value);
-    else if (value.startsWith('file:')) {
+    // A URL's scheme has no case: `DATA:` and `FILE:` are those (Gemini's review).
+    else if (/^file:/i.test(value)) {
       try {
         specifiers.add(fileURLToPath(value));
       } catch {
@@ -967,13 +1108,15 @@ export function scanModule(src: string, file: string): ModuleScan {
     }
     // A data: module's own imports are in a string, and `#x` maps through
     // package.json to a local file this doesn't follow.
-    else if (/^(data:|#)/.test(value) || LOADER_MODULES.includes(value)) refuse(at);
+    else if (/^(data:|#)/i.test(value) || /^[a-z][a-z0-9+.-]*:/i.test(value) && !value.startsWith('node:') || LOADER_MODULES.includes(value)) refuse(at);
     // A package: hashed only when the repo commits it (tracked-packages.ts).
     else packages.add(value);
   };
   // Identifiers and members a load handled already, so they aren't
   // refused as bare references to `require`.
   const handled = new Set<AstNode>();
+  // `Reflect.x` members that are called right there: the only use allowed.
+  const reflectCalls = new Set<AstNode>();
   const stack: { node: AstNode; parent?: AstNode; key?: string }[] = [{ node: parsed.program as unknown as AstNode }];
   while (stack.length) {
     const { node, parent, key } = stack.pop()!;
@@ -1014,7 +1157,14 @@ export function scanModule(src: string, file: string): ModuleScan {
       }
       case 'Identifier':
         if (handled.has(node) || !isReference(parent, key)) break;
-        if (LOADER_NAMES.includes(node.name)) refuse(node);
+        // Reflect only called in place (`Reflect.has(o, k)`), below.
+        if (node.name === 'Reflect') break;
+        if (LOADER_NAMES.includes(node.name) || CODE_REACH.includes(node.name)) refuse(node);
+        // `process`, `globalThis` and the like as values (`const p = process`,
+        // `Object.entries(process)`): what's on them is then read by a name
+        // this can't see (Gemini's review). Their plain members, `typeof`,
+        // and `module.exports = ...` read nothing that way.
+        if (RISKY_OBJECTS.includes(node.name) && node.name !== 'require' && !(parent?.type === 'MemberExpression' && key === 'object') && parent?.type !== 'UnaryExpression') refuse(node);
         break;
       case 'MemberExpression': {
         const name = propertyName(node);
@@ -1022,8 +1172,39 @@ export function scanModule(src: string, file: string): ModuleScan {
           // `process[k]`: any property, so any loader, by a name worked out later.
           const o = node.object;
           if (o.type === 'MetaProperty' || (o.type === 'Identifier' && RISKY_OBJECTS.includes(o.name))) refuse(node);
-        } else if (!handled.has(node) && LOADER_PROPERTIES.includes(name)) refuse(node);
+        } else if (!handled.has(node) && (LOADER_PROPERTIES.includes(name) || CODE_REACH.includes(name))) refuse(node);
         break;
+      }
+      // `const { eval: run } = globalThis`, `{ constructor: F } = f`: a
+      // pattern's key reads that property, though it isn't a reference
+      // (Daybreak 154). A worked-out key could read any of them.
+      case 'Property':
+        // `{ __proto__: f }` makes f the prototype: its constructor then reads as o's.
+        if (parent?.type === 'ObjectExpression' && !node.computed && node.kind === 'init' && !node.shorthand && propertyKey(node) === '__proto__') refuse(node);
+        if (parent?.type === 'ObjectPattern') {
+          const name = propertyKey(node);
+          // `{ ['eval']: run }` names it too (Codex's review).
+          // A worked-out key reads like `o[k]` (see CODE_REACH); a number reads no loader.
+          const read = name ?? plainString(node.key);
+          if (read !== undefined && (LOADER_PROPERTIES.includes(read) || CODE_REACH.includes(read) || LOADER_NAMES.includes(read))) refuse(node);
+        }
+        break;
+    }
+    // `Reflect.get(f, 'constructor')`: a string that's exactly such a name,
+    // handed to what reads a property by one, reaches it without writing it
+    // as one (`globalThis['eval']` is a member above). Not any such string:
+    // `case 'eval':` in a CLI's switch, or `Object.hasOwn(o, 'constructor')`,
+    // reads nothing. And Reflect only ever called in place, so it can't be
+    // handed on as `const get = Reflect.get` (Codex's review).
+    if (node.type === 'Identifier' && node.name === 'Reflect' && isReference(parent, key) && !(parent?.type === 'MemberExpression' && key === 'object' && reflectCalls.has(parent))) refuse(node);
+    if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' && node.callee.object.type === 'Identifier' && node.callee.object.name === 'Reflect') {
+      reflectCalls.add(node.callee);
+      const method = propertyName(node.callee);
+      if (method === undefined) refuse(node);
+      else if (method === 'get' || method === 'getOwnPropertyDescriptor') {
+        // Reads a property by name: only a plain one that isn't a loader's.
+        const named = node.arguments[1] && plainString(node.arguments[1]);
+        if (named === undefined || CODE_REACH.includes(named) || LOADER_NAMES.includes(named) || LOADER_PROPERTIES.includes(named)) refuse(node);
       }
     }
     for (const k of Object.keys(node)) {
@@ -1049,9 +1230,33 @@ type AstNode = { type: string; start: number; end: number; [field: string]: any 
 
 // Names that load code, or hand out something that can, when used as values.
 const LOADER_NAMES = ['require', 'eval', 'Function', 'createRequire', 'getBuiltinModule', 'dlopen'];
-const LOADER_PROPERTIES = ['require', 'createRequire', 'getBuiltinModule', 'dlopen', '_load'];
-// Modules that load code by a name or from a string.
-const LOADER_MODULES = ['module', 'node:module', 'vm', 'node:vm', 'worker_threads', 'node:worker_threads'];
+const LOADER_PROPERTIES = ['require', 'createRequire', 'getBuiltinModule', 'dlopen', '_load', 'binding', '_linkedBinding'];
+// What reaches code made from a string or bytes without a loader's name
+// (Daybreak 154, 21 Nov 2026): `eval` and `Function` as properties
+// (`globalThis.eval`), any function's `constructor` (`(() => {}).constructor`
+// is Function, an async one's AsyncFunction), what lists a prototype's
+// hidden properties with their values (`getOwnPropertyDescriptors` hands
+// out `constructor` without naming it), and WebAssembly, which compiles
+// bytes. Not `getPrototypeOf`, everyday code that reaches nothing by
+// itself: from a prototype it's still one of these. As a name, a
+// property, a string or a pattern's key, all refused: a script whose
+// payload is data until it evaluates it isn't one the hash can vouch for.
+// Not a class's own `constructor() {}` or an object literal's key, which
+// define rather than read. What can't be refused by a scan is a script
+// written to hide it (`o[a][b](c)` with keys worked out as it runs), and a
+// child process running whatever it's handed, which a patch's commands do
+// by design: the card that trusts it is what reads for those.
+const CODE_REACH = [
+  'eval', 'Function', 'constructor', 'AsyncFunction', 'GeneratorFunction', 'AsyncGeneratorFunction',
+  'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', '__lookupGetter__', 'WebAssembly', 'Reflect', '__proto__',
+  'setPrototypeOf',
+];
+// Modules that load code by a name or from a string: the module system, vm,
+// workers, and inspector and repl, which evaluate what they're sent.
+const LOADER_MODULES = [
+  'module', 'node:module', 'vm', 'node:vm', 'worker_threads', 'node:worker_threads', 'inspector', 'node:inspector',
+  'inspector/promises', 'node:inspector/promises', 'repl', 'node:repl', 'node:test', 'test',
+];
 // Objects a computed `[k]` on could reach a loader through.
 const RISKY_OBJECTS = ['globalThis', 'global', 'process', 'module', 'require', 'self', 'window'];
 // TypeScript types: gone before the code runs, so nothing in them loads.
@@ -1183,6 +1388,12 @@ export function automaticCommand(command: string, folder: string, files: string[
       problem: `\`${command}\` runs by itself, but patch trust can't follow everything ${script} runs, so trusting the patch couldn't cover it: ${why} Run other scripts by a plain path ("./scripts/x.sh") and package scripts by a plain name ("npm run build").`,
     };
   }
+  // Hashed isn't followed: on Windows a script beside another is hashed
+  // as something Windows could run by name, without what it runs being
+  // read (Codex's sixth review). So what this one runs is followed now,
+  // and must all be covered too.
+  const deep = actionCommandProblem(command, folder, files, blocked);
+  if (deep) return { problem: `\`${command}\` runs by itself, but it ${deep}` };
   const quote = (w: string) => `'${w.replace(/'/g, `'\\''`)}'`;
   // From the folder holding .threadbear/, which is where the follow
   // started: a hook in a thread in a subfolder ran from there, so the
@@ -1215,13 +1426,29 @@ export function actionCommandProblem(command: string, folder: string, files: str
 // repo too, each followed from its own folder and repo (checkDigest, and the
 // commands of a patch that loads without a hash). `missing`: files it names
 // that aren't there yet.
-function followOutside(command: string, label: string, start: FollowOptions, reads: Reads): { files: Set<string>; missing: Set<string>; problem?: string } {
+function followOutside(command: string, label: string, start: FollowOptions, reads: Reads): { files: Set<string>; missing: Set<string>; problem?: string; writeProblem?: string } {
   const files = new Set<string>();
   const missing = new Set<string>();
   const seen = new Set<string>();
   const queue: { file: string; dir: string }[] = [];
   let problem: string | undefined;
+  // Each reach's writes, held against all of their runs at the end: a
+  // script outside the repo that writes one the check runs (Daybreak 153).
+  const writes: Writes = { written: [], reached: [], pending: [], deps: [], exported: [], cleared: [] };
+  let wrote: string | undefined;
   const take = (reach: ScriptReach) => {
+    wrote ??= reach.writeProblem;
+    if (reach.writes) {
+      writes.written.push(...reach.writes.written);
+      writes.reached.push(...reach.writes.reached);
+      writes.somewhere ??= reach.writes.somewhere;
+      // A variable the check sets is the outside script's to write to too.
+      writes.pending!.push(...(reach.writes.pending ?? []));
+      writes.deps!.push(...(reach.writes.deps ?? []));
+      if (reach.writes.assignsAny) writes.assignsAny = true;
+      writes.exported!.push(...(reach.writes.exported ?? []));
+      writes.cleared!.push(...(reach.writes.cleared ?? []));
+    }
     for (const f of reach.files) files.add(f);
     for (const f of reach.missing) missing.add(f);
     for (const { file, dirs } of reach.outside ?? []) for (const dir of dirs) queue.push({ file, dir });
@@ -1242,7 +1469,11 @@ function followOutside(command: string, label: string, start: FollowOptions, rea
     // folder it runs in: its `./x` is there, not beside it.
     take(reachOf(script, { ...followOptions(path.dirname(script), reads), folder: dir, outside: true }));
   }
-  return { files, missing, ...(problem ? { problem } : {}) };
+  const cross = writeProblem(writes, start.top);
+  if (cross?.definite) wrote ??= cross.problem;
+  else if (cross) problem ??= cross.problem;
+  if (wrote) problem = wrote;
+  return { files, missing, ...(problem ? { problem } : {}), ...(wrote ? { writeProblem: wrote } : {}) };
 }
 
 // What a schedule's check runs, for binding its approval to (a card, or an
@@ -1254,7 +1485,12 @@ function followOutside(command: string, label: string, start: FollowOptions, rea
 // that runs in turn isn't: a thread that asks first can't approve one
 // (threadbear-mcp.ts). Programs on PATH and installed packages aren't
 // followed, as for patches. `commandOnly`: nothing but the command counts.
-export type CheckDigest = { hash: string; files: string[]; problem?: string };
+// `writes`: it writes a file it then runs (Daybreak 153), so no approval,
+// an owner's included, can cover what will run.
+// A check no one can approve, said to whoever made it, owner included.
+export class CheckRefused extends Error {}
+
+export type CheckDigest = { hash: string; files: string[]; problem?: string; writes?: string };
 // What a card was put up for (threadbear-mcp.ts, checkGuard): the digest and
 // folder as it went up, neither when they couldn't be read here.
 export type CheckCard = { hash?: string; folder?: string };
@@ -1287,7 +1523,7 @@ export function checkDigest(command: string, cwd: string, commandOnly = false): 
   if (huge) problem ??= `the check reaches ${huge}, over ${MAX_READ_BYTES / 1024 / 1024} MB, more than patch trust reads.`;
   // Whether it stopped, not its wording: the bytes say what changed, and a
   // reworded message shouldn't hold every such check.
-  return { hash: sha256(Buffer.from(JSON.stringify([CHECK_TAG, command, pairs, Boolean(problem)]))), files: pairs.map(([f]) => f), ...(problem ? { problem } : {}) };
+  return { hash: sha256(Buffer.from(JSON.stringify([CHECK_TAG, command, pairs, Boolean(problem)]))), files: pairs.map(([f]) => f), ...(problem ? { problem } : {}), ...(followed.writeProblem ? { writes: followed.writeProblem } : {}) };
 }
 
 // Every file a schedule's check reaches from `cwd`, as checkDigest follows
@@ -1383,6 +1619,8 @@ function repoTop(dir: string): string {
   }
 }
 
+const WINDOWS_CHECK = "On Windows, for now, a schedule's check doesn't run in a repo's folder, as it would run by itself: following what it runs there still has gaps. Give the schedule a folder outside any repo, or no check.";
+
 const PICTURES = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.icns', '.pdf', '.heic'];
 
 function isFile(p: string): boolean {
@@ -1449,12 +1687,10 @@ export function folderKeyOfDir(dir: string): string {
   return main ? path.join(realpath(main), path.relative(top, folder)) : folder;
 }
 
+// The real form of a path, as it is when it isn't there (platform.ts): the
+// one every path here is compared by.
 function realpath(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return p;
-  }
+  return realPath(p);
 }
 
 // The nearest folder from `dir` up with a `.git`, when that `.git` is a
@@ -1493,14 +1729,14 @@ export function worktreeOf(dir: string): { top: string; main: string } | undefin
 // symlinked .git as the worktree it points at (Gautam's scan, 6 Nov).
 export function mainCheckoutOf(top: string): string | undefined {
   try {
-    const realTop = fs.realpathSync(top);
+    const realTop = realPathSync(top);
     const dotGit = path.join(realTop, '.git');
     if (!fs.lstatSync(dotGit).isFile()) return undefined;
     const named = gitdirLine(readHead(dotGit));
     if (!named) return undefined;
     const gitdir = path.resolve(realTop, named);
     const back = path.resolve(gitdir, readHead(path.join(gitdir, 'gitdir')).trim());
-    if (path.basename(back) !== '.git' || fs.realpathSync(path.dirname(back)) !== realTop) return undefined;
+    if (path.basename(back) !== '.git' || realPathSync(path.dirname(back)) !== realTop) return undefined;
     const common = path.resolve(gitdir, readHead(path.join(gitdir, 'commondir')).trim());
     const name = path.relative(path.join(common, 'worktrees'), gitdir);
     if (path.basename(common) !== '.git' || !name || name.startsWith('..') || name.includes(path.sep)) return undefined;

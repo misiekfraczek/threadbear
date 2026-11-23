@@ -13,8 +13,10 @@ import type { PendingApproval, ThreadState } from '../runner.ts';
 import { matchAnswers } from '../runner.ts';
 import { SECRET_TIMEOUT_DEFAULT_MIN, SECRET_TIMEOUT_MAX_MIN, type SecretFiles } from '../secrets.ts';
 import { START_CARD, type RequestAnswer } from '../cross-runner.ts';
+import { noAppToAllow } from '../app-seen.ts';
 import { REMOTE_ALLOW_REFUSED, remoteCardShowsAll } from '../tools.ts';
-import { reviewCard, reviewsCards, type CardForReview, type CardVerdict } from './card-review.ts';
+import { reviewCard, reviewerLeftIt, reviewsCards, type CardForReview, type CardVerdict } from './card-review.ts';
+import { cliHears } from '../cli-session.ts';
 
 export type SecretRequest = { label: string; reason: string; placeholder?: string; timeoutMinutes?: number; toolUseId?: string; signal?: AbortSignal };
 export type SecretAnswer = ({ status: 'saved' } & SecretFiles) | { status: 'declined' | 'expired'; message?: string };
@@ -48,7 +50,7 @@ export const approvalsPart = {
     decision: ApprovalDecision;
     message?: string;
     answers?: Record<string, string>;
-    // Answers to the calls queued on the card (docs/protocol.md, "Queued calls").
+    // Answers to the calls queued on the card (docs/protocol/threads.md, "Queued calls").
     queued?: QueuedAnswers;
     // From the phone or another Mac's view of this runner, through the
     // backend (sync.ts), which show only a line of a card's input.
@@ -107,7 +109,7 @@ export const approvalsPart = {
     return {};
   },
 
-  // plans.approve (docs/protocol.md, "Plan first"): Go ahead on a plan card.
+  // plans.approve (docs/protocol/threads.md, "Plan first"): Go ahead on a plan card.
   // Claude's plan is an ExitPlanMode call waiting on its approval, which
   // this allows. Otherwise (Codex, whose plan ends its turn, or Claude's
   // after a restart dropped the call) the thread leaves plan mode and Mike
@@ -119,8 +121,9 @@ export const approvalsPart = {
     const call = [...rt.approvals.values()].find((p) => p.kind === 'tool' && p.plan === params.itemId);
     if (call) return this.respondApproval({ threadId: params.threadId, approvalId: call.approvalId, decision: 'allow' });
     const mode = this.leavePlan(st);
+    const gen = rt.generation;
     rt.session?.setPermissionMode(mode).catch(() => {
-      rt.releaseWhenIdle = true;
+      this.cli(st, { kind: 'leave', gen });
     });
     this.send(params.threadId, PLAN_GO_AHEAD);
     return {};
@@ -143,11 +146,11 @@ export const approvalsPart = {
   // it gets a turn. A background subagent's (no toolUseId) gets none: it's
   // between the subagent and Mike, whatever the agent is doing. A turn opened
   // for one held Mike's messages back until the CLI next ran one, and ending
-  // it cleared the asks of the turn before (docs/protocol.md, "A subagent's
+  // it cleared the asks of the turn before (docs/protocol/needs-you.md, "A subagent's
   // card").
   turnForRequest(this: Runner, st: ThreadState, gen: number, main = true): boolean {
     const { rt } = st;
-    if (rt.generation !== gen || rt.closing || this.stopping) return false;
+    if (cliHears(rt, gen) !== 'current' || this.stopping) return false;
     if (main && !rt.turn) this.openCliTurn(st);
     return true;
   },
@@ -196,14 +199,22 @@ export const approvalsPart = {
       rt.reviews?.delete(id);
       signal?.removeEventListener('abort', onAbort);
     }
-    if (rt.generation !== gen || rt.closing || rt.deleted || this.stopping) return { decision: 'expired', message: 'The thread is shutting down.' };
+    if (cliHears(rt, gen) !== 'current' || rt.deleted || this.stopping) return { decision: 'expired', message: 'The thread is shutting down.' };
     // Still on Auto: switched to Ask or Plan meanwhile, it's Mike's card.
     if (verdict.allow && !entry.stale && reviewsCards(this, st)) {
       this.emit(st, { type: 'system.note', text: `Allowed by the reviewer: ${card.title}. ${verdict.why}` }, rt.turn?.turnId);
       return { decision: 'allow' };
     }
-    if (!verdict.allow && verdict.why) this.emit(st, { type: 'system.note', text: `The reviewer left this one for you: ${verdict.why}` }, rt.turn?.turnId);
-    return show();
+    // Switched out of Auto meanwhile, it's an ordinary card.
+    const why = verdict.allow || entry.stale || !reviewsCards(this, st) ? undefined : verdict.why;
+    if (!why) return show();
+    this.emit(st, { type: 'system.note', text: `The reviewer left this one for you: ${why}` }, rt.turn?.turnId);
+    // The agent sees only the answer, so without this it guessed why it was
+    // asked and told Mike it was Claude's own safety check (20 Nov 2026).
+    // Only on Mike's no (a click or writing instead): a card closed without
+    // him isn't his to explain.
+    const a = await show();
+    return a.decision === 'deny' && !a.stopped && !a.noApp ? { ...a, reviewer: reviewerLeftIt(why) } : a;
   },
 
   // The card itself, for Mike.
@@ -225,6 +236,9 @@ export const approvalsPart = {
       // if a client sends it: it would save a rule Mike was never offered.
       const answer = req.canAlwaysAllow ? resolve : (a: ToolApprovalAnswer) => resolve(a.decision === 'allowAlways' ? { ...a, decision: 'allow' } : a);
       const macOnly = !remoteCardShowsAll(req.name, req.input, st.rec.cwd, req.title);
+      // Not a plan: its card is also where a plan is read and sent back to
+      // be revised, which the phone and other Macs can do.
+      if (macOnly && req.name !== 'ExitPlanMode' && this.appCanAllow && !this.appCanAllow()) return resolve(this.refuseNoApp(st, String(body.title)));
       const queued = req.toolUseId && req.queued?.length ? new Set(req.queued.map((c) => c.itemId)) : undefined;
       this.addApproval(st, { approvalId, kind: 'tool', title: String(body.title), main: Boolean(req.toolUseId), ...(plan ? { plan } : {}), ...(macOnly ? { macOnly } : {}), ...(req.toolUseId ? { itemId: req.toolUseId } : {}), ...(queued ? { queued } : {}), ...(req.fullAllows && !plan ? { fullAllows: true } : {}), resolve: answer }, body, req.signal);
       if (queued) this.emit(st, { type: 'approval.queued', approvalId, calls: req.queued! }, st.rt.turn?.turnId);
@@ -243,6 +257,8 @@ export const approvalsPart = {
   },
 
   agentApprovalCard(this: Runner, st: ThreadState, req: AgentApprovalRequest): Promise<ToolApprovalAnswer> {
+    // Only the app connected straight to this runner can allow one.
+    if (this.appCanAllow && !this.appCanAllow()) return Promise.resolve(this.refuseNoApp(st, req.title));
     const approvalId = crypto.randomUUID();
     // The title is why it asks; the Mac card's heading is only "Use <tool>?",
     // so it goes in the reason line too (David, 9 Nov 2026).
@@ -251,6 +267,14 @@ export const approvalsPart = {
       const answer = (a: ToolApprovalAnswer) => resolve(a.decision === 'allowAlways' ? { ...a, decision: 'allow' } : a);
       this.addApproval(st, { approvalId, kind: 'tool', main: true, macOnly: true, resolve: answer }, body, req.signal ?? new AbortController().signal);
     });
+  },
+
+  // A card only this runner's own app could allow, on a runner with none
+  // (app-seen.ts): not put up, as it could only ever be denied. A note in
+  // the thread says so, and the agent is told what to do instead.
+  refuseNoApp(this: Runner, st: ThreadState, title: string): ToolApprovalAnswer {
+    this.emit(st, { type: 'system.note', text: `Not asked: ${title}. Only a Threadbear app connected straight to ${this.ownName ?? 'this runner'} could allow it, and none has connected lately, so the agent was told to do it another way.` }, st.rt.turn?.turnId);
+    return { decision: 'deny', noApp: true, message: noAppToAllow(title.replace(/[.\s]+$/, ''), this.ownName) };
   },
 
   requestQuestion(this: Runner, st: ThreadState, gen: number, req: QuestionRequest): Promise<QuestionAnswer> {
@@ -263,7 +287,7 @@ export const approvalsPart = {
     });
   },
 
-  // ask_secret (docs/protocol.md, "Secrets"): a card that waits for Mike to
+  // ask_secret (docs/protocol/threads.md, "Secrets"): a card that waits for Mike to
   // type a secret on the Mac or the phone. Resolves with the file's paths,
   // or declined or expired; never with the value.
   requestSecret(this: Runner, threadId: string, req: SecretRequest): Promise<SecretAnswer> {

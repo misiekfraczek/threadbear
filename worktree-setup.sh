@@ -67,7 +67,7 @@ refresh_main() {
   rmdir "$lock"
 }
 
-for dir in . runner app/Tools/mock-runner; do
+for dir in . runner mock-runner; do
   here="$ROOT/$dir"
   there="${MAIN:+$MAIN/$dir}"
   if [ -e "$here/node_modules" ] || [ -L "$here/node_modules" ]; then
@@ -102,4 +102,23 @@ else
   # newer stub replaces an older one.
   cp "$ROOT/scripts/swift-freeze-pre-commit" "$hooks/pre-commit"
   chmod +x "$hooks/pre-commit"
+fi
+
+# docs/experiments.md merges line by line (.gitattributes' merge=lines,
+# scripts/merge-lines.mjs), so a rebase in `tb land` neither conflicts on
+# two threads' new experiments nor brings back one either side took out,
+# as union merging did (17 Nov). Git's config is shared by every worktree,
+# so this covers them all; rewritten each time, so it follows node moving.
+# A relative script path, as git runs a merge driver from the worktree's
+# top, and each worktree uses its own copy.
+if [ -f "$ROOT/scripts/merge-lines.mjs" ]; then
+  git -C "$ROOT" config merge.lines.name "one-line entries, in any order (scripts/merge-lines.mjs)"
+  git -C "$ROOT" config merge.lines.driver "'$NODE' scripts/merge-lines.mjs %O %A %B"
+fi
+# eslint-suppressions.json merges by count the same way
+# (scripts/merge-suppressions.mjs), so two landings that each fix or record
+# lint problems don't stop each other on a text conflict.
+if [ -f "$ROOT/scripts/merge-suppressions.mjs" ]; then
+  git -C "$ROOT" config merge.suppressions.name "lint suppressions, by count (scripts/merge-suppressions.mjs)"
+  git -C "$ROOT" config merge.suppressions.driver "'$NODE' scripts/merge-suppressions.mjs %O %A %B"
 fi

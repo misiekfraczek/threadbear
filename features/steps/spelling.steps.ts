@@ -37,11 +37,33 @@ When('I choose {string} from the composer\'s right-click menu on {string}', asyn
   await this.app.do({ cmd: 'composer-right-click', at, choose: item });
 });
 
-// A switch the test Mac may have either way: ticked if it isn't yet.
+function ticked(titles: string[], item: string): boolean {
+  return titles.some((t) => t === item.replace(/([^›]*› )?(.*)/, (_, sub, name) => `${sub ?? ''}✓ ${name}`));
+}
+
+// A switch an earlier scenario in the same app may have left either way:
+// ticked if it isn't yet.
 Given('{string} is ticked in the composer\'s right-click menu', async function (this: ThreadbearWorld, item: string) {
-  const ticked = (titles: string[]) => titles.some((t) => t === item.replace(/([^›]*› )?(.*)/, (_, sub, name) => `${sub ?? ''}✓ ${name}`));
-  if (!ticked(await menu(this, ''))) {
+  if (!ticked(await menu(this, ''), item)) {
     await this.app.do({ cmd: 'composer-right-click', choose: item });
   }
-  assert.ok(ticked(await menu(this, '')), `"${item}" didn't tick`);
+  assert.ok(ticked(await menu(this, ''), item), `"${item}" didn't tick`);
+});
+
+Given('{string} is not ticked in the composer\'s right-click menu', async function (this: ThreadbearWorld, item: string) {
+  if (ticked(await menu(this, ''), item)) {
+    await this.app.do({ cmd: 'composer-right-click', choose: item });
+  }
+  assert.ok(!ticked(await menu(this, ''), item), `"${item}" stayed ticked`);
+});
+
+When('I undo in the composer', async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'menu-key', key: 'z', modifiers: ['cmd'] });
+});
+
+Then('the composer marks nothing as misspelled', async function (this: ThreadbearWorld) {
+  // Given the marks' pause after typing to settle first.
+  await sleep(600);
+  const marks = JSON.parse(okValue(await this.app.do({ cmd: 'composer-spelling' }))) as string[];
+  assert.deepEqual(marks, [], `the box marks ${JSON.stringify(marks)}`);
 });
