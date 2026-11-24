@@ -2378,6 +2378,12 @@ async function dispatch(client, method, p) {
     }
     case 'mock.clis': {
       if (p.wentBack) return wentBack();
+      // { add: CliStatus }: one more row, as a runner with that agent has.
+      if (p.add) {
+        clis.push(p.add);
+        broadcastClis();
+        return { clis };
+      }
       // { failed: { provider, message } }: that CLI's update failed, as the
       // runner reports one (the apps' banner says so until it's dismissed).
       const cli = p.failed && clis.find((c) => c.provider === p.failed.provider);

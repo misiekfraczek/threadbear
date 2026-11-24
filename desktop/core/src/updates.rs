@@ -1398,11 +1398,21 @@ pub fn hold_thread(cli: &CliStatus) -> Option<&str> {
     cli.hold.as_ref().and_then(|h| h.thread_id.as_deref())
 }
 
-/// Who keeps it up to date, when that isn't the usual: a path set by hand is
-/// never updated.
+/// Who keeps it up to date, when that isn't the usual: a Codex path set by
+/// hand is never updated, nor is an agent with no updater of its own.
 pub fn managed_line(cli: &CliStatus) -> Option<&'static str> {
-    (cli.managed_by == "none")
-        .then_some("Set by hand in runner.json, so Threadbear leaves it alone")
+    (cli.managed_by == "none").then_some(if cli.provider == "codex" {
+        "Set by hand in runner.json, so Threadbear leaves it alone"
+    } else {
+        "Updated outside Threadbear: download a new version yourself"
+    })
+}
+
+/// Whether the row has the "Updates:" menu. Not for an agent updated only
+/// when asked, nor for one nobody here updates: the runner refuses a policy
+/// for it, which showed as an error on picking one.
+pub fn offers_policy(cli: &CliStatus) -> bool {
+    !cli.can_update_now && cli.managed_by != "none"
 }
 
 /// The update button's title, or None when there's nothing to install.
@@ -1518,11 +1528,11 @@ pub fn checked_line<Tz: TimeZone>(clis: &[CliStatus], now: &DateTime<Tz>) -> Opt
 /// The CLI's line as both apps' dumps give it (AppDump.usageLines): its
 /// status, the policy, the buttons it has, and what an update is doing.
 pub fn dump_line(cli: &CliStatus) -> String {
-    let mut line = format!(
-        "{} ({})",
-        status_line(cli),
-        policy_title(&cli.policy).to_lowercase()
-    );
+    // The policy only where the row has its menu.
+    let mut line = status_line(cli);
+    if offers_policy(cli) {
+        line.push_str(&format!(" ({})", policy_title(&cli.policy).to_lowercase()));
+    }
     if let Some(button) = update_title(cli) {
         line.push_str(&format!(" [{button}]"));
     }
@@ -1690,6 +1700,43 @@ mod tests {
             }),
             Some("Set by hand in runner.json, so Threadbear leaves it alone")
         );
+    }
+
+    #[test]
+    fn a_cli_nobody_here_updates_offers_no_policy() {
+        let agy = CliStatus {
+            provider: "antigravity".into(),
+            name: Some("Antigravity".into()),
+            installed_version: Some("1.4.5".into()),
+            managed_by: "none".into(),
+            status: "unknown".into(),
+            policy: "off".into(),
+            ..Default::default()
+        };
+        assert!(!offers_policy(&agy));
+        assert_eq!(update_title(&agy), None);
+        assert_eq!(dump_line(&agy), "Antigravity 1.4.5");
+        assert_eq!(
+            managed_line(&agy),
+            Some("Updated outside Threadbear: download a new version yourself")
+        );
+        let by_hand = CliStatus {
+            provider: "codex".into(),
+            ..agy.clone()
+        };
+        assert!(!offers_policy(&by_hand));
+        let claude = CliStatus {
+            provider: "claude".into(),
+            managed_by: "cli".into(),
+            ..agy.clone()
+        };
+        assert!(offers_policy(&claude));
+        let opencode = CliStatus {
+            managed_by: "cli".into(),
+            can_update_now: true,
+            ..agy
+        };
+        assert!(!offers_policy(&opencode));
     }
 
     #[test]

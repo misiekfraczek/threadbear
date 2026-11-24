@@ -667,6 +667,16 @@ test('an ACP agent shows its version, and never updates by itself', async () => 
   assert.equal(c.u.list().find((r) => r.provider === 'opencode')!.policy, 'off');
 });
 
+test('an agent with no updater of its own says nobody here updates it, so the row offers no policy', async () => {
+  const c = acpSetup();
+  (c.u as unknown as { d: Record<string, unknown> }).d.acp = { providers: ['antigravity'], binary: () => '/bin/opencode', updateArgs: () => [] };
+  const row = c.u.list().find((r) => r.provider === 'antigravity')!;
+  assert.equal(row.managedBy, 'none');
+  assert.equal(row.canUpdateNow, false);
+  assert.equal(row.policy, 'off');
+  assert.equal(c.u.list().find((r) => r.provider === 'antigravity')!.managedBy, 'none');
+});
+
 test('Update runs the agent\'s own updater and reports what happened', async () => {
   let v = '1.0.0';
   const c = acpSetup({ version: () => v });

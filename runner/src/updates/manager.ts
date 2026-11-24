@@ -262,6 +262,7 @@ export class CliUpdates {
     // before 17 Nov the row kept its Update button and a press that found
     // nothing just spun and came back, saying nothing.
     const u = s.update;
+    const canUpdate = (this.d.acp?.updateArgs(p).length ?? 0) > 0;
     const fresh =
       !!installedVersion &&
       (u?.state === 'unchanged' || u?.state === 'succeeded') &&
@@ -271,11 +272,12 @@ export class CliUpdates {
     return {
       provider: p,
       path: this.d.acp!.binary(p) ?? '',
-      managedBy: 'cli',
+      // An agent with no updater of its own (Antigravity) can't be updated
+      // here, so its row offers neither Update nor a policy.
+      managedBy: canUpdate ? 'cli' : 'none',
       status: fresh ? 'current' : 'unknown',
       policy: 'off',
-      // An agent with no updater of its own (Antigravity) can't be updated here.
-      canUpdateNow: (this.d.acp?.updateArgs(p).length ?? 0) > 0,
+      canUpdateNow: canUpdate,
       inUse: this.d.hooks.versionsInUse(p),
       ...(installedVersion ? { installedVersion } : {}),
       ...(fresh ? { latestVersion: installedVersion, checkedAt: u!.finishedAt } : {}),

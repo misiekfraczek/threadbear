@@ -11,6 +11,10 @@ When('the runner starts building main at {string} for {string}', async function 
   await this.app.do({ cmd: 'mock', method: 'updates', params: { state: 'building', commit, subject } });
 });
 
+When('the runner also has Antigravity, which has no updater of its own', async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'mock', method: 'clis', params: { add: { provider: 'antigravity', path: '/Users/alex/agy/agy_acp_server.par', managedBy: 'none', installedVersion: '1.4.5', status: 'unknown', policy: 'off', canUpdateNow: false, inUse: [] } } });
+});
+
 When('Mike has a release of 10 Nov with 3 new changes', async function (this: ThreadbearWorld) {
   const release = {
     tag: 'release/2026-11-10',

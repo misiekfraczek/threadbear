@@ -1270,7 +1270,7 @@ impl Threadbear {
         let mut bottom = h_flex().items_center().gap(px(8.));
         // A menu, not a segmented control: two rows of three buttons were
         // most of the popover's noise, and the choice is set once and left.
-        if !cli.can_update_now {
+        if rules::offers_policy(cli) {
             bottom = bottom.child(self.render_policy_menu(cli, cx));
         }
         bottom = bottom.child(div().flex_1());

@@ -109,7 +109,9 @@ type CliStatus = {
   path: string          // the binary new sessions start
   managedBy: "threadbear" | "cli" | "none" // Codex: Threadbear's own copies;
                         // Claude: its own installer; "none": codexPath set by
-                        // hand, never updated
+                        // hand, or an agent with no updater of its own
+                        // (Antigravity): never updated, so the row offers no
+                        // policy and `clis.setPolicy` isn't called for it
   installedVersion?: string // what new sessions start on
   latestVersion?: string
   canUpdateNow?: boolean // an ACP agent: no version feed, so the row offers an

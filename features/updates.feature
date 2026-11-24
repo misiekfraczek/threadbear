@@ -15,6 +15,15 @@ Feature: The Updates panel
     And the Updates panel lists "Codex 0.165.0 is held back because the app-server protocol changed (automatic) [Update anyway] [Go back to 0.163.0]"
     And the Updates panel lists "  Missing: thread/backgroundTerminals/list"
 
+  # Until 24 Nov its row had the "Updates:" menu, and picking from it put
+  # "This CLI is updated outside Threadbear" in the error bar.
+  @updates.panel
+  Scenario: A CLI nobody here updates has no policy to pick
+    When the runner also has Antigravity, which has no updater of its own
+    And I open the Updates panel
+    Then the Updates panel lists "Antigravity 1.4.5"
+    And the Updates panel lists "  Updated outside Threadbear: download a new version yourself"
+
   @updates.panel
   Scenario: Update installs a CLI's new version, saying so while it runs
     When I open the Updates panel

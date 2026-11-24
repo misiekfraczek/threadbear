@@ -151,7 +151,8 @@ export type CliStatus = {
   provider: Provider;
   path: string; // the binary new sessions start
   // Codex: Threadbear's own copies; Claude: its own installer; 'none' when
-  // codexPath is set by hand and never updated.
+  // nobody here updates it (codexPath set by hand, or an agent with no
+  // updater of its own): the row offers no policy.
   managedBy: 'threadbear' | 'cli' | 'none';
   installedVersion?: string;
   latestVersion?: string;
