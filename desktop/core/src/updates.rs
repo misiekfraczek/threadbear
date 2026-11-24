@@ -1695,6 +1695,7 @@ mod tests {
         assert!(!cli_pending(&current));
         assert_eq!(
             managed_line(&CliStatus {
+                provider: "codex".into(),
                 managed_by: "none".into(),
                 ..current
             }),
