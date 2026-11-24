@@ -539,7 +539,9 @@ File references are where to look.
   done) through a folder named for the old app's process,
   `$TMPDIR/threadbear-handover-<pid>`, deleted once it's over. It writes what it did and the build's output to
   `~/Library/Logs/threadbear-desktop-update.log` (the one before it in
-  `.log.1` once that passes 2 MB). `followMain: false` stops it too.
+  `.log.1` once that passes 2 MB). `followMain: false` stops it too, except
+  that a build staged by hand (`desktop/scripts/stage-update.sh`) is still
+  noticed and goes in the same way.
 - **Idle benchmarks** (`features/tools/idle-perf.ts`), only when run explicitly:
   compile CPU counters, a window watcher and (for Swift references) an
   owned-PID activation helper into a temporary folder, removed at the end.

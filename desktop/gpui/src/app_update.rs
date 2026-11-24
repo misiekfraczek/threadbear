@@ -701,13 +701,20 @@ impl Threadbear {
         }
         // followMain: false in runner.json stops the runner rebuilding, and
         // the app too (on-your-mac.md promises both). Only an explicit false.
-        if self
+        // A build staged by hand is still noticed, so the app menu and the
+        // Updates panel offer Restart to Update for it.
+        let follow_main = self
             .runner_settings
             .as_ref()
-            .and_then(|s| s["followMain"].as_bool())
-            == Some(false)
-        {
+            .and_then(|s| s["followMain"].as_bool());
+        if rules::look(follow_main) == rules::Look::StagedOnly {
             self.updater.settling = false;
+            let staged = staged_build();
+            if staged != self.updater.staged {
+                self.updater.staged = staged;
+                self.menus_stale = true;
+                cx.notify();
+            }
             return;
         }
         let checkout = running.checkout.clone();
