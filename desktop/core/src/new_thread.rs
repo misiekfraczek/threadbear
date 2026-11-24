@@ -257,6 +257,7 @@ pub fn login_name(id: &str, accounts: &[Account]) -> String {
 }
 
 /// `AccountName.label`: a name for a card, where a whole address doesn't fit.
+/// The only Claude login is just "Claude", like the other providers' cards.
 pub fn account_label(id: &str, accounts: &[Account]) -> String {
     let Some(account) = accounts.iter().find(|a| a.id == id) else {
         return id.to_owned();
@@ -265,14 +266,19 @@ pub fn account_label(id: &str, accounts: &[Account]) -> String {
         return short_account_name(id, accounts);
     }
     let full = account.name();
-    let Some(at) = full.find('@') else {
-        return full;
-    };
     let siblings: Vec<String> = accounts
         .iter()
         .filter(|a| a.id != id && a.provider_id() == account.provider_id())
         .map(Account::name)
         .collect();
+    // The only Claude login reads as its provider, as Codex, Grok and
+    // Gemini do; the address only matters when there are several.
+    if siblings.is_empty() {
+        return "Claude".to_owned();
+    }
+    let Some(at) = full.find('@') else {
+        return full;
+    };
     let local = local_part(&full).to_owned();
     if !siblings.iter().any(|s| local_part(s) == local) {
         return local;
@@ -1705,6 +1711,25 @@ mod tests {
         assert_eq!(account_label("claude-3", &l.accounts), "studio");
         assert_eq!(account_label("codex-main", &l.accounts), "Codex");
         assert_eq!(login_name("claude-2", &l.accounts), "work");
+    }
+
+    #[test]
+    fn the_only_claude_login_reads_as_claude() {
+        let accounts = vec![
+            Account {
+                id: "claude-main".into(),
+                provider: "claude".into(),
+                email: Some("sam.lee@gmail.com".into()),
+                ..Default::default()
+            },
+            Account {
+                id: "codex-main".into(),
+                provider: "codex".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(account_label("claude-main", &accounts), "Claude");
+        assert_eq!(account_label("codex-main", &accounts), "Codex");
     }
 
     #[test]
